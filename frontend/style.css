@@ -1,0 +1,147 @@
+:root {
+  --bg: #f4f7fb;
+  --panel: #ffffff;
+  --text: #1a1f36;
+  --muted: #5d6478;
+  --accent: #006a65;
+  --accent-2: #0e8b84;
+  --border: #d8dfea;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at 20% 20%, #e9f4ff, var(--bg));
+}
+
+.layout {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 16px;
+  padding: 16px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.left p {
+  color: var(--muted);
+}
+
+.health {
+  margin: 14px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfcff;
+}
+
+.health pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.chat-window {
+  height: calc(100vh - 220px);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: #fcfdff;
+}
+
+.msg {
+  margin-bottom: 10px;
+  padding: 10px;
+  border-radius: 10px;
+  max-width: 85%;
+  line-height: 1.45;
+}
+
+.msg-paragraph {
+  margin: 0 0 10px;
+  white-space: normal;
+}
+
+.msg-paragraph:last-child {
+  margin-bottom: 0;
+}
+
+.msg.user {
+  margin-left: auto;
+  background: #dff6f4;
+  border: 1px solid #b8e8e4;
+}
+
+.msg.assistant {
+  margin-right: auto;
+  background: #eef3ff;
+  border: 1px solid #d8e1ff;
+}
+
+.msg .tools {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.composer {
+  margin-top: 10px;
+}
+
+textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  resize: vertical;
+  font: inherit;
+}
+
+.composer-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+button {
+  border: 0;
+  border-radius: 9px;
+  padding: 9px 14px;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+button:hover {
+  background: var(--accent-2);
+}
+
+button.secondary {
+  background: #f2f4f9;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-window {
+    height: 55vh;
+  }
+}
