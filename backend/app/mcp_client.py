@@ -30,6 +30,10 @@ class McpClient:
         self._session_id: str | None = None
         self._initialized = False
 
+    def _reset_session(self) -> None:
+        self._session_id = None
+        self._initialized = False
+
     def _build_headers(self) -> Dict[str, str]:
         headers = {
             "Content-Type": "application/json",
@@ -163,14 +167,35 @@ class McpClient:
             pass
         self._initialized = True
 
+    @staticmethod
+    def _should_retry_with_new_session(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "session not found",
+                "invalid session",
+                "unknown session",
+                "network is unreachable",
+                "connection refused",
+                "connection reset",
+                "remote protocol error",
+                "server disconnected",
+            )
+        )
+
     def list_tools(self) -> List[McpTool]:
-        self.initialize()
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_request_id(),
-            "method": "tools/list",
-        }
-        result = self._request(payload)
+        payload = {"jsonrpc": "2.0", "id": self._next_request_id(), "method": "tools/list"}
+        for attempt in range(2):
+            try:
+                self.initialize()
+                result = self._request(payload)
+                break
+            except Exception as exc:
+                if attempt == 0 and self._should_retry_with_new_session(exc):
+                    self._reset_session()
+                    continue
+                raise
         tools = result.get("tools", []) if isinstance(result, dict) else []
 
         parsed: List[McpTool] = []
@@ -185,14 +210,19 @@ class McpClient:
         return parsed
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        self.initialize()
         payload = {
             "jsonrpc": "2.0",
             "id": self._next_request_id(),
             "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments,
-            },
+            "params": {"name": tool_name, "arguments": arguments},
         }
-        return self._request(payload)
+        for attempt in range(2):
+            try:
+                self.initialize()
+                return self._request(payload)
+            except Exception as exc:
+                if attempt == 0 and self._should_retry_with_new_session(exc):
+                    self._reset_session()
+                    continue
+                raise
+        raise McpProtocolError(f"Failed to call tool '{tool_name}' after retry.")

@@ -69,6 +69,92 @@ Open:
 - Backend health: `http://localhost:8000/api/health`
 - Backend MCP tools list: `http://localhost:8000/api/tools`
 
+## Workspace UI
+
+The frontend is a buttons-and-preview workspace, not a chat-first UI:
+
+- **Workspace tab**: upload a business process document or a requirement spec, review the extracted elements/relationships/view layout in an editable table and a diagram preview, then explicitly click "Create in Archi". Nothing is written to Archi until you approve the preview. Uncheck rows to drop elements or relationships, or edit element names inline before applying.
+- **Health / MCP Tools tabs**: service status and the live MCP tool catalog.
+- **Assistant drawer**: a collapsible chat panel docked on the right for free-form questions about the model. Collapse it with the chevron or the topbar toggle to give the workspace the full width.
+
+### Upload preview workflow
+
+1. `POST /api/actions/business-process-upload/preview` or `POST /api/actions/requirements-upload/preview`
+   - Input: multipart `file` (+ optional `view_name`)
+   - Supports: `pdf`, `xlsx`, `xlsm`, `txt`, `md`, `csv`, `json`
+   - Behavior: extracts elements/relationships/layout from the upload and returns an editable **plan** (nothing is written to Archi yet).
+2. `POST /api/actions/apply`
+   - Input: JSON body `{"plan": <plan from step 1, with any rows edited or unchecked>}`
+   - Behavior: creates/updates the elements, relationships, and view content for the included rows in one automation run via MCP `bulk-mutate`.
+
+Both preview endpoints still respect Archi approval mode. If approval mode is enabled, a human still needs to approve in Archi after `apply`.
+
+### One-shot automation actions (no preview)
+
+For scripted/API use without a review step, the original single-call endpoints are still available:
+
+- `POST /api/actions/business-process-upload`
+- `POST /api/actions/requirements-upload`
+
+Same inputs as the preview endpoints above, but extraction and Archi writes happen in one call.
+
+### Chat with trace
+
+POST `http://localhost:8000/api/chat/trace`
+
+Returns normal chat output plus a detailed execution trace (rounds, retries, tool calls).
+
+Example body:
+
+```json
+{
+  "message": "Summarize the architecture and mention key dependencies.",
+  "history": [],
+  "system_prompt": null
+}
+```
+
+### Streaming chat (SSE)
+
+POST `http://localhost:8000/api/chat/stream`
+
+Streams response chunks as Server-Sent Events with event names:
+
+- `start`
+- `delta` (text chunks)
+- `trace` (optional full trace + tools)
+- `done`
+- `error`
+- `close`
+
+Example body:
+
+```json
+{
+  "message": "What application components support customer sales?",
+  "history": [],
+  "stream_chunk_chars": 180,
+  "include_trace": true
+}
+```
+
+### Conversation export
+
+POST `http://localhost:8000/api/conversations/export`
+
+Validates and normalizes a conversation payload for backup or transfer.
+
+### Conversation import
+
+POST `http://localhost:8000/api/conversations/import`
+
+Accepts either:
+
+- full export envelope (`schema_version` + `conversation`)
+- raw `conversation` object
+
+Returns normalized conversation + warnings if any fields were corrected.
+
 ## Stop
 
 ```bash
@@ -99,3 +185,6 @@ Then serve frontend separately or open a static server and point calls to `/api`
 - Azure auth/model errors:
   - verify key, base URL, deployment/model name.
 
+- Upload says no readable text:
+  - For scanned PDFs, run OCR first.
+  - For legacy Excel `.xls`, convert to `.xlsx` and retry.

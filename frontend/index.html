@@ -3,34 +3,257 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Archi Local Chatbot</title>
+    <title>Archi Local Chatbot Workspace</title>
+    <link
+      rel="preconnect"
+      href="https://fonts.googleapis.com"
+    />
+    <link
+      rel="preconnect"
+      href="https://fonts.gstatic.com"
+      crossorigin
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="layout">
-      <section class="panel left">
-        <h1>Archi Local Chatbot</h1>
-        <p>Frontend + backend connected to your local Archi MCP server and Azure model.</p>
+    <div class="bg-shape bg-shape-1"></div>
+    <div class="bg-shape bg-shape-2"></div>
 
-        <div class="health" id="healthBox">
-          <strong>Service Status</strong>
-          <pre id="healthText">Loading...</pre>
-        </div>
-
-        <button id="clearBtn" class="secondary">Clear Conversation</button>
-      </section>
-
-      <section class="panel right">
-        <div id="chatWindow" class="chat-window"></div>
-
-        <form id="chatForm" class="composer">
-          <textarea id="messageInput" rows="3" placeholder="Ask about your Archi model..." required></textarea>
-          <div class="composer-row">
-            <button id="sendBtn" type="submit">Send</button>
+    <div class="app-shell">
+      <header class="card topbar">
+        <div class="brand">
+          <div class="brand-mark">A</div>
+          <div>
+            <h1>Archi Local Chatbot</h1>
+            <p>Upload business processes and requirements, preview the model, then create it in Archi.</p>
           </div>
-        </form>
-      </section>
-    </main>
+        </div>
+        <div class="topbar-status">
+          <span id="connectionBadge" class="badge status status-pending">Checking MCP</span>
+          <span id="modelBadge" class="badge">Model: --</span>
+          <button id="refreshHealthBtn" class="btn ghost" type="button">Refresh status</button>
+          <button id="chatToggleBtn" class="btn ghost" type="button" aria-expanded="true" aria-controls="chatDrawer">
+            Hide assistant
+          </button>
+        </div>
+      </header>
+
+      <div id="appGrid" class="app-grid">
+        <main class="main-panel">
+          <nav class="tab-bar card" aria-label="Workspace sections">
+            <button class="tab-btn active" type="button" data-tab="workspaceTab">Workspace</button>
+            <button class="tab-btn" type="button" data-tab="healthTab">Health</button>
+            <button class="tab-btn" type="button" data-tab="toolsTab">MCP Tools</button>
+          </nav>
+
+          <section id="workspaceTab" class="tab-panel">
+            <section class="card automation-panel">
+              <article class="automation-card">
+                <h3>Upload Business Processes</h3>
+                <p>Upload a PDF, Excel, or text file describing your business processes. Preview the extracted steps and objects before anything is written to Archi.</p>
+                <form id="businessProcessForm" class="action-form">
+                  <input id="businessProcessFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
+                  <input id="businessProcessViewName" type="text" value="Business Process View" maxlength="120" placeholder="Target view name" />
+                  <button id="businessProcessBtn" class="btn primary" type="submit">Preview extraction</button>
+                </form>
+              </article>
+
+              <article class="automation-card">
+                <h3>Upload Requirement Specification</h3>
+                <p>Upload a requirement spec. Preview the generated product architecture elements and relationships before anything is written to Archi.</p>
+                <form id="requirementsForm" class="action-form">
+                  <input id="requirementsFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
+                  <input id="requirementsViewName" type="text" value="Product Architecture" maxlength="120" placeholder="Target view name" />
+                  <button id="requirementsBtn" class="btn primary" type="submit">Preview extraction</button>
+                </form>
+              </article>
+            </section>
+
+            <div id="actionStatus" class="action-status" aria-live="polite">Upload a file to preview extracted elements before creating them in Archi.</div>
+
+            <section id="previewPanel" class="card preview-panel">
+              <div id="previewEmptyState" class="empty-state">No preview yet. Run an upload above to see extracted elements here.</div>
+
+              <div id="previewContent" class="preview-content hidden">
+                <header class="preview-header">
+                  <div class="preview-title-row">
+                    <label class="sr-only" for="previewViewName">View name</label>
+                    <input id="previewViewName" type="text" maxlength="120" class="preview-title-input" />
+                    <span id="previewSourceBadge" class="badge">source</span>
+                  </div>
+                  <div id="previewCounts" class="preview-counts"></div>
+                  <div id="previewWarnings" class="preview-warnings hidden"></div>
+                </header>
+
+                <div class="preview-body">
+                  <div class="preview-diagram-wrap">
+                    <h4>View preview</h4>
+                    <div id="previewDiagram" class="preview-diagram"></div>
+                  </div>
+
+                  <div class="preview-tables">
+                    <div class="preview-table-block">
+                      <h4>Elements</h4>
+                      <div class="table-scroll">
+                        <table id="elementsTable" class="preview-table">
+                          <thead>
+                            <tr>
+                              <th class="col-check"></th>
+                              <th>Type</th>
+                              <th>Name</th>
+                            </tr>
+                          </thead>
+                          <tbody></tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div class="preview-table-block">
+                      <h4>Relationships</h4>
+                      <div class="table-scroll">
+                        <table id="relationshipsTable" class="preview-table">
+                          <thead>
+                            <tr>
+                              <th class="col-check"></th>
+                              <th>Type</th>
+                              <th>Source &rarr; Target</th>
+                            </tr>
+                          </thead>
+                          <tbody></tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="preview-actions">
+                  <button id="discardPreviewBtn" class="btn ghost" type="button">Discard</button>
+                  <button id="applyPreviewBtn" class="btn primary" type="button">Create in Archi</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="card action-log-card">
+              <header class="card-head">
+                <h2>Recent automation runs</h2>
+              </header>
+              <div id="actionLog" class="action-log">
+                <div class="empty-state">No automation runs yet this session.</div>
+              </div>
+            </section>
+          </section>
+
+          <section id="healthTab" class="tab-panel hidden">
+            <section class="card">
+              <header class="card-head">
+                <h2>Service health</h2>
+                <button id="refreshHealthInlineBtn" class="btn ghost small" type="button">Refresh</button>
+              </header>
+              <div class="kv-grid">
+                <div><span>Status</span><strong id="healthStatus">--</strong></div>
+                <div><span>MCP</span><strong id="healthMcpStatus">--</strong></div>
+                <div><span>Tools</span><strong id="healthToolCount">--</strong></div>
+                <div><span>Server</span><strong id="healthServer">--</strong></div>
+              </div>
+              <details class="raw-block">
+                <summary>Raw payload</summary>
+                <pre id="healthText">Loading...</pre>
+              </details>
+            </section>
+          </section>
+
+          <section id="toolsTab" class="tab-panel hidden">
+            <section class="card">
+              <header class="card-head">
+                <h2>MCP tools</h2>
+                <button id="refreshToolsBtn" class="btn ghost small" type="button">Reload</button>
+              </header>
+              <div class="tool-toolbar">
+                <input id="toolSearchInput" type="search" placeholder="Search tools..." />
+                <span id="toolCountBadge" class="badge">0 tools</span>
+              </div>
+              <div id="toolList" class="tool-list"></div>
+            </section>
+          </section>
+        </main>
+
+        <aside id="chatDrawer" class="chat-drawer card">
+          <header class="drawer-head">
+            <div class="drawer-head-text">
+              <h2 id="conversationTitle">Assistant</h2>
+              <p id="conversationMeta">0 messages</p>
+            </div>
+            <button id="drawerCollapseBtn" class="drawer-collapse-btn" type="button" title="Collapse assistant">&raquo;</button>
+          </header>
+
+          <div class="drawer-body">
+            <div class="conversation-toolbar">
+              <button id="newChatBtn" class="btn small" type="button">New chat</button>
+              <button id="renameConversationBtn" class="btn ghost small" type="button">Rename</button>
+              <button id="clearBtn" class="btn ghost small" type="button">Clear</button>
+              <button id="exportBtn" class="btn ghost small" type="button">Export</button>
+            </div>
+
+            <div id="conversationList" class="conversation-list"></div>
+
+            <details class="advanced quick-prompts-details">
+              <summary>Quick prompts</summary>
+              <div class="quick-prompts">
+                <button class="btn ghost quick-prompt" type="button" data-prompt="Summarize the current Archi model structure and key layers.">
+                  Model summary
+                </button>
+                <button class="btn ghost quick-prompt" type="button" data-prompt="Which applications support the customer sales business processes?">
+                  Business to app mapping
+                </button>
+                <button class="btn ghost quick-prompt" type="button" data-prompt="List potential gaps or risks you can infer from this architecture data.">
+                  Architecture risks
+                </button>
+                <button class="btn ghost quick-prompt" type="button" data-prompt="Show important dependencies between technology and application components.">
+                  Dependency analysis
+                </button>
+              </div>
+            </details>
+
+            <div id="chatWindow" class="chat-window" aria-live="polite"></div>
+
+            <form id="chatForm" class="composer">
+              <label class="sr-only" for="messageInput">Message</label>
+              <textarea
+                id="messageInput"
+                rows="2"
+                placeholder="Ask about your Archi model..."
+                required
+              ></textarea>
+
+              <details class="advanced">
+                <summary>Optional system instruction</summary>
+                <textarea
+                  id="systemPromptInput"
+                  rows="3"
+                  placeholder="Optional override for assistant behavior on this page."
+                ></textarea>
+              </details>
+
+              <div class="composer-row">
+                <div class="composer-meta">
+                  <span class="hint">Enter to send</span>
+                  <span id="messageCounter" class="counter">0/20000</span>
+                </div>
+                <div class="composer-actions">
+                  <button id="retryBtn" class="btn ghost small" type="button">Retry</button>
+                  <button id="stopBtn" class="btn warn small" type="button" disabled>Stop</button>
+                  <button id="sendBtn" class="btn primary small" type="submit">Send</button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </aside>
+      </div>
+    </div>
 
     <script src="/app.js"></script>
   </body>

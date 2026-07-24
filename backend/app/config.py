@@ -20,6 +20,9 @@ class Settings:
     max_model_retries: int
     model_retry_backoff_seconds: float
     max_tool_roundtrips: int
+    max_upload_bytes: int
+    max_upload_text_chars: int
+    max_action_steps: int
     default_system_prompt: str
 
 
@@ -48,6 +51,9 @@ def get_settings() -> Settings:
         max_model_retries=int(os.getenv("MAX_MODEL_RETRIES", "3")),
         model_retry_backoff_seconds=float(os.getenv("MODEL_RETRY_BACKOFF_SECONDS", "1.5")),
         max_tool_roundtrips=int(os.getenv("MAX_TOOL_ROUNDTRIPS", "8")),
+        max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024))),
+        max_upload_text_chars=int(os.getenv("MAX_UPLOAD_TEXT_CHARS", "80000")),
+        max_action_steps=int(os.getenv("MAX_ACTION_STEPS", "18")),
         default_system_prompt=os.getenv(
             "SYSTEM_PROMPT",
             (
