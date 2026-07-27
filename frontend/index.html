@@ -36,6 +36,9 @@
           <span id="connectionBadge" class="badge status status-pending">Checking MCP</span>
           <span id="modelBadge" class="badge">Model: --</span>
           <button id="refreshHealthBtn" class="btn ghost" type="button">Refresh status</button>
+          <button id="metaModelBtn" class="btn ghost" type="button" aria-haspopup="dialog" aria-controls="metaModelModal">
+            Meta model
+          </button>
           <button id="chatToggleBtn" class="btn ghost" type="button" aria-expanded="true" aria-controls="chatDrawer">
             Hide assistant
           </button>
@@ -46,6 +49,7 @@
         <main class="main-panel">
           <nav class="tab-bar card" aria-label="Workspace sections">
             <button class="tab-btn active" type="button" data-tab="workspaceTab">Workspace</button>
+            <button class="tab-btn" type="button" data-tab="assessmentTab">Architecture Assessment</button>
             <button class="tab-btn" type="button" data-tab="healthTab">Health</button>
             <button class="tab-btn" type="button" data-tab="toolsTab">MCP Tools</button>
           </nav>
@@ -62,15 +66,6 @@
                 </form>
               </article>
 
-              <article class="automation-card">
-                <h3>Upload Requirement Specification</h3>
-                <p>Upload a requirement spec. Preview the generated product architecture elements and relationships before anything is written to Archi.</p>
-                <form id="requirementsForm" class="action-form">
-                  <input id="requirementsFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
-                  <input id="requirementsViewName" type="text" value="Product Architecture" maxlength="120" placeholder="Target view name" />
-                  <button id="requirementsBtn" class="btn primary" type="submit">Preview extraction</button>
-                </form>
-              </article>
             </section>
 
             <div id="actionStatus" class="action-status" aria-live="polite">Upload a file to preview extracted elements before creating them in Archi.</div>
@@ -91,8 +86,19 @@
 
                 <div class="preview-body">
                   <div class="preview-diagram-wrap">
-                    <h4>View preview</h4>
-                    <div id="previewDiagram" class="preview-diagram"></div>
+                    <div class="preview-diagram-head">
+                      <h4>View preview</h4>
+                      <div class="diagram-toolbar">
+                        <button id="diagramZoomOutBtn" class="btn ghost small" type="button" title="Zoom out">&minus;</button>
+                        <span id="diagramZoomLabel" class="diagram-zoom-label">100%</span>
+                        <button id="diagramZoomInBtn" class="btn ghost small" type="button" title="Zoom in">+</button>
+                        <button id="diagramResetViewBtn" class="btn ghost small" type="button" title="Reset view">Reset</button>
+                      </div>
+                    </div>
+                    <div id="previewDiagram" class="preview-diagram">
+                      <div id="previewDiagramStage" class="preview-diagram-stage"></div>
+                    </div>
+                    <p class="diagram-hint">Scroll to zoom, drag to pan.</p>
                   </div>
 
                   <div class="preview-tables">
@@ -143,6 +149,136 @@
               </header>
               <div id="actionLog" class="action-log">
                 <div class="empty-state">No automation runs yet this session.</div>
+              </div>
+            </section>
+          </section>
+
+          <section id="assessmentTab" class="tab-panel hidden">
+            <nav class="assessment-stepper card">
+              <button class="assessment-step-btn active" type="button" data-step="setup">1. Setup</button>
+              <button class="assessment-step-btn" type="button" data-step="ist" disabled>2. Ist-Aufnahme</button>
+              <button class="assessment-step-btn" type="button" data-step="soll" disabled>3. Soll-Architektur</button>
+              <button class="assessment-step-btn" type="button" data-step="mapping" disabled>4. Mapping &amp; Gap-Analyse</button>
+              <button class="assessment-step-btn" type="button" data-step="summary" disabled>5. Summary</button>
+            </nav>
+
+            <section id="assessmentStepSetup" class="card assessment-step">
+              <h3>1. Setup &amp; Context</h3>
+              <p>Checks the current Archi model for existing Ist/Soll views and confirms the assessment scope before starting. Mirrors the Setup &amp; Context Agent from the assessment spec.</p>
+              <div class="assessment-field-row">
+                <label>Ist view name
+                  <input id="assessmentIstViewName" type="text" value="Ist-Business-Prozesse" maxlength="120" />
+                </label>
+                <label>Soll view name
+                  <input id="assessmentSollViewName" type="text" value="Soll-Architektur" maxlength="120" />
+                </label>
+              </div>
+              <button id="assessmentSetupBtn" class="btn primary" type="button">Check model state</button>
+              <div id="assessmentSetupResult" class="assessment-result hidden"></div>
+              <div class="assessment-step-actions">
+                <span></span>
+                <button id="assessmentSetupContinueBtn" class="btn primary" type="button" disabled>Continue to Ist-Aufnahme</button>
+              </div>
+            </section>
+
+            <section id="assessmentStepIst" class="card assessment-step hidden">
+              <h3>2. Ist-Aufnahme (Business Process Extractor)</h3>
+              <p>Upload as-is process documentation (PDF, Excel, or text). Uses the same PDF-geometry-aware, evidence-gated extraction as the Workspace upload. Nothing is written to Archi until you review and apply below.</p>
+              <form id="assessmentIstForm" class="action-form">
+                <input id="assessmentIstFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
+                <button id="assessmentIstBtn" class="btn primary" type="submit">Preview extraction</button>
+              </form>
+              <div id="assessmentIstStatus" class="action-status hidden"></div>
+              <div id="assessmentIstPreview" class="assessment-preview hidden">
+                <div id="assessmentIstCounts" class="preview-counts"></div>
+                <div class="table-scroll">
+                  <table id="assessmentIstTable" class="preview-table">
+                    <thead><tr><th class="col-check"></th><th>Type</th><th>Name</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+                <div class="preview-actions">
+                  <button id="assessmentIstDiscardBtn" class="btn ghost" type="button">Discard</button>
+                  <button id="assessmentIstApplyBtn" class="btn primary" type="button">Create in Archi</button>
+                </div>
+              </div>
+              <div class="assessment-step-actions">
+                <button id="assessmentIstBackBtn" class="btn ghost" type="button">Back</button>
+                <button id="assessmentIstContinueBtn" class="btn primary" type="button" disabled>Continue to Soll-Architektur</button>
+              </div>
+            </section>
+
+            <section id="assessmentStepSoll" class="card assessment-step hidden">
+              <h3>3. Soll-Architektur (Target Architecture Builder)</h3>
+              <p>Upload target requirements, reference-model notes, or workshop outputs describing the desired to-be architecture. Elements are tagged status=target and added to the Soll view from Setup.</p>
+              <form id="assessmentSollForm" class="action-form">
+                <input id="assessmentSollFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
+                <button id="assessmentSollBtn" class="btn primary" type="submit">Preview extraction</button>
+              </form>
+              <div id="assessmentSollStatus" class="action-status hidden"></div>
+              <div id="assessmentSollPreview" class="assessment-preview hidden">
+                <div id="assessmentSollCounts" class="preview-counts"></div>
+                <div class="table-scroll">
+                  <table id="assessmentSollTable" class="preview-table">
+                    <thead><tr><th class="col-check"></th><th>Type</th><th>Name</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+                <div class="preview-actions">
+                  <button id="assessmentSollDiscardBtn" class="btn ghost" type="button">Discard</button>
+                  <button id="assessmentSollApplyBtn" class="btn primary" type="button">Create in Archi</button>
+                </div>
+              </div>
+              <div class="assessment-step-actions">
+                <button id="assessmentSollBackBtn" class="btn ghost" type="button">Back</button>
+                <button id="assessmentSollContinueBtn" class="btn primary" type="button" disabled>Continue to Mapping &amp; Gap-Analyse</button>
+              </div>
+            </section>
+
+            <section id="assessmentStepMapping" class="card assessment-step hidden">
+              <h3>4. Mapping &amp; Gap-Analyse</h3>
+              <p>Compares every Ist business process already in the model against the Soll business processes and classifies each pairing as a full match, partial match, legacy process with no Soll equivalent, or a new Soll process with no Ist equivalent.</p>
+              <button id="assessmentMappingRunBtn" class="btn primary" type="button">Run mapping &amp; gap analysis</button>
+              <div id="assessmentMappingStatus" class="action-status hidden"></div>
+              <div id="assessmentMappingResult" class="assessment-preview hidden">
+                <h4>Mappings</h4>
+                <div class="table-scroll">
+                  <table id="assessmentMappingTable" class="preview-table">
+                    <thead><tr><th class="col-check"></th><th>Ist process</th><th>Match</th><th>Soll process</th><th>Rationale</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+                <h4>Gap report</h4>
+                <div class="table-scroll">
+                  <table id="assessmentGapTable" class="preview-table">
+                    <thead><tr><th>Category</th><th>Criticality</th><th>Description</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+                <div class="preview-actions">
+                  <button id="assessmentMappingApplyBtn" class="btn primary" type="button">Apply mappings to Archi</button>
+                </div>
+              </div>
+              <div class="assessment-step-actions">
+                <button id="assessmentMappingBackBtn" class="btn ghost" type="button">Back</button>
+                <button id="assessmentMappingContinueBtn" class="btn primary" type="button" disabled>Continue to Summary</button>
+              </div>
+            </section>
+
+            <section id="assessmentStepSummary" class="card assessment-step hidden">
+              <h3>5. Business Summary</h3>
+              <p>Aggregates the mapping and gap results into a compact, management-ready summary.</p>
+              <button id="assessmentSummaryRunBtn" class="btn primary" type="button">Generate summary</button>
+              <div id="assessmentSummaryStatus" class="action-status hidden"></div>
+              <div id="assessmentSummaryResult" class="assessment-preview hidden">
+                <div id="assessmentSummaryStats" class="kv-grid"></div>
+                <h4>Executive summary</h4>
+                <p id="assessmentSummaryText" class="assessment-summary-text"></p>
+                <button id="assessmentSummaryCopyBtn" class="btn ghost small" type="button">Copy</button>
+              </div>
+              <div class="assessment-step-actions">
+                <button id="assessmentSummaryBackBtn" class="btn ghost" type="button">Back</button>
+                <span></span>
               </div>
             </section>
           </section>
@@ -252,6 +388,21 @@
             </form>
           </div>
         </aside>
+      </div>
+    </div>
+
+    <div id="metaModelModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="metaModelTitle">
+      <div class="modal-card">
+        <header class="modal-head">
+          <div>
+            <h2 id="metaModelTitle">Governance meta-model</h2>
+            <p>Element types and relationships the assistant and uploads are required to follow.</p>
+          </div>
+          <button id="metaModelCloseBtn" class="btn ghost small" type="button" aria-label="Close">Close</button>
+        </header>
+        <div id="metaModelBody" class="modal-body">
+          <div class="empty-state">Loading meta-model...</div>
+        </div>
       </div>
     </div>
 

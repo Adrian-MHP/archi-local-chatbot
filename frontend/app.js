@@ -23,7 +23,25 @@ const state = {
   actionLog: [],
   activeTab: "workspaceTab",
   chatCollapsed: false,
+  diagramZoom: 1,
+  diagramPan: { x: 0, y: 0 },
+  diagramDrag: null,
+  metaModel: null,
+  assessment: {
+    currentStep: "setup",
+    completedSteps: new Set(),
+    pending: false,
+    istPlan: null,
+    sollPlan: null,
+    mappingResult: null,
+  },
 };
+
+const ASSESSMENT_STEPS = ["setup", "ist", "soll", "mapping", "summary"];
+
+const DIAGRAM_ZOOM_MIN = 0.2;
+const DIAGRAM_ZOOM_MAX = 4;
+const DIAGRAM_ZOOM_STEP = 1.25;
 
 const elements = {
   appGrid: document.getElementById("appGrid"),
@@ -62,10 +80,6 @@ const elements = {
   businessProcessFile: document.getElementById("businessProcessFile"),
   businessProcessViewName: document.getElementById("businessProcessViewName"),
   businessProcessBtn: document.getElementById("businessProcessBtn"),
-  requirementsForm: document.getElementById("requirementsForm"),
-  requirementsFile: document.getElementById("requirementsFile"),
-  requirementsViewName: document.getElementById("requirementsViewName"),
-  requirementsBtn: document.getElementById("requirementsBtn"),
   actionStatus: document.getElementById("actionStatus"),
   previewPanel: document.getElementById("previewPanel"),
   previewEmptyState: document.getElementById("previewEmptyState"),
@@ -75,11 +89,62 @@ const elements = {
   previewCounts: document.getElementById("previewCounts"),
   previewWarnings: document.getElementById("previewWarnings"),
   previewDiagram: document.getElementById("previewDiagram"),
+  previewDiagramStage: document.getElementById("previewDiagramStage"),
+  diagramZoomInBtn: document.getElementById("diagramZoomInBtn"),
+  diagramZoomOutBtn: document.getElementById("diagramZoomOutBtn"),
+  diagramResetViewBtn: document.getElementById("diagramResetViewBtn"),
+  diagramZoomLabel: document.getElementById("diagramZoomLabel"),
   elementsTable: document.getElementById("elementsTable"),
   relationshipsTable: document.getElementById("relationshipsTable"),
   discardPreviewBtn: document.getElementById("discardPreviewBtn"),
   applyPreviewBtn: document.getElementById("applyPreviewBtn"),
   actionLog: document.getElementById("actionLog"),
+  metaModelBtn: document.getElementById("metaModelBtn"),
+  metaModelModal: document.getElementById("metaModelModal"),
+  metaModelCloseBtn: document.getElementById("metaModelCloseBtn"),
+  metaModelBody: document.getElementById("metaModelBody"),
+  assessmentIstViewName: document.getElementById("assessmentIstViewName"),
+  assessmentSollViewName: document.getElementById("assessmentSollViewName"),
+  assessmentSetupBtn: document.getElementById("assessmentSetupBtn"),
+  assessmentSetupResult: document.getElementById("assessmentSetupResult"),
+  assessmentSetupContinueBtn: document.getElementById("assessmentSetupContinueBtn"),
+  assessmentIstForm: document.getElementById("assessmentIstForm"),
+  assessmentIstFile: document.getElementById("assessmentIstFile"),
+  assessmentIstBtn: document.getElementById("assessmentIstBtn"),
+  assessmentIstStatus: document.getElementById("assessmentIstStatus"),
+  assessmentIstPreview: document.getElementById("assessmentIstPreview"),
+  assessmentIstCounts: document.getElementById("assessmentIstCounts"),
+  assessmentIstTable: document.getElementById("assessmentIstTable"),
+  assessmentIstDiscardBtn: document.getElementById("assessmentIstDiscardBtn"),
+  assessmentIstApplyBtn: document.getElementById("assessmentIstApplyBtn"),
+  assessmentIstBackBtn: document.getElementById("assessmentIstBackBtn"),
+  assessmentIstContinueBtn: document.getElementById("assessmentIstContinueBtn"),
+  assessmentSollForm: document.getElementById("assessmentSollForm"),
+  assessmentSollFile: document.getElementById("assessmentSollFile"),
+  assessmentSollBtn: document.getElementById("assessmentSollBtn"),
+  assessmentSollStatus: document.getElementById("assessmentSollStatus"),
+  assessmentSollPreview: document.getElementById("assessmentSollPreview"),
+  assessmentSollCounts: document.getElementById("assessmentSollCounts"),
+  assessmentSollTable: document.getElementById("assessmentSollTable"),
+  assessmentSollDiscardBtn: document.getElementById("assessmentSollDiscardBtn"),
+  assessmentSollApplyBtn: document.getElementById("assessmentSollApplyBtn"),
+  assessmentSollBackBtn: document.getElementById("assessmentSollBackBtn"),
+  assessmentSollContinueBtn: document.getElementById("assessmentSollContinueBtn"),
+  assessmentMappingRunBtn: document.getElementById("assessmentMappingRunBtn"),
+  assessmentMappingStatus: document.getElementById("assessmentMappingStatus"),
+  assessmentMappingResult: document.getElementById("assessmentMappingResult"),
+  assessmentMappingTable: document.getElementById("assessmentMappingTable"),
+  assessmentGapTable: document.getElementById("assessmentGapTable"),
+  assessmentMappingApplyBtn: document.getElementById("assessmentMappingApplyBtn"),
+  assessmentMappingBackBtn: document.getElementById("assessmentMappingBackBtn"),
+  assessmentMappingContinueBtn: document.getElementById("assessmentMappingContinueBtn"),
+  assessmentSummaryRunBtn: document.getElementById("assessmentSummaryRunBtn"),
+  assessmentSummaryStatus: document.getElementById("assessmentSummaryStatus"),
+  assessmentSummaryResult: document.getElementById("assessmentSummaryResult"),
+  assessmentSummaryStats: document.getElementById("assessmentSummaryStats"),
+  assessmentSummaryText: document.getElementById("assessmentSummaryText"),
+  assessmentSummaryCopyBtn: document.getElementById("assessmentSummaryCopyBtn"),
+  assessmentSummaryBackBtn: document.getElementById("assessmentSummaryBackBtn"),
 };
 
 function validateRequiredElements() {
@@ -538,12 +603,6 @@ const PREVIEW_CONFIG = {
     viewInput: () => elements.businessProcessViewName,
     label: "Business process",
   },
-  "requirements-upload": {
-    endpoint: "/api/actions/requirements-upload/preview",
-    fileInput: () => elements.requirementsFile,
-    viewInput: () => elements.requirementsViewName,
-    label: "Requirements",
-  },
 };
 
 function buildKeyIndex(plan) {
@@ -567,6 +626,31 @@ function typeColor(type) {
 function truncateLabel(text, maxLen) {
   const t = String(text || "");
   return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
+}
+
+function wrapLabel(text, maxCharsPerLine, maxLines) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = "";
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > maxCharsPerLine && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(current);
+  if (!lines.length) return [""];
+
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines);
+    const last = kept[maxLines - 1];
+    kept[maxLines - 1] = last.length > 2 ? `${last.slice(0, maxCharsPerLine - 1)}…` : `${last}…`;
+    return kept;
+  }
+  return lines;
 }
 
 function rectBoundaryPoint(cx, cy, halfW, halfH, dx, dy) {
@@ -600,15 +684,30 @@ function buildRelationshipLine(svgNS, sourcePos, targetPos, offsetX, offsetY) {
   return line;
 }
 
+function computeElementBoxHeight(pos, name) {
+  const paddingX = 8;
+  const nameStartY = 40;
+  const lineHeight = 15;
+  const maxLines = 6;
+  const maxCharsPerLine = Math.max(10, Math.floor((pos.width - paddingX * 2) / 6.4));
+  const nameLines = wrapLabel(name, maxCharsPerLine, maxLines);
+  const neededHeight = nameStartY + nameLines.length * lineHeight + 10;
+  return { nameLines, height: Math.max(pos.height, neededHeight), maxCharsPerLine };
+}
+
 function buildElementNode(svgNS, el, pos, offsetX, offsetY) {
   const palette = typeColor(el.type);
   const group = document.createElementNS(svgNS, "g");
+  const paddingX = 8;
+  const nameStartY = 40;
+  const lineHeight = 15;
+  const { nameLines, height: boxHeight } = computeElementBoxHeight(pos, el.name);
 
   const rect = document.createElementNS(svgNS, "rect");
   rect.setAttribute("x", String(pos.x + offsetX));
   rect.setAttribute("y", String(pos.y + offsetY));
   rect.setAttribute("width", String(pos.width));
-  rect.setAttribute("height", String(pos.height));
+  rect.setAttribute("height", String(boxHeight));
   rect.setAttribute("rx", "8");
   rect.setAttribute("fill", palette.fill);
   rect.setAttribute("stroke", palette.stroke);
@@ -616,19 +715,23 @@ function buildElementNode(svgNS, el, pos, offsetX, offsetY) {
   group.appendChild(rect);
 
   const typeLabel = document.createElementNS(svgNS, "text");
-  typeLabel.setAttribute("x", String(pos.x + offsetX + 8));
+  typeLabel.setAttribute("x", String(pos.x + offsetX + paddingX));
   typeLabel.setAttribute("y", String(pos.y + offsetY + 17));
   typeLabel.setAttribute("class", "diagram-type-label");
   typeLabel.setAttribute("fill", palette.stroke);
-  typeLabel.textContent = truncateLabel(el.type, 26);
+  typeLabel.textContent = el.type;
   group.appendChild(typeLabel);
 
   const nameLabel = document.createElementNS(svgNS, "text");
-  nameLabel.setAttribute("x", String(pos.x + offsetX + 8));
-  nameLabel.setAttribute("y", String(pos.y + offsetY + 40));
   nameLabel.setAttribute("class", "diagram-name-label");
   nameLabel.setAttribute("fill", palette.text);
-  nameLabel.textContent = truncateLabel(el.name, 22);
+  nameLines.forEach((line, index) => {
+    const tspan = document.createElementNS(svgNS, "tspan");
+    tspan.setAttribute("x", String(pos.x + offsetX + paddingX));
+    tspan.setAttribute("y", String(pos.y + offsetY + nameStartY + index * lineHeight));
+    tspan.textContent = line;
+    nameLabel.appendChild(tspan);
+  });
   group.appendChild(nameLabel);
 
   const titleEl = document.createElementNS(svgNS, "title");
@@ -639,7 +742,7 @@ function buildElementNode(svgNS, el, pos, offsetX, offsetY) {
 }
 
 function renderPreviewDiagram() {
-  const container = elements.previewDiagram;
+  const container = elements.previewDiagramStage;
   container.innerHTML = "";
   const plan = state.currentPlan;
   if (!plan) return;
@@ -661,12 +764,16 @@ function renderPreviewDiagram() {
   const positions = {};
   includedElements.forEach((el, index) => {
     const pos = plan.layout_positions ? plan.layout_positions[el.key] : null;
-    positions[el.key] = pos || {
+    const basePos = pos || {
       x: 100 + (index % 4) * 260,
       y: 100 + Math.floor(index / 4) * 140,
       width: 200,
       height: 80,
     };
+    // Grow the rendered box height to fit the full (word-wrapped) name so labels are
+    // never cut off with an ellipsis in the preview.
+    const { height } = computeElementBoxHeight(basePos, el.name);
+    positions[el.key] = { ...basePos, height };
   });
 
   let minX = Infinity;
@@ -720,6 +827,80 @@ function renderPreviewDiagram() {
   }
 
   container.appendChild(svg);
+}
+
+function applyDiagramTransform() {
+  elements.previewDiagramStage.style.transform =
+    `translate(${state.diagramPan.x}px, ${state.diagramPan.y}px) scale(${state.diagramZoom})`;
+  elements.diagramZoomLabel.textContent = `${Math.round(state.diagramZoom * 100)}%`;
+}
+
+function resetDiagramView() {
+  state.diagramZoom = 1;
+  state.diagramPan = { x: 0, y: 0 };
+  applyDiagramTransform();
+}
+
+function setDiagramZoom(nextZoom, anchor) {
+  const clamped = Math.min(DIAGRAM_ZOOM_MAX, Math.max(DIAGRAM_ZOOM_MIN, nextZoom));
+  if (anchor) {
+    const ratio = clamped / state.diagramZoom;
+    state.diagramPan = {
+      x: anchor.x - (anchor.x - state.diagramPan.x) * ratio,
+      y: anchor.y - (anchor.y - state.diagramPan.y) * ratio,
+    };
+  }
+  state.diagramZoom = clamped;
+  applyDiagramTransform();
+}
+
+function attachDiagramInteractions() {
+  const viewport = elements.previewDiagram;
+
+  viewport.addEventListener("wheel", (event) => {
+    if (!state.currentPlan) return;
+    event.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const direction = event.deltaY < 0 ? DIAGRAM_ZOOM_STEP : 1 / DIAGRAM_ZOOM_STEP;
+    setDiagramZoom(state.diagramZoom * direction, anchor);
+  }, { passive: false });
+
+  viewport.addEventListener("mousedown", (event) => {
+    if (!state.currentPlan) return;
+    state.diagramDrag = {
+      startX: event.clientX,
+      startY: event.clientY,
+      startPan: { ...state.diagramPan },
+    };
+    viewport.classList.add("dragging");
+  });
+
+  window.addEventListener("mousemove", (event) => {
+    if (!state.diagramDrag) return;
+    const dx = event.clientX - state.diagramDrag.startX;
+    const dy = event.clientY - state.diagramDrag.startY;
+    state.diagramPan = {
+      x: state.diagramDrag.startPan.x + dx,
+      y: state.diagramDrag.startPan.y + dy,
+    };
+    applyDiagramTransform();
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!state.diagramDrag) return;
+    state.diagramDrag = null;
+    viewport.classList.remove("dragging");
+  });
+
+  viewport.addEventListener("dblclick", () => {
+    if (!state.currentPlan) return;
+    resetDiagramView();
+  });
+
+  elements.diagramZoomInBtn.addEventListener("click", () => setDiagramZoom(state.diagramZoom * DIAGRAM_ZOOM_STEP));
+  elements.diagramZoomOutBtn.addEventListener("click", () => setDiagramZoom(state.diagramZoom / DIAGRAM_ZOOM_STEP));
+  elements.diagramResetViewBtn.addEventListener("click", resetDiagramView);
 }
 
 function renderElementsTable() {
@@ -895,6 +1076,7 @@ function renderPreview() {
   renderPreviewDiagram();
   renderPreviewCounts();
   renderPreviewWarnings();
+  resetDiagramView();
   updateActionButtonsState();
 }
 
@@ -1053,6 +1235,706 @@ async function applyPreview() {
     state.pendingAction = null;
     updateActionButtonsState();
   }
+}
+
+/* ---------------- Architecture Assessment wizard ---------------- */
+
+function setAssessmentStatus(el, message, tone = "neutral") {
+  el.textContent = String(message || "");
+  el.className = "action-status";
+  if (tone) el.classList.add(`action-${tone}`);
+  el.classList.toggle("hidden", !message);
+}
+
+function refreshAssessmentStepperClasses() {
+  document.querySelectorAll(".assessment-step-btn").forEach((btn) => {
+    const btnStep = btn.dataset.step;
+    btn.classList.toggle("active", btnStep === state.assessment.currentStep);
+    btn.classList.toggle("completed", state.assessment.completedSteps.has(btnStep));
+  });
+}
+
+const ASSESSMENT_PANEL_ID_BY_STEP = {
+  setup: "assessmentStepSetup",
+  ist: "assessmentStepIst",
+  soll: "assessmentStepSoll",
+  mapping: "assessmentStepMapping",
+  summary: "assessmentStepSummary",
+};
+
+function setAssessmentStep(step) {
+  if (!ASSESSMENT_STEPS.includes(step)) return;
+  state.assessment.currentStep = step;
+  Object.entries(ASSESSMENT_PANEL_ID_BY_STEP).forEach(([key, id]) => {
+    const panel = document.getElementById(id);
+    if (panel) panel.classList.toggle("hidden", key !== step);
+  });
+  refreshAssessmentStepperClasses();
+}
+
+function markAssessmentStepComplete(step) {
+  state.assessment.completedSteps.add(step);
+  const idx = ASSESSMENT_STEPS.indexOf(step);
+  const nextStep = ASSESSMENT_STEPS[idx + 1];
+  if (nextStep) {
+    const nextBtn = document.querySelector(`.assessment-step-btn[data-step="${nextStep}"]`);
+    if (nextBtn) nextBtn.disabled = false;
+  }
+  refreshAssessmentStepperClasses();
+}
+
+async function runAssessmentSetup() {
+  const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
+  const sollViewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+  elements.assessmentSetupBtn.disabled = true;
+  elements.assessmentSetupResult.classList.add("hidden");
+  try {
+    const params = new URLSearchParams({ ist_view_name: istViewName, soll_view_name: sollViewName });
+    const res = await fetch(`/api/assessment/setup?${params.toString()}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Setup check failed (${res.status})`);
+
+    const box = elements.assessmentSetupResult;
+    box.innerHTML = "";
+    box.classList.remove("hidden");
+    for (const note of data.notes || []) {
+      const p = document.createElement("p");
+      p.textContent = note;
+      box.appendChild(p);
+    }
+    elements.assessmentSetupContinueBtn.disabled = false;
+    markAssessmentStepComplete("setup");
+  } catch (err) {
+    const box = elements.assessmentSetupResult;
+    box.innerHTML = "";
+    box.classList.remove("hidden");
+    const p = document.createElement("p");
+    p.textContent = `Error: ${err.message || String(err)}`;
+    box.appendChild(p);
+  } finally {
+    elements.assessmentSetupBtn.disabled = false;
+  }
+}
+
+function updateAssessmentCounts(plan, countsEl) {
+  const included = plan.elements.filter((el) => el.include).length;
+  countsEl.textContent =
+    `${included}/${plan.elements.length} elements selected · ${plan.relationships.length} relationship(s) ` +
+    `will be created · ${plan.steps_processed} steps processed`;
+}
+
+function renderAssessmentElementsTable(plan, tbodyEl, countsEl) {
+  tbodyEl.innerHTML = "";
+  if (!plan || !plan.elements.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    td.className = "empty-state";
+    td.textContent = "No elements extracted.";
+    tr.appendChild(td);
+    tbodyEl.appendChild(tr);
+    if (countsEl) countsEl.textContent = "";
+    return;
+  }
+  plan.elements.forEach((el) => {
+    const tr = document.createElement("tr");
+    if (!el.include) tr.classList.add("row-excluded");
+
+    const checkTd = document.createElement("td");
+    checkTd.className = "col-check";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = el.include;
+    checkbox.addEventListener("change", () => {
+      el.include = checkbox.checked;
+      tr.classList.toggle("row-excluded", !el.include);
+      if (countsEl) updateAssessmentCounts(plan, countsEl);
+    });
+    checkTd.appendChild(checkbox);
+    tr.appendChild(checkTd);
+
+    const typeTd = document.createElement("td");
+    typeTd.className = "cell-type";
+    typeTd.textContent = el.type;
+    tr.appendChild(typeTd);
+
+    const nameTd = document.createElement("td");
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.value = el.name;
+    nameInput.maxLength = 120;
+    nameInput.className = "cell-name-input";
+    nameInput.addEventListener("input", () => {
+      el.name = nameInput.value;
+    });
+    nameTd.appendChild(nameInput);
+    tr.appendChild(nameTd);
+
+    tbodyEl.appendChild(tr);
+  });
+  if (countsEl) updateAssessmentCounts(plan, countsEl);
+}
+
+async function loadAssessmentIstPreview() {
+  const file = elements.assessmentIstFile.files && elements.assessmentIstFile.files[0];
+  if (!file) {
+    setAssessmentStatus(elements.assessmentIstStatus, "Select a file first.", "error");
+    return;
+  }
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentIstBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentIstStatus, `Extracting preview from '${file.name}'...`, "pending");
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("view_name", elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse");
+    const res = await fetch("/api/actions/business-process-upload/preview", { method: "POST", body: formData });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
+    state.assessment.istPlan = data;
+    elements.assessmentIstPreview.classList.remove("hidden");
+    renderAssessmentElementsTable(data, elements.assessmentIstTable.querySelector("tbody"), elements.assessmentIstCounts);
+    setAssessmentStatus(
+      elements.assessmentIstStatus,
+      `Preview ready: ${data.elements.length} elements, ${data.relationships.length} relationships. Review, then click "Create in Archi".`,
+      "ok"
+    );
+    elements.assessmentIstFile.value = "";
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentIstStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentIstBtn.disabled = false;
+  }
+}
+
+async function applyAssessmentIstPlan() {
+  const plan = state.assessment.istPlan;
+  if (!plan || state.assessment.pending) return;
+  if (!plan.elements.some((el) => el.include)) {
+    setAssessmentStatus(elements.assessmentIstStatus, "Select at least one element before applying.", "error");
+    return;
+  }
+  state.assessment.pending = true;
+  elements.assessmentIstApplyBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentIstStatus, `Creating '${plan.view_name}' in Archi...`, "pending");
+  try {
+    const res = await fetch("/api/actions/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Apply failed (${res.status})`);
+    setAssessmentStatus(elements.assessmentIstStatus, data.summary || "Applied to Archi.", "ok");
+    pushActionLogEntry({
+      action: "business-process-upload",
+      viewName: data.view_name || plan.view_name,
+      summary: data.summary || "Applied to Archi.",
+      tone: "ok",
+    });
+    markAssessmentStepComplete("ist");
+    elements.assessmentIstContinueBtn.disabled = false;
+    state.assessment.istPlan = null;
+    elements.assessmentIstPreview.classList.add("hidden");
+    await loadHealth();
+    await loadTools();
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentIstStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentIstApplyBtn.disabled = false;
+  }
+}
+
+function discardAssessmentIstPlan() {
+  state.assessment.istPlan = null;
+  elements.assessmentIstPreview.classList.add("hidden");
+  setAssessmentStatus(elements.assessmentIstStatus, "Preview discarded. Nothing was written to Archi.", "neutral");
+}
+
+async function loadAssessmentSollPreview() {
+  const file = elements.assessmentSollFile.files && elements.assessmentSollFile.files[0];
+  if (!file) {
+    setAssessmentStatus(elements.assessmentSollStatus, "Select a file first.", "error");
+    return;
+  }
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentSollBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentSollStatus, `Extracting preview from '${file.name}'...`, "pending");
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("view_name", elements.assessmentSollViewName.value.trim() || "Soll-Architektur");
+    const res = await fetch("/api/assessment/soll-architecture/preview", { method: "POST", body: formData });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
+    state.assessment.sollPlan = data;
+    elements.assessmentSollPreview.classList.remove("hidden");
+    renderAssessmentElementsTable(data, elements.assessmentSollTable.querySelector("tbody"), elements.assessmentSollCounts);
+    setAssessmentStatus(
+      elements.assessmentSollStatus,
+      `Preview ready: ${data.elements.length} elements, ${data.relationships.length} relationships (tagged status=target). Review, then click "Create in Archi".`,
+      "ok"
+    );
+    elements.assessmentSollFile.value = "";
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentSollBtn.disabled = false;
+  }
+}
+
+async function applyAssessmentSollPlan() {
+  const plan = state.assessment.sollPlan;
+  if (!plan || state.assessment.pending) return;
+  if (!plan.elements.some((el) => el.include)) {
+    setAssessmentStatus(elements.assessmentSollStatus, "Select at least one element before applying.", "error");
+    return;
+  }
+  state.assessment.pending = true;
+  elements.assessmentSollApplyBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentSollStatus, `Creating '${plan.view_name}' in Archi...`, "pending");
+  try {
+    const res = await fetch("/api/actions/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Apply failed (${res.status})`);
+    setAssessmentStatus(elements.assessmentSollStatus, data.summary || "Applied to Archi.", "ok");
+    pushActionLogEntry({
+      action: "assessment-soll-upload",
+      viewName: data.view_name || plan.view_name,
+      summary: data.summary || "Applied to Archi.",
+      tone: "ok",
+    });
+    markAssessmentStepComplete("soll");
+    elements.assessmentSollContinueBtn.disabled = false;
+    state.assessment.sollPlan = null;
+    elements.assessmentSollPreview.classList.add("hidden");
+    await loadHealth();
+    await loadTools();
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentSollApplyBtn.disabled = false;
+  }
+}
+
+function discardAssessmentSollPlan() {
+  state.assessment.sollPlan = null;
+  elements.assessmentSollPreview.classList.add("hidden");
+  setAssessmentStatus(elements.assessmentSollStatus, "Preview discarded. Nothing was written to Archi.", "neutral");
+}
+
+const ASSESSMENT_MATCH_TYPE_LABELS = {
+  full: "Full match",
+  partial: "Partial match",
+  legacy_no_soll: "Legacy (no Soll)",
+  gap_new: "New (no Ist)",
+};
+
+const ASSESSMENT_CRITICALITY_LABELS = { high: "High", medium: "Medium", low: "Low" };
+
+const ASSESSMENT_CATEGORY_LABELS = {
+  missing_process: "Missing process",
+  redundancy: "Redundancy",
+  structural_difference: "Structural difference",
+  tooling_data_gap: "Tooling / data gap",
+};
+
+function renderAssessmentMappingTable(data) {
+  const tbody = elements.assessmentMappingTable.querySelector("tbody");
+  tbody.innerHTML = "";
+  if (!data.mappings.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "empty-state";
+    td.textContent = "No mappings.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  data.mappings.forEach((mapping) => {
+    const tr = document.createElement("tr");
+    const endpointsComplete = Boolean(mapping.ist_key && mapping.soll_key);
+    if (!mapping.include || !endpointsComplete) tr.classList.add("row-excluded");
+
+    const checkTd = document.createElement("td");
+    checkTd.className = "col-check";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = mapping.include;
+    checkbox.disabled = !endpointsComplete;
+    checkbox.title = endpointsComplete ? "" : "Only mappings with both an Ist and a Soll process can be applied";
+    checkbox.addEventListener("change", () => {
+      mapping.include = checkbox.checked;
+      tr.classList.toggle("row-excluded", !mapping.include || !endpointsComplete);
+    });
+    checkTd.appendChild(checkbox);
+    tr.appendChild(checkTd);
+
+    const istTd = document.createElement("td");
+    istTd.textContent = mapping.ist_name || "—";
+    tr.appendChild(istTd);
+
+    const matchTd = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = `cell-match-type match-${mapping.match_type}`;
+    badge.textContent = ASSESSMENT_MATCH_TYPE_LABELS[mapping.match_type] || mapping.match_type;
+    matchTd.appendChild(badge);
+    tr.appendChild(matchTd);
+
+    const sollTd = document.createElement("td");
+    sollTd.textContent = mapping.soll_name || "—";
+    tr.appendChild(sollTd);
+
+    const rationaleTd = document.createElement("td");
+    rationaleTd.className = "meta-model-note";
+    rationaleTd.textContent = mapping.rationale || "";
+    tr.appendChild(rationaleTd);
+
+    tbody.appendChild(tr);
+  });
+}
+
+function renderAssessmentGapTable(data) {
+  const tbody = elements.assessmentGapTable.querySelector("tbody");
+  tbody.innerHTML = "";
+  if (!data.gaps.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    td.className = "empty-state";
+    td.textContent = "No gaps identified.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  data.gaps.forEach((gap) => {
+    const tr = document.createElement("tr");
+
+    const categoryTd = document.createElement("td");
+    categoryTd.textContent = ASSESSMENT_CATEGORY_LABELS[gap.category] || gap.category;
+    tr.appendChild(categoryTd);
+
+    const criticalityTd = document.createElement("td");
+    const span = document.createElement("span");
+    span.className = `criticality-${gap.criticality}`;
+    span.textContent = ASSESSMENT_CRITICALITY_LABELS[gap.criticality] || gap.criticality;
+    criticalityTd.appendChild(span);
+    tr.appendChild(criticalityTd);
+
+    const descTd = document.createElement("td");
+    descTd.textContent = gap.description;
+    tr.appendChild(descTd);
+
+    tbody.appendChild(tr);
+  });
+}
+
+async function runAssessmentMapping() {
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentMappingRunBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentMappingStatus, "Running mapping & gap analysis...", "pending");
+  try {
+    const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
+    const sollViewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+    const res = await fetch("/api/assessment/mapping/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ist_view_name: istViewName, soll_view_name: sollViewName }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Mapping analysis failed (${res.status})`);
+    state.assessment.mappingResult = data;
+    elements.assessmentMappingResult.classList.remove("hidden");
+    renderAssessmentMappingTable(data);
+    renderAssessmentGapTable(data);
+    const warningText = data.warnings && data.warnings.length ? ` (${data.warnings.join(" ")})` : "";
+    setAssessmentStatus(
+      elements.assessmentMappingStatus,
+      `Found ${data.mappings.length} mapping(s) and ${data.gaps.length} gap(s).${warningText}`,
+      "ok"
+    );
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentMappingStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentMappingRunBtn.disabled = false;
+  }
+}
+
+async function applyAssessmentMappings() {
+  const result = state.assessment.mappingResult;
+  if (!result || state.assessment.pending) return;
+  const included = result.mappings.filter((m) => m.include && m.ist_key && m.soll_key);
+  if (!included.length) {
+    setAssessmentStatus(elements.assessmentMappingStatus, "Select at least one full/partial mapping to apply.", "error");
+    return;
+  }
+  state.assessment.pending = true;
+  elements.assessmentMappingApplyBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentMappingStatus, "Applying mappings to Archi...", "pending");
+  try {
+    const res = await fetch("/api/assessment/mapping/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mappings: result.mappings }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Applying mappings failed (${res.status})`);
+    setAssessmentStatus(elements.assessmentMappingStatus, data.summary || "Mappings applied.", "ok");
+    pushActionLogEntry({
+      action: "assessment-mapping",
+      viewName: "Ist ↔ Soll mapping",
+      summary: data.summary || "Mappings applied.",
+      tone: "ok",
+    });
+    markAssessmentStepComplete("mapping");
+    elements.assessmentMappingContinueBtn.disabled = false;
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentMappingStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentMappingApplyBtn.disabled = false;
+  }
+}
+
+function renderAssessmentSummary(data) {
+  const stats = elements.assessmentSummaryStats;
+  stats.innerHTML = "";
+  const rows = [
+    ["Ist processes mapped", data.ist_process_count],
+    ["Soll processes mapped", data.soll_process_count],
+    ["Full matches", data.full_matches],
+    ["Partial matches", data.partial_matches],
+    ["Gaps identified", data.gap_count],
+    ["Critical gaps", data.critical_gap_count],
+    ["Average similarity", `${data.average_similarity}%`],
+    ["Maturity score", `${data.maturity_score}%`],
+  ];
+  for (const [label, value] of rows) {
+    const div = document.createElement("div");
+    const span = document.createElement("span");
+    span.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = String(value);
+    div.appendChild(span);
+    div.appendChild(strong);
+    stats.appendChild(div);
+  }
+  elements.assessmentSummaryText.textContent = data.executive_summary || "";
+}
+
+async function runAssessmentSummary() {
+  const result = state.assessment.mappingResult;
+  if (!result) {
+    setAssessmentStatus(elements.assessmentSummaryStatus, "Run mapping & gap analysis first.", "error");
+    return;
+  }
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentSummaryRunBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentSummaryStatus, "Generating summary...", "pending");
+  try {
+    const res = await fetch("/api/assessment/summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mappings: result.mappings, gaps: result.gaps }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Summary generation failed (${res.status})`);
+    renderAssessmentSummary(data);
+    elements.assessmentSummaryResult.classList.remove("hidden");
+    setAssessmentStatus(elements.assessmentSummaryStatus, "Summary generated.", "ok");
+    markAssessmentStepComplete("summary");
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentSummaryStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentSummaryRunBtn.disabled = false;
+  }
+}
+
+function attachAssessmentEventHandlers() {
+  document.querySelectorAll(".assessment-step-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.disabled) return;
+      setAssessmentStep(btn.dataset.step);
+    });
+  });
+
+  elements.assessmentSetupBtn.addEventListener("click", runAssessmentSetup);
+  elements.assessmentSetupContinueBtn.addEventListener("click", () => setAssessmentStep("ist"));
+
+  elements.assessmentIstForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await loadAssessmentIstPreview();
+  });
+  elements.assessmentIstApplyBtn.addEventListener("click", applyAssessmentIstPlan);
+  elements.assessmentIstDiscardBtn.addEventListener("click", discardAssessmentIstPlan);
+  elements.assessmentIstBackBtn.addEventListener("click", () => setAssessmentStep("setup"));
+  elements.assessmentIstContinueBtn.addEventListener("click", () => setAssessmentStep("soll"));
+
+  elements.assessmentSollForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await loadAssessmentSollPreview();
+  });
+  elements.assessmentSollApplyBtn.addEventListener("click", applyAssessmentSollPlan);
+  elements.assessmentSollDiscardBtn.addEventListener("click", discardAssessmentSollPlan);
+  elements.assessmentSollBackBtn.addEventListener("click", () => setAssessmentStep("ist"));
+  elements.assessmentSollContinueBtn.addEventListener("click", () => setAssessmentStep("mapping"));
+
+  elements.assessmentMappingRunBtn.addEventListener("click", runAssessmentMapping);
+  elements.assessmentMappingApplyBtn.addEventListener("click", applyAssessmentMappings);
+  elements.assessmentMappingBackBtn.addEventListener("click", () => setAssessmentStep("soll"));
+  elements.assessmentMappingContinueBtn.addEventListener("click", () => setAssessmentStep("summary"));
+
+  elements.assessmentSummaryRunBtn.addEventListener("click", runAssessmentSummary);
+  elements.assessmentSummaryBackBtn.addEventListener("click", () => setAssessmentStep("mapping"));
+  elements.assessmentSummaryCopyBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(elements.assessmentSummaryText.textContent || "");
+      const original = elements.assessmentSummaryCopyBtn.textContent;
+      elements.assessmentSummaryCopyBtn.textContent = "Copied";
+      setTimeout(() => {
+        elements.assessmentSummaryCopyBtn.textContent = original;
+      }, 1200);
+    } catch (err) {
+      // clipboard unavailable; ignore
+    }
+  });
+}
+
+/* ---------------- Meta model viewer ---------------- */
+
+async function loadMetaModel() {
+  if (state.metaModel) return state.metaModel;
+  const res = await fetch("/api/meta-model");
+  if (!res.ok) {
+    throw new Error(`Meta-model request failed (${res.status})`);
+  }
+  state.metaModel = await res.json();
+  return state.metaModel;
+}
+
+function renderMetaModelBody(metaModel) {
+  const container = elements.metaModelBody;
+  container.innerHTML = "";
+
+  const layersSection = document.createElement("div");
+  layersSection.className = "meta-model-layers";
+  for (const layer of metaModel.layers || []) {
+    const card = document.createElement("article");
+    card.className = "meta-model-layer-card";
+
+    const title = document.createElement("h3");
+    title.textContent = layer.label;
+    card.appendChild(title);
+
+    const chipList = document.createElement("div");
+    chipList.className = "meta-model-chip-list";
+    for (const elementType of layer.elements || []) {
+      const palette = typeColor(elementType);
+      const chip = document.createElement("span");
+      chip.className = "meta-model-chip";
+      chip.style.background = palette.fill;
+      chip.style.borderColor = palette.stroke;
+      chip.style.color = palette.text;
+      chip.textContent = elementType;
+      chipList.appendChild(chip);
+    }
+    card.appendChild(chipList);
+    layersSection.appendChild(card);
+  }
+  container.appendChild(layersSection);
+
+  const relHead = document.createElement("h3");
+  relHead.className = "meta-model-relationships-head";
+  relHead.textContent = "Allowed relationships";
+  container.appendChild(relHead);
+
+  const tableScroll = document.createElement("div");
+  tableScroll.className = "table-scroll meta-model-table-scroll";
+  const table = document.createElement("table");
+  table.className = "preview-table";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const label of ["Source", "Relationship", "Target", "Note"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const rel of metaModel.relationships || []) {
+    const tr = document.createElement("tr");
+
+    const sourceTd = document.createElement("td");
+    sourceTd.textContent = rel.source;
+    tr.appendChild(sourceTd);
+
+    const relTd = document.createElement("td");
+    relTd.textContent = `${rel.label} (${rel.type})`;
+    tr.appendChild(relTd);
+
+    const targetTd = document.createElement("td");
+    targetTd.textContent = rel.target;
+    tr.appendChild(targetTd);
+
+    const noteTd = document.createElement("td");
+    noteTd.className = "meta-model-note";
+    noteTd.textContent = rel.note || "";
+    tr.appendChild(noteTd);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  tableScroll.appendChild(table);
+  container.appendChild(tableScroll);
+}
+
+async function openMetaModelModal() {
+  elements.metaModelModal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+
+  if (state.metaModel) {
+    renderMetaModelBody(state.metaModel);
+    return;
+  }
+
+  elements.metaModelBody.innerHTML = "";
+  const loading = document.createElement("div");
+  loading.className = "empty-state";
+  loading.textContent = "Loading meta-model...";
+  elements.metaModelBody.appendChild(loading);
+
+  try {
+    const metaModel = await loadMetaModel();
+    renderMetaModelBody(metaModel);
+  } catch (err) {
+    elements.metaModelBody.innerHTML = "";
+    const errorState = document.createElement("div");
+    errorState.className = "empty-state";
+    errorState.textContent = `Unable to load meta-model: ${err.message || String(err)}`;
+    elements.metaModelBody.appendChild(errorState);
+  }
+}
+
+function closeMetaModelModal() {
+  elements.metaModelModal.classList.add("hidden");
+  document.body.classList.remove("modal-open");
 }
 
 /* ---------------- Chat / general UI ---------------- */
@@ -1234,7 +2116,6 @@ function updateSendButtonState() {
 function updateActionButtonsState() {
   const isBusy = Boolean(state.pendingController || state.pendingAction);
   elements.businessProcessBtn.disabled = isBusy;
-  elements.requirementsBtn.disabled = isBusy;
   const hasIncludedElement = Boolean(state.currentPlan && state.currentPlan.elements.some((el) => el.include));
   elements.applyPreviewBtn.disabled = isBusy || !hasIncludedElement;
   elements.discardPreviewBtn.disabled = isBusy || !state.currentPlan;
@@ -1534,11 +2415,6 @@ function attachEventHandlers() {
     await loadPreview("business-process-upload");
   });
 
-  elements.requirementsForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await loadPreview("requirements-upload");
-  });
-
   elements.previewViewName.addEventListener("input", () => {
     if (state.currentPlan) {
       state.currentPlan.view_name = elements.previewViewName.value;
@@ -1588,6 +2464,21 @@ function attachEventHandlers() {
     setChatCollapsed(!state.chatCollapsed);
   });
 
+  elements.metaModelBtn.addEventListener("click", openMetaModelModal);
+  elements.metaModelCloseBtn.addEventListener("click", closeMetaModelModal);
+  elements.metaModelModal.addEventListener("click", (event) => {
+    if (event.target === elements.metaModelModal) {
+      closeMetaModelModal();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !elements.metaModelModal.classList.contains("hidden")) {
+      closeMetaModelModal();
+    }
+  });
+
+  attachDiagramInteractions();
+
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       loadHealth();
@@ -1614,6 +2505,8 @@ function init() {
   }
 
   attachEventHandlers();
+  attachAssessmentEventHandlers();
+  setAssessmentStep("setup");
   setActiveTab(state.activeTab);
   setChatCollapsed(state.chatCollapsed);
   renderAll();

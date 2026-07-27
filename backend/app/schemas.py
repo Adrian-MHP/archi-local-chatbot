@@ -54,7 +54,7 @@ class ChatTraceResponse(ChatResponse):
 
 
 class ActionResponse(BaseModel):
-    action: Literal["business-process-upload", "requirements-upload"]
+    action: Literal["business-process-upload", "requirements-upload", "assessment-soll-upload"]
     status: Literal["ok", "partial"]
     summary: str
     view_name: str
@@ -81,6 +81,7 @@ class PlanElement(BaseModel):
     type: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=120)
     documentation: str = Field(default="", max_length=400)
+    properties: Dict[str, str] = Field(default_factory=dict)
     include: bool = True
 
 
@@ -95,7 +96,7 @@ class PlanRelationship(BaseModel):
 
 
 class AutomationPlan(BaseModel):
-    action: Literal["business-process-upload", "requirements-upload"]
+    action: Literal["business-process-upload", "requirements-upload", "assessment-soll-upload"]
     source_name: str = Field(default="", max_length=200)
     view_name: str = Field(min_length=1, max_length=120)
     elements: List[PlanElement] = Field(default_factory=list)
@@ -112,6 +113,75 @@ class AutomationPlanResponse(AutomationPlan):
 
 class ApplyPlanRequest(BaseModel):
     plan: AutomationPlan
+
+
+class AssessmentSetupResponse(BaseModel):
+    ist_view_name: str
+    soll_view_name: str
+    ist_view_exists: bool
+    soll_view_exists: bool
+    existing_business_element_count: int = Field(default=0, ge=0)
+    notes: List[str] = Field(default_factory=list)
+
+
+class MappingEntry(BaseModel):
+    key: str = Field(min_length=1, max_length=200)
+    ist_key: str | None = Field(default=None, max_length=200)
+    ist_name: str | None = Field(default=None, max_length=200)
+    soll_key: str | None = Field(default=None, max_length=200)
+    soll_name: str | None = Field(default=None, max_length=200)
+    match_type: Literal["full", "partial", "gap_new", "legacy_no_soll"]
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = Field(default="", max_length=400)
+    include: bool = True
+
+
+class GapEntry(BaseModel):
+    category: Literal["missing_process", "redundancy", "structural_difference", "tooling_data_gap"]
+    criticality: Literal["high", "medium", "low"]
+    description: str = Field(default="", max_length=400)
+    related_ist_name: str | None = Field(default=None, max_length=200)
+    related_soll_name: str | None = Field(default=None, max_length=200)
+
+
+class MappingGapRequest(BaseModel):
+    ist_view_name: str = Field(default="Ist-Business-Prozesse", max_length=120)
+    soll_view_name: str = Field(default="Soll-Architektur", max_length=120)
+
+
+class MappingGapResponse(BaseModel):
+    ist_view_name: str
+    soll_view_name: str
+    mappings: List[MappingEntry] = Field(default_factory=list)
+    gaps: List[GapEntry] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class MappingApplyRequest(BaseModel):
+    mappings: List[MappingEntry] = Field(default_factory=list)
+
+
+class MappingApplyResponse(BaseModel):
+    summary: str
+    created_relationships: int = Field(default=0, ge=0)
+    used_tools: List[str] = Field(default_factory=list)
+
+
+class AssessmentSummaryRequest(BaseModel):
+    mappings: List[MappingEntry] = Field(default_factory=list)
+    gaps: List[GapEntry] = Field(default_factory=list)
+
+
+class AssessmentSummaryResponse(BaseModel):
+    ist_process_count: int = Field(default=0, ge=0)
+    soll_process_count: int = Field(default=0, ge=0)
+    full_matches: int = Field(default=0, ge=0)
+    partial_matches: int = Field(default=0, ge=0)
+    gap_count: int = Field(default=0, ge=0)
+    critical_gap_count: int = Field(default=0, ge=0)
+    average_similarity: float = Field(default=0.0, ge=0.0, le=100.0)
+    maturity_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    executive_summary: str = ""
 
 
 class ConversationTurn(BaseModel):

@@ -11,6 +11,7 @@ class Settings:
     azure_openai_base_url: str
     azure_openai_model: str
     azure_openai_fallback_model: str
+    azure_openai_extraction_model: str
     mcp_server_url: str
     mcp_bearer_token: str
     app_host: str
@@ -40,8 +41,9 @@ def get_settings() -> Settings:
     return Settings(
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
         azure_openai_base_url=_normalize_azure_base_url(os.getenv("AZURE_OPENAI_BASE_URL", "")),
-        azure_openai_model=os.getenv("AZURE_OPENAI_MODEL", "gpt-5-mini").strip(),
+        azure_openai_model=os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4").strip(),
         azure_openai_fallback_model=os.getenv("AZURE_OPENAI_FALLBACK_MODEL", "").strip(),
+        azure_openai_extraction_model=os.getenv("AZURE_OPENAI_EXTRACTION_MODEL", "").strip(),
         mcp_server_url=os.getenv("MCP_SERVER_URL", "http://127.0.0.1:18090/mcp").strip(),
         mcp_bearer_token=os.getenv("MCP_BEARER_TOKEN", "").strip(),
         app_host=os.getenv("APP_HOST", "0.0.0.0").strip(),
@@ -53,7 +55,7 @@ def get_settings() -> Settings:
         max_tool_roundtrips=int(os.getenv("MAX_TOOL_ROUNDTRIPS", "8")),
         max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024))),
         max_upload_text_chars=int(os.getenv("MAX_UPLOAD_TEXT_CHARS", "80000")),
-        max_action_steps=int(os.getenv("MAX_ACTION_STEPS", "18")),
+        max_action_steps=int(os.getenv("MAX_ACTION_STEPS", "60")),
         default_system_prompt=os.getenv(
             "SYSTEM_PROMPT",
             (

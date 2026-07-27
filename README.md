@@ -18,6 +18,7 @@ archi-local-chatbot/
 │   │   ├── config.py
 │   │   ├── main.py
 │   │   ├── mcp_client.py
+│   │   ├── meta_model.py
 │   │   └── schemas.py
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -97,6 +98,35 @@ For scripted/API use without a review step, the original single-call endpoints a
 - `POST /api/actions/requirements-upload`
 
 Same inputs as the preview endpoints above, but extraction and Archi writes happen in one call.
+
+### Governance meta-model
+
+`GET /api/meta-model` returns the organization's required ArchiMate element types, layers, and
+relationship pairs (defined in `backend/app/meta_model.py`). This is injected into every extraction
+prompt and the chat system prompt, so uploads and chat-driven model changes stick to the declared
+vocabulary: relationships whose (source type, target type) pair isn't declared in the meta-model are
+coerced to `AssociationRelationship` rather than left as an unsanctioned type. The "Meta model" button
+in the UI renders this same data as a reference viewer.
+
+### Extraction grounding (anti-hallucination)
+
+Both upload actions require every extracted element/relationship to be backed by a quote from the
+source document (`evidence` field) or a high model-reported confidence; candidates that fail both are
+dropped and reported in the response's `warnings`. If everything fails the check, the request returns
+`422` with an explanation instead of silently fabricating a result. For diagram/flowchart exports
+specifically, sequential ("this step follows that step") relationships are only added when the model
+explicitly flags the step as linearly sequential in the source text -- flattened diagram exports
+usually don't carry that signal, so steps are created without a fabricated flow between them (visible
+as a warning in the preview) rather than guessing at connections that aren't really there.
+
+### Extraction model override
+
+`AZURE_OPENAI_EXTRACTION_MODEL` (optional) lets uploads use a different, typically stronger, Azure
+deployment than day-to-day chat (`AZURE_OPENAI_MODEL`), since extraction is reasoning-heavy and runs
+far less often. Falls back to `AZURE_OPENAI_MODEL` when unset. The value must be an actual **deployment
+name** that exists on your Azure OpenAI resource for chat completions -- check Azure AI Foundry /
+Azure OpenAI Studio's Deployments list, not just the model catalog (a model can appear in the catalog
+without having a working deployment).
 
 ### Chat with trace
 

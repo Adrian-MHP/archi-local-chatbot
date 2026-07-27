@@ -198,7 +198,7 @@ button {
 
 .automation-panel {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   padding: 14px;
 }
@@ -334,20 +334,72 @@ button {
   color: var(--ink-muted);
 }
 
+.preview-diagram-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.preview-diagram-head h4 {
+  margin: 0;
+}
+
+.diagram-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.diagram-toolbar .btn {
+  padding: 4px 10px;
+  min-width: 30px;
+}
+
+.diagram-zoom-label {
+  min-width: 44px;
+  text-align: center;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+.diagram-hint {
+  margin: 6px 0 0;
+  font-size: 0.72rem;
+  color: var(--ink-muted);
+}
+
 .preview-diagram {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: linear-gradient(180deg, #fcfdff 0%, #f4f8fc 100%);
   min-height: 260px;
   max-height: 420px;
-  overflow: auto;
+  overflow: hidden;
+  padding: 0;
+  cursor: grab;
+  touch-action: none;
+}
+
+.preview-diagram.dragging {
+  cursor: grabbing;
+}
+
+.preview-diagram-stage {
+  display: inline-block;
+  transform-origin: 0 0;
   padding: 8px;
+  will-change: transform;
 }
 
 .diagram-svg {
-  width: 100%;
+  width: 1100px;
   height: auto;
   display: block;
+  user-select: none;
 }
 
 .diagram-type-label {
@@ -1095,6 +1147,284 @@ button:focus {
   border-radius: var(--radius-sm);
   padding: 14px 10px;
   font-size: 0.84rem;
+}
+
+/* ---------------- Meta model modal ---------------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 24, 40, 0.45);
+}
+
+.modal-card {
+  width: min(880px, 100%);
+  max-height: min(84vh, 820px);
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 24px 60px rgba(10, 20, 40, 0.28);
+  overflow: hidden;
+}
+
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.modal-head p {
+  margin: 4px 0 0;
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+}
+
+.modal-body {
+  padding: 16px 18px;
+  overflow: auto;
+}
+
+body.modal-open {
+  overflow: hidden;
+}
+
+.meta-model-layers {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.meta-model-layer-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  padding: 10px;
+}
+
+.meta-model-layer-card h3 {
+  margin: 0 0 8px;
+  font-size: 0.86rem;
+}
+
+.meta-model-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.meta-model-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.meta-model-relationships-head {
+  margin: 0 0 8px;
+  font-size: 0.9rem;
+}
+
+.meta-model-table-scroll {
+  max-height: 320px;
+}
+
+.meta-model-note {
+  color: var(--ink-muted);
+  font-size: 0.74rem;
+}
+
+/* ---------------- Architecture Assessment wizard ---------------- */
+
+.assessment-stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px;
+}
+
+.assessment-step-btn {
+  flex: 1;
+  min-width: 140px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--ink-muted);
+  padding: 9px 10px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+}
+
+.assessment-step-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.assessment-step-btn.completed {
+  border-color: #b9dbcf;
+  color: var(--ok);
+}
+
+.assessment-step-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.assessment-step {
+  padding: 16px;
+}
+
+.assessment-step h3 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.assessment-step > p {
+  margin: 0 0 12px;
+  color: var(--ink-muted);
+  font-size: 0.84rem;
+  max-width: 760px;
+}
+
+.assessment-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.assessment-field-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--ink-muted);
+  flex: 1;
+  min-width: 220px;
+}
+
+.assessment-result {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 10px 12px;
+  font-size: 0.82rem;
+}
+
+.assessment-result p {
+  margin: 0 0 6px;
+}
+
+.assessment-result p:last-child {
+  margin-bottom: 0;
+}
+
+.assessment-preview {
+  margin-top: 14px;
+}
+
+.assessment-preview h4 {
+  margin: 14px 0 8px;
+  font-size: 0.88rem;
+}
+
+.assessment-preview h4:first-child {
+  margin-top: 0;
+}
+
+.assessment-step-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.assessment-summary-text {
+  white-space: pre-wrap;
+  line-height: 1.55;
+  font-size: 0.92rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin: 0 0 10px;
+}
+
+.cell-match-type {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.match-full {
+  background: #ecf8f2;
+  color: var(--ok);
+}
+
+.match-partial {
+  background: #fff8eb;
+  color: var(--warning);
+}
+
+.match-legacy_no_soll,
+.match-gap_new {
+  background: #fff2f1;
+  color: var(--danger);
+}
+
+.criticality-high {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.criticality-medium {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.criticality-low {
+  color: var(--ink-muted);
+}
+
+@media (max-width: 720px) {
+  .assessment-stepper {
+    flex-direction: column;
+  }
+
+  .assessment-step-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 
 .hidden {

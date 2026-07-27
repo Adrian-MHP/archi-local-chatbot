@@ -19,9 +19,13 @@ from pydantic import ValidationError
 
 from .azure_agent import ChatService
 from .config import get_settings
+from . import meta_model
 from .schemas import (
     ActionResponse,
     ApplyPlanRequest,
+    AssessmentSetupResponse,
+    AssessmentSummaryRequest,
+    AssessmentSummaryResponse,
     AutomationPlanResponse,
     ChatRequest,
     ChatResponse,
@@ -32,6 +36,10 @@ from .schemas import (
     ConversationExportResponse,
     ConversationImportRequest,
     ConversationImportResponse,
+    MappingApplyRequest,
+    MappingApplyResponse,
+    MappingGapRequest,
+    MappingGapResponse,
 )
 
 load_dotenv()
@@ -180,7 +188,7 @@ def _extract_text_from_xlsx(content: bytes) -> str:
     return combined
 
 
-async def _extract_text_from_upload(file: UploadFile) -> tuple[str, str]:
+async def _extract_text_from_upload(file: UploadFile) -> tuple[str, str, bytes | None]:
     filename = (file.filename or "upload").strip() or "upload"
     lower_name = filename.lower()
     suffix = f".{lower_name.rsplit('.', 1)[-1]}" if "." in lower_name else ""
@@ -220,7 +228,8 @@ async def _extract_text_from_upload(file: UploadFile) -> tuple[str, str]:
         raise HTTPException(status_code=422, detail="No processable text could be extracted from uploaded file.")
     if len(text) > settings.max_upload_text_chars:
         text = text[: settings.max_upload_text_chars]
-    return text, filename
+    pdf_bytes = content if suffix == ".pdf" else None
+    return text, filename, pdf_bytes
 
 
 @app.get("/api/health")
@@ -262,6 +271,11 @@ def tools() -> Dict[str, Any]:
             for t in mcp_tools
         ],
     }
+
+
+@app.get("/api/meta-model")
+def get_meta_model() -> Dict[str, Any]:
+    return meta_model.as_dict()
 
 
 @app.get("/api/debug/mcp")
@@ -415,12 +429,13 @@ async def business_process_upload_action(
     file: UploadFile = File(...),
     view_name: str | None = Form(default=None),
 ) -> ActionResponse:
-    text, source_name = await _extract_text_from_upload(file)
+    text, source_name, pdf_bytes = await _extract_text_from_upload(file)
     try:
         execution = chat_service.run_business_process_automation(
             content_text=text,
             source_name=source_name,
             view_name=view_name,
+            pdf_bytes=pdf_bytes,
         )
     except HTTPException:
         raise
@@ -461,7 +476,7 @@ async def requirements_upload_action(
     file: UploadFile = File(...),
     view_name: str | None = Form(default=None),
 ) -> ActionResponse:
-    text, source_name = await _extract_text_from_upload(file)
+    text, source_name, _pdf_bytes = await _extract_text_from_upload(file)
     try:
         execution = chat_service.run_requirements_automation(
             content_text=text,
@@ -507,12 +522,13 @@ async def business_process_upload_preview(
     file: UploadFile = File(...),
     view_name: str | None = Form(default=None),
 ) -> AutomationPlanResponse:
-    text, source_name = await _extract_text_from_upload(file)
+    text, source_name, pdf_bytes = await _extract_text_from_upload(file)
     try:
         plan = chat_service.plan_business_process_automation(
             content_text=text,
             source_name=source_name,
             view_name=view_name,
+            pdf_bytes=pdf_bytes,
         )
     except HTTPException:
         raise
@@ -528,7 +544,7 @@ async def requirements_upload_preview(
     file: UploadFile = File(...),
     view_name: str | None = Form(default=None),
 ) -> AutomationPlanResponse:
-    text, source_name = await _extract_text_from_upload(file)
+    text, source_name, _pdf_bytes = await _extract_text_from_upload(file)
     try:
         plan = chat_service.plan_requirements_automation(
             content_text=text,
@@ -577,6 +593,78 @@ def apply_plan(payload: ApplyPlanRequest) -> ActionResponse:
         added_connections=int(execution.get("added_connections", 0)),
         used_tools=list(execution.get("used_tools", [])),
     )
+
+
+@app.get("/api/assessment/setup", response_model=AssessmentSetupResponse)
+def assessment_setup(
+    ist_view_name: str = "Ist-Business-Prozesse",
+    soll_view_name: str = "Soll-Architektur",
+) -> AssessmentSetupResponse:
+    try:
+        result = chat_service.assessment_setup(ist_view_name=ist_view_name, soll_view_name=soll_view_name)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Assessment setup failed: {exc}") from exc
+    return AssessmentSetupResponse(**result)
+
+
+@app.post("/api/assessment/soll-architecture/preview", response_model=AutomationPlanResponse)
+async def assessment_soll_architecture_preview(
+    file: UploadFile = File(...),
+    view_name: str | None = Form(default=None),
+) -> AutomationPlanResponse:
+    text, source_name, _pdf_bytes = await _extract_text_from_upload(file)
+    try:
+        plan = chat_service.plan_soll_architecture(
+            content_text=text,
+            source_name=source_name,
+            view_name=view_name,
+        )
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Soll-Architektur preview failed: {exc}") from exc
+    return AutomationPlanResponse(**plan)
+
+
+@app.post("/api/assessment/mapping/preview", response_model=MappingGapResponse)
+def assessment_mapping_preview(payload: MappingGapRequest) -> MappingGapResponse:
+    try:
+        result = chat_service.run_mapping_gap_analysis(
+            ist_view_name=payload.ist_view_name,
+            soll_view_name=payload.soll_view_name,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Mapping & gap analysis failed: {exc}") from exc
+    return MappingGapResponse(**result)
+
+
+@app.post("/api/assessment/mapping/apply", response_model=MappingApplyResponse)
+def assessment_mapping_apply(payload: MappingApplyRequest) -> MappingApplyResponse:
+    mapping_dicts = [m.model_dump() for m in payload.mappings]
+    try:
+        result = chat_service.apply_mapping_relationships(mappings=mapping_dicts)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Applying mappings failed: {exc}") from exc
+    return MappingApplyResponse(**result)
+
+
+@app.post("/api/assessment/summary", response_model=AssessmentSummaryResponse)
+def assessment_summary(payload: AssessmentSummaryRequest) -> AssessmentSummaryResponse:
+    mapping_dicts = [m.model_dump() for m in payload.mappings]
+    gap_dicts = [g.model_dump() for g in payload.gaps]
+    try:
+        result = chat_service.generate_assessment_summary(mappings=mapping_dicts, gaps=gap_dicts)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Summary generation failed: {exc}") from exc
+    return AssessmentSummaryResponse(**result)
 
 
 @app.post("/api/conversations/export", response_model=ConversationExportResponse)
