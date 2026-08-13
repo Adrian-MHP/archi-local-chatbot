@@ -306,6 +306,18 @@ class ChatService:
                         return {"items": block["json"]}
                     parsed = self._try_parse_json_text(block.get("text", ""))
                     if isinstance(parsed, dict):
+                        # This server always wraps its actual payload one level deeper as
+                        # {"result": ...}, same as the outer envelope checked above. Tools that
+                        # return a flat list (search-elements, get-views) happen to work without
+                        # this because _result_list's fallback separately checks for a list under
+                        # "result" -- but richer object-shaped payloads (get-view-contents'
+                        # {"result": {"elements": [...], ...}}) need the dict unwrapped here too,
+                        # or every caller silently sees an empty result.
+                        nested_parsed = parsed.get("result")
+                        if isinstance(nested_parsed, dict):
+                            return nested_parsed
+                        if isinstance(nested_parsed, list):
+                            return {"items": nested_parsed}
                         return parsed
                     if isinstance(parsed, list):
                         return {"items": parsed}
@@ -488,6 +500,26 @@ class ChatService:
                     visual_connections.add(rel_id)
 
         return element_to_view_obj, visual_connections
+
+    def _collect_view_business_processes(self, *, view_id: str, used_tools: List[str]) -> List[Dict[str, str]]:
+        """BusinessProcess elements actually placed on a specific view -- NOT every BusinessProcess
+        in the model. Searching the whole model (as this used to) mixes every assessment cycle ever
+        run, plus any unrelated BusinessProcess elements the user's Archi model already contained,
+        into every mapping/proposal run. Scoping to the view the user actually configured in Setup
+        is what makes a fresh view name in a new cycle actually behave like a fresh cycle."""
+        result = self._mcp_call("get-view-contents", {"viewId": view_id}, used_tools)
+        out: List[Dict[str, str]] = []
+        seen_ids: set[str] = set()
+        for item in self._result_list(result, "elements"):
+            if str(item.get("type", "")).strip() != "BusinessProcess":
+                continue
+            element_id = str(item.get("id", "")).strip()
+            name = str(item.get("name", "")).strip()
+            if not element_id or not name or element_id in seen_ids:
+                continue
+            seen_ids.add(element_id)
+            out.append({"id": element_id, "name": name})
+        return out
 
     def _execute_view_plan(
         self,
@@ -1813,8 +1845,8 @@ class ChatService:
         return execution
 
     # ---------------- Architecture Assessment workflow ----------------
-    # Setup -> Ist-Aufnahme -> Soll-Architektur -> Mapping & Gap-Analyse -> Summary.
-    # Ist-Aufnahme reuses run_/plan_business_process_automation as-is (targeted at the Ist
+    # Setup -> As-Is Capture -> To-Be Architecture -> Mapping & Gap Analysis -> Summary.
+    # As-Is Capture reuses run_/plan_business_process_automation as-is (targeted at the As-Is
     # view name). The stages below cover the rest of the workflow.
 
     def assessment_setup(self, *, ist_view_name: str, soll_view_name: str) -> Dict[str, Any]:
@@ -1826,14 +1858,14 @@ class ChatService:
 
         notes: List[str] = []
         notes.append(
-            f"Found existing Ist view '{ist_view_name}' -- Ist-Aufnahme will add to it."
+            f"Found existing As-Is view '{ist_view_name}' -- As-Is Capture will add to it."
             if ist_view_id
-            else f"No existing '{ist_view_name}' view found -- it will be created during Ist-Aufnahme."
+            else f"No existing '{ist_view_name}' view found -- it will be created during As-Is Capture."
         )
         notes.append(
-            f"Found existing Soll view '{soll_view_name}' -- Soll-Architektur will add to it."
+            f"Found existing To-Be view '{soll_view_name}' -- To-Be Architecture will add to it."
             if soll_view_id
-            else f"No existing '{soll_view_name}' view found -- it will be created during Soll-Architektur."
+            else f"No existing '{soll_view_name}' view found -- it will be created during To-Be Architecture."
         )
         notes.append(f"{len(business_elements)} existing Business layer element(s) found in the model.")
 
@@ -1854,15 +1886,15 @@ class ChatService:
         view_name: str | None = None,
         pdf_bytes: bytes | None = None,
     ) -> Dict[str, Any]:
-        """A target-state upload (e.g. a Soll SIPOC table or process diagram) describes the same
-        kind of content as an Ist upload -- process steps and their sequence -- so it reuses the
-        exact same SIPOC-table / PDF-geometry / evidence-gated text extraction as Ist-Aufnahme,
+        """A target-state upload (e.g. a To-Be SIPOC table or process diagram) describes the same
+        kind of content as an As-Is upload -- process steps and their sequence -- so it reuses the
+        exact same SIPOC-table / PDF-geometry / evidence-gated text extraction as As-Is Capture,
         just tagged as "target" instead of running the separate ApplicationComponent-oriented
         product-architecture extraction meant for requirement documents."""
         extracted = self._extract_business_process_plan(
             content_text=content_text,
             source_name=source_name,
-            view_name=view_name or "Soll-Architektur",
+            view_name=view_name or "To-Be Architecture",
             pdf_bytes=pdf_bytes,
         )
         tagged_elements = {
@@ -1878,42 +1910,40 @@ class ChatService:
         ist_view_name: str,
         view_name: str | None = None,
     ) -> Dict[str, Any]:
-        """Generate a Soll-Architektur proposal directly from the Ist processes already in the model,
-        for when no separate target-requirements document exists yet to upload in step 3."""
+        """Generate a To-Be Architecture proposal directly from the As-Is processes on the configured
+        As-Is view, for when no separate target-requirements document exists yet to upload in step 3.
+        Scoped to that specific view rather than a model-wide search -- see
+        _collect_view_business_processes for why that distinction matters."""
         used_tools: List[str] = []
-        result = self._mcp_call("search-elements", {"query": "", "type": "BusinessProcess", "limit": 500}, used_tools)
-        all_processes = self._result_list(result, "elements")
-
-        ist_names: List[str] = []
-        for item in all_processes:
-            name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-            status = self._property_value(item.get("properties"), "status").lower()
-            if status != "target":
-                ist_names.append(name)
+        ist_view_id = self._find_existing_view_id(view_name=ist_view_name, used_tools=used_tools)
+        if not ist_view_id:
+            raise RuntimeError(
+                f"No As-Is view named '{ist_view_name}' found in the model. Run As-Is Capture first."
+            )
+        ist_processes = self._collect_view_business_processes(view_id=ist_view_id, used_tools=used_tools)
+        ist_names = [p["name"] for p in ist_processes]
 
         if not ist_names:
             raise RuntimeError(
-                f"No Ist business processes found in the model (view '{ist_view_name}'). Run Ist-Aufnahme first."
+                f"No As-Is business processes found on view '{ist_view_name}'. Run As-Is Capture first."
             )
 
-        preferred_view_name = self._normalize_name(view_name or "Soll-Architektur", fallback="Soll-Architektur")
+        preferred_view_name = self._normalize_name(view_name or "To-Be Architecture", fallback="To-Be Architecture")
         process_lines = "\n".join(f"- {name}" for name in ist_names)
 
         user_prompt = (
-            "You are proposing a TO-BE (Soll) business process architecture based on the following AS-IS "
-            "(Ist) business processes already in the model. Improve on them the way a target-state "
+            "You are proposing a TO-BE business process architecture based on the following AS-IS "
+            "business processes already in the model. Improve on them the way a target-state "
             "architecture typically would: automate manual-sounding steps, consolidate obviously redundant "
             "or duplicate steps, modernize outdated tooling references, and add at most a few clearly "
             "justified new capabilities (e.g. self-service, automation, AI-assisted variants). Do not invent "
             "an unrelated process landscape -- every proposed process must trace back to (replace, merge, or "
-            "extend) something in the Ist list below.\n"
+            "extend) something in the AS-IS list below.\n"
             "Return strict JSON only with this schema:\n"
             "{\n"
             '  "view_name": "string",\n'
             '  "elements": [{"name": "string", "type": "BusinessProcess", "description": "1 sentence: how '
-            'this relates to the Ist process(es) it is based on"}],\n'
+            'this relates to the As-Is process(es) it is based on"}],\n'
             '  "relationships": [{"type": "TriggeringRelationship", "source": "element name", "target": '
             '"element name"}]\n'
             "}\n"
@@ -1923,7 +1953,7 @@ class ChatService:
             "- Connect the proposed processes in their intended sequential order via TriggeringRelationship.\n"
             "- No explanation text, only the JSON object.\n\n"
             f"Preferred view name: {preferred_view_name}\n\n"
-            f"Ist business processes already in the model:\n{process_lines}"
+            f"As-Is business processes already in the model:\n{process_lines}"
         )
         parsed = self._call_model_for_json(
             system_prompt="You are an enterprise architecture target-state design engine. Output strict JSON only.",
@@ -1933,7 +1963,7 @@ class ChatService:
         raw_elements = parsed.get("elements")
         raw_relationships = parsed.get("relationships")
         if not isinstance(raw_elements, list) or not raw_elements:
-            raise RuntimeError("Could not generate a Soll-Architektur proposal from the current Ist processes.")
+            raise RuntimeError("Could not generate a To-Be Architecture proposal from the current As-Is processes.")
         if not isinstance(raw_relationships, list):
             raw_relationships = []
 
@@ -1957,7 +1987,7 @@ class ChatService:
             key_by_name.setdefault(self._norm_key(name), key)
 
         if not elements:
-            raise RuntimeError("Could not generate a Soll-Architektur proposal from the current Ist processes.")
+            raise RuntimeError("Could not generate a To-Be Architecture proposal from the current As-Is processes.")
 
         relationships: List[Dict[str, str]] = []
         for item in raw_relationships:
@@ -1978,48 +2008,42 @@ class ChatService:
             "steps_processed": len(elements),
             "steps_truncated": False,
             "warnings": [
-                f"AI-generated proposal based on {len(ist_names)} existing Ist business process(es). Review "
+                f"AI-generated proposal based on {len(ist_names)} existing As-Is business process(es). Review "
                 "carefully before applying -- this is a suggested target state, not an extraction from a "
                 "source document."
             ],
         }
         return self._format_plan_response(
-            action="assessment-soll-upload", source_name="AI-proposed from Ist-Aufnahme", extracted=extracted
+            action="assessment-soll-upload", source_name="AI-proposed from As-Is Capture", extracted=extracted
         )
-
-    @staticmethod
-    def _property_value(properties: Any, key: str) -> str:
-        if isinstance(properties, dict):
-            return str(properties.get(key, "")).strip()
-        if isinstance(properties, list):
-            for prop in properties:
-                if isinstance(prop, dict) and str(prop.get("key", "")).strip().lower() == key.lower():
-                    return str(prop.get("value", "")).strip()
-        return ""
 
     def run_mapping_gap_analysis(self, *, ist_view_name: str, soll_view_name: str) -> Dict[str, Any]:
         used_tools: List[str] = []
-        result = self._mcp_call("search-elements", {"query": "", "type": "BusinessProcess", "limit": 500}, used_tools)
-        all_processes = self._result_list(result, "elements")
+        ist_view_id = self._find_existing_view_id(view_name=ist_view_name, used_tools=used_tools)
+        soll_view_id = self._find_existing_view_id(view_name=soll_view_name, used_tools=used_tools)
 
-        ist_processes: List[Dict[str, str]] = []
-        soll_processes: List[Dict[str, str]] = []
-        for item in all_processes:
-            element_id = str(item.get("id", "")).strip()
-            name = str(item.get("name", "")).strip()
-            if not element_id or not name:
-                continue
-            status = self._property_value(item.get("properties"), "status").lower()
-            entry = {"id": element_id, "name": name}
-            (soll_processes if status == "target" else ist_processes).append(entry)
+        if not ist_view_id:
+            raise RuntimeError(
+                f"No As-Is view named '{ist_view_name}' found in the model. Run As-Is Capture first."
+            )
+        if not soll_view_id:
+            raise RuntimeError(
+                f"No To-Be view named '{soll_view_name}' found in the model. Run To-Be Architecture first."
+            )
+
+        # Scoped to exactly what's on these two views -- not a model-wide search -- so a fresh view
+        # name in a new assessment cycle actually gets a fresh mapping, instead of mixing in every
+        # BusinessProcess element from every prior cycle (or unrelated model content).
+        ist_processes = self._collect_view_business_processes(view_id=ist_view_id, used_tools=used_tools)
+        soll_processes = self._collect_view_business_processes(view_id=soll_view_id, used_tools=used_tools)
 
         if not ist_processes:
             raise RuntimeError(
-                "No Ist business processes found in the model. Run Ist-Aufnahme (business process upload) first."
+                f"No As-Is business processes found on view '{ist_view_name}'. Run As-Is Capture first."
             )
         if not soll_processes:
             raise RuntimeError(
-                "No Soll business processes found (elements tagged status=target). Run Soll-Architektur first."
+                f"No To-Be business processes found on view '{soll_view_name}'. Run To-Be Architecture first."
             )
 
         # A full mapping+gap analysis over hundreds of processes in one LLM call gets slow enough to
@@ -2037,7 +2061,7 @@ class ChatService:
         soll_lines = "\n".join(f"{p['id']}: {p['name']}" for p in soll_processes)
 
         user_prompt = (
-            "You are comparing an AS-IS (Ist) business process list to a TO-BE (Soll) business process list "
+            "You are comparing an AS-IS business process list to a TO-BE business process list "
             "for an architecture assessment gap analysis.\n"
             "Return strict JSON only with this schema:\n"
             "{\n"
@@ -2048,19 +2072,19 @@ class ChatService:
             '"related_soll_id": "string or null"}]\n'
             "}\n"
             "Rules:\n"
-            "- match_type 'full' = the Ist and Soll process describe essentially the same activity.\n"
+            "- match_type 'full' = the AS-IS and TO-BE process describe essentially the same activity.\n"
             "- match_type 'partial' = related but meaningfully different scope or steps.\n"
-            "- match_type 'legacy_no_soll' = an Ist process with no reasonable Soll equivalent (soll_id null).\n"
-            "- match_type 'gap_new' = a Soll process with no Ist equivalent -- a new process not yet "
+            "- match_type 'legacy_no_soll' = an AS-IS process with no reasonable TO-BE equivalent (soll_id null).\n"
+            "- match_type 'gap_new' = a TO-BE process with no AS-IS equivalent -- a new process not yet "
             "implemented (ist_id null).\n"
-            "- Every listed Ist id and every listed Soll id must appear in exactly one mapping entry.\n"
+            "- Every listed AS-IS id and every listed TO-BE id must appear in exactly one mapping entry.\n"
             "- Only compare the process NAMES given; do not invent details not implied by the names.\n"
             "- gaps should summarize the most notable mapping outcomes (especially legacy_no_soll and gap_new "
             "entries, and any 'partial' entries with a meaningful difference), grouped by category and rated "
             "by business criticality. Not every mapping needs its own gap entry.\n"
             "- No explanation text, only the JSON object.\n\n"
-            f"Ist processes (from '{ist_view_name}'):\n{ist_lines}\n\n"
-            f"Soll processes (from '{soll_view_name}'):\n{soll_lines}"
+            f"As-Is processes (from '{ist_view_name}'):\n{ist_lines}\n\n"
+            f"To-Be processes (from '{soll_view_name}'):\n{soll_lines}"
         )
         parsed = self._call_model_for_json(
             system_prompt="You are an enterprise architecture assessment engine. Output strict JSON only.",
@@ -2133,13 +2157,13 @@ class ChatService:
         unmapped_ist = len(ist_processes) - len(mapped_ist_ids)
         unmapped_soll = len(soll_processes) - len(mapped_soll_ids)
         if unmapped_ist > 0:
-            warnings.append(f"{unmapped_ist} Ist process(es) were not covered by any mapping entry.")
+            warnings.append(f"{unmapped_ist} As-Is process(es) were not covered by any mapping entry.")
         if unmapped_soll > 0:
-            warnings.append(f"{unmapped_soll} Soll process(es) were not covered by any mapping entry.")
+            warnings.append(f"{unmapped_soll} To-Be process(es) were not covered by any mapping entry.")
         if ist_truncated:
-            warnings.append(f"Ist processes were truncated to the first {max_mapping_items} for this analysis.")
+            warnings.append(f"As-Is processes were truncated to the first {max_mapping_items} for this analysis.")
         if soll_truncated:
-            warnings.append(f"Soll processes were truncated to the first {max_mapping_items} for this analysis.")
+            warnings.append(f"To-Be processes were truncated to the first {max_mapping_items} for this analysis.")
 
         return {
             "ist_view_name": ist_view_name,
@@ -2154,11 +2178,11 @@ class ChatService:
         self,
         *,
         mappings: List[Dict[str, Any]],
-        view_name: str = "Ist-Soll Mapping",
+        view_name: str = "As-Is To-Be Mapping",
     ) -> Dict[str, Any]:
-        """Create the Ist<->Soll traceability relationships AND a real Archi view visualizing them:
-        an Ist row and a Soll row, matched pairs vertically aligned and connected, unmatched
-        processes (legacy-no-Soll / new-no-Ist) shown standalone in their row so the gap is visible
+        """Create the As-Is<->To-Be traceability relationships AND a real Archi view visualizing them:
+        an As-Is row and a To-Be row, matched pairs vertically aligned and connected, unmatched
+        processes (legacy-no-To-Be / new-no-As-Is) shown standalone in their row so the gap is visible
         at a glance -- not just a relationship buried in the model."""
         included = [m for m in mappings if m.get("include", True)]
         matched = [m for m in included if m.get("ist_key") and m.get("soll_key")]
@@ -2168,7 +2192,7 @@ class ChatService:
         if not matched and not ist_only and not soll_only:
             raise RuntimeError("No mappings were selected to apply.")
 
-        preferred_view_name = self._normalize_name(view_name or "Ist-Soll Mapping", fallback="Ist-Soll Mapping")
+        preferred_view_name = self._normalize_name(view_name or "As-Is To-Be Mapping", fallback="As-Is To-Be Mapping")
         match_labels = {"full": "full match", "partial": "partial match"}
 
         elements_by_key: Dict[str, Dict[str, str]] = {}
@@ -2185,8 +2209,8 @@ class ChatService:
         for mapping in matched:
             ist_key = f"ist::{mapping['ist_key']}"
             soll_key = f"soll::{mapping['soll_key']}"
-            elements_by_key[ist_key] = {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "Ist process")}
-            elements_by_key[soll_key] = {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "Soll process")}
+            elements_by_key[ist_key] = {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "As-Is process")}
+            elements_by_key[soll_key] = {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "To-Be process")}
             x = start_x + col_index * col_gap
             layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
             layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
@@ -2197,7 +2221,7 @@ class ChatService:
             # Triggering/Flow/Specialization/Association) -- every prior "successful" apply was
             # silently rejected wholesale before _mcp_call was fixed to actually check for errors.
             # AssociationRelationship is the correct, always-valid ArchiMate type here; "realizes"
-            # is still conveyed via the connection's name/label (source=Soll, target=Ist) since that
+            # is still conveyed via the connection's name/label (source=To-Be, target=As-Is) since that
             # was the intended traceability semantics.
             relationships.append(
                 {
@@ -2212,7 +2236,7 @@ class ChatService:
         for mapping in ist_only:
             ist_key = f"ist::{mapping['ist_key']}"
             elements_by_key.setdefault(
-                ist_key, {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "Ist process")}
+                ist_key, {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "As-Is process")}
             )
             x = start_x + col_index * col_gap
             layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
@@ -2221,15 +2245,15 @@ class ChatService:
         for mapping in soll_only:
             soll_key = f"soll::{mapping['soll_key']}"
             elements_by_key.setdefault(
-                soll_key, {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "Soll process")}
+                soll_key, {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "To-Be process")}
             )
             x = start_x + col_index * col_gap
             layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
             col_index += 1
 
         execution = self._execute_view_plan(
-            action_label="Ist-Soll mapping visualization",
-            source_name="Mapping & Gap-Analyse",
+            action_label="As-Is/To-Be mapping visualization",
+            source_name="Mapping & Gap Analysis",
             view_name=preferred_view_name,
             elements_by_key=elements_by_key,
             relationships=relationships,
@@ -2239,7 +2263,7 @@ class ChatService:
         resolved_view_name = str(execution.get("view_name", preferred_view_name))
         summary = (
             f"Created mapping view '{resolved_view_name}': {len(matched)} matched pair(s) connected, "
-            f"{len(ist_only)} Ist-only (legacy, no Soll equivalent), {len(soll_only)} Soll-only (new, no Ist "
+            f"{len(ist_only)} As-Is-only (legacy, no To-Be equivalent), {len(soll_only)} To-Be-only (new, no As-Is "
             f"equivalent) shown standalone. {execution.get('created_relationships', 0)} new relationship(s) created. "
             "If Archi approval mode is enabled, approve the proposal to apply changes."
         )
@@ -2261,7 +2285,9 @@ class ChatService:
         legacy_count = sum(1 for m in mappings if m.get("match_type") == "legacy_no_soll")
         gap_new_count = sum(1 for m in mappings if m.get("match_type") == "gap_new")
         gap_count = len(gaps)
-        critical_gap_count = sum(1 for g in gaps if g.get("criticality") == "high")
+        high_gap_count = sum(1 for g in gaps if g.get("criticality") == "high")
+        medium_gap_count = sum(1 for g in gaps if g.get("criticality") == "medium")
+        low_gap_count = sum(1 for g in gaps if g.get("criticality") == "low")
 
         confidences = [
             self._as_float(m.get("confidence", 0.0), default=0.0)
@@ -2272,32 +2298,87 @@ class ChatService:
         total_mappings = max(1, len(mappings))
         maturity_score = ((full_matches + 0.5 * partial_matches) / total_mappings) * 100.0
 
+        if maturity_score >= 75:
+            readiness_label = "Advanced"
+        elif maturity_score >= 45:
+            readiness_label = "Progressing"
+        else:
+            readiness_label = "Early Stage"
+
+        # Sort gaps highest-criticality-first so the LLM sees the most decision-relevant ones
+        # first if the list has to be truncated, and so it can quote real descriptions instead of
+        # inventing risk language.
+        criticality_rank = {"high": 0, "medium": 1, "low": 2}
+        sorted_gaps = sorted(gaps, key=lambda g: criticality_rank.get(str(g.get("criticality")), 3))
+        gap_lines = "\n".join(
+            f"- [{g.get('criticality', 'medium')}] {g.get('category', 'gap')}: {g.get('description', '')}"
+            for g in sorted_gaps[:20]
+        ) or "- (no gaps identified)"
+
         summary_prompt = (
-            "Write a short executive summary (4-6 sentences, plain text, no markdown, no headings or bullet "
-            "points) of this architecture assessment gap analysis for a management audience.\n"
-            f"Ist processes mapped: {len(ist_ids)}. Soll processes mapped: {len(soll_ids)}.\n"
+            "You are preparing the executive summary slide for a steering committee (steerco) readout of an "
+            "architecture assessment. The audience is senior management with limited time -- they need the "
+            "verdict and the decision they're being asked to make, not a narrative of the analysis process.\n\n"
+            "Ground every claim ONLY in the data below. Never invent a number, risk, or finding that isn't "
+            "directly supported by it. top_risks entries must paraphrase or quote an actual gap from the list "
+            "below, not a generic statement.\n\n"
+            f"As-Is processes mapped: {len(ist_ids)}. To-Be processes mapped: {len(soll_ids)}.\n"
             f"Full matches: {full_matches}. Partial matches: {partial_matches}. "
-            f"Legacy processes with no Soll equivalent: {legacy_count}. "
-            f"New Soll processes with no Ist equivalent: {gap_new_count}.\n"
-            f"Total gaps identified: {gap_count}, of which {critical_gap_count} are high criticality.\n"
+            f"Legacy processes with no To-Be equivalent: {legacy_count}. "
+            f"New To-Be processes with no As-Is equivalent: {gap_new_count}.\n"
+            f"Total gaps: {gap_count} (high: {high_gap_count}, medium: {medium_gap_count}, low: {low_gap_count}).\n"
             f"Average mapping confidence/similarity: {average_similarity:.0f}%. "
-            f"Overall maturity score: {maturity_score:.0f}%.\n"
-            "Mention the maturity score, the volume of gaps, and flag whether critical gaps need near-term "
-            "attention."
+            f"Overall maturity score: {maturity_score:.0f}% ({readiness_label}).\n\n"
+            f"Gap list (highest criticality first):\n{gap_lines}\n\n"
+            "Return strict JSON only with this schema:\n"
+            "{\n"
+            '  "headline": "one punchy sentence, the verdict a steerco member would remember -- state the '
+            'maturity/readiness posture and the single biggest thing needing a decision",\n'
+            '  "key_findings": ["3 to 4 short, specific, scannable bullet points -- each one fact, not a '
+            'restatement of raw counts already shown elsewhere"],\n'
+            '  "top_risks": ["2 to 3 bullets, each naming a REAL gap from the list above and why it matters '
+            'to the business, ordered most severe first"],\n'
+            '  "recommendation": "1-2 sentences: the single clearest recommended course of action given the '
+            'findings -- what should leadership approve or prioritize",\n'
+            '  "next_steps": ["2 to 3 short, concrete, near-term action items"],\n'
+            '  "executive_summary": "4-6 sentence flowing paragraph version of the same verdict, for when a '
+            'plain-text summary is needed instead of bullets"\n'
+            "}\n"
+            "Rules:\n"
+            "- Plain text only inside every field -- no markdown, no bullet characters, no bold.\n"
+            "- Be concrete and quantify where the data supports it (e.g. cite counts or the maturity score) "
+            "rather than using vague language like \"several\" or \"significant\".\n"
+            "- If there are zero high-criticality gaps, top_risks should say so explicitly rather than "
+            "padding with lower-severity items dressed up as risks.\n"
+            "- No explanation text outside the JSON object."
         )
-        create_kwargs: Dict[str, Any] = dict(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You write concise, plain-text executive summaries for architecture consulting engagements.",
-                },
-                {"role": "user", "content": summary_prompt},
-            ],
-            temperature=0.3,
+        parsed = self._call_model_for_json(
+            system_prompt=(
+                "You write steerco-grade architecture assessment summaries: concise, decision-oriented, and "
+                "strictly grounded in the data you're given. Output strict JSON only."
+            ),
+            user_prompt=summary_prompt,
         )
-        extraction_model = self.settings.azure_openai_extraction_model or self.settings.azure_openai_model
-        response, _model, _retries = self._call_model_with_retries(create_kwargs, primary_model=extraction_model)
-        executive_summary = (response.choices[0].message.content or "").strip()
+
+        def _str_list(raw: Any, *, max_items: int, max_len: int) -> List[str]:
+            if not isinstance(raw, list):
+                return []
+            out = []
+            for item in raw[:max_items]:
+                text = self._normalize_name(item, fallback="", max_len=max_len)
+                if text:
+                    out.append(text)
+            return out
+
+        headline = self._normalize_name(parsed.get("headline", ""), fallback="", max_len=200)
+        key_findings = _str_list(parsed.get("key_findings"), max_items=5, max_len=220)
+        top_risks = _str_list(parsed.get("top_risks"), max_items=4, max_len=260)
+        recommendation = self._normalize_name(parsed.get("recommendation", ""), fallback="", max_len=400)
+        next_steps = _str_list(parsed.get("next_steps"), max_items=4, max_len=200)
+        executive_summary = self._normalize_name(parsed.get("executive_summary", ""), fallback="", max_len=1200)
+
+        if not top_risks and high_gap_count == 0:
+            top_risks = ["No high-criticality gaps identified in this assessment."]
 
         return {
             "ist_process_count": len(ist_ids),
@@ -2305,9 +2386,17 @@ class ChatService:
             "full_matches": full_matches,
             "partial_matches": partial_matches,
             "gap_count": gap_count,
-            "critical_gap_count": critical_gap_count,
+            "critical_gap_count": high_gap_count,
+            "medium_gap_count": medium_gap_count,
+            "low_gap_count": low_gap_count,
             "average_similarity": round(average_similarity, 1),
             "maturity_score": round(maturity_score, 1),
+            "readiness_label": readiness_label,
+            "headline": headline,
+            "key_findings": key_findings,
+            "top_risks": top_risks,
+            "recommendation": recommendation,
+            "next_steps": next_steps,
             "executive_summary": executive_summary,
         }
 

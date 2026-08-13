@@ -82,8 +82,8 @@ RELATIONSHIPS: List[Tuple[str, str, str, str, str]] = [
         "AssociationRelationship",
         "BusinessProcess",
         "Realizes (mapping)",
-        "Ist-Soll traceability in the Mapping & Gap-Analyse view: the target (Soll) process is "
-        "linked to the as-is (Ist) process it replaces or fulfills, labeled 'realizes' on the "
+        "As-Is/To-Be traceability in the Mapping & Gap Analysis view: the target (To-Be) process is "
+        "linked to the as-is (As-Is) process it replaces or fulfills, labeled 'realizes' on the "
         "connection. RealizationRelationship itself is not a valid ArchiMate pairing between two "
         "BusinessProcess elements (rejected by the MCP server's validator), so Association is the "
         "correct type here with the semantic intent carried in the relationship name instead.",

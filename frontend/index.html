@@ -57,34 +57,34 @@
           <section id="assessmentTab" class="tab-panel">
             <nav class="assessment-stepper card">
               <button class="assessment-step-btn active" type="button" data-step="setup">1. Setup</button>
-              <button class="assessment-step-btn" type="button" data-step="ist" disabled>2. Ist-Aufnahme</button>
-              <button class="assessment-step-btn" type="button" data-step="soll" disabled>3. Soll-Architektur</button>
-              <button class="assessment-step-btn" type="button" data-step="mapping" disabled>4. Mapping &amp; Gap-Analyse</button>
+              <button class="assessment-step-btn" type="button" data-step="ist" disabled>2. As-Is Capture</button>
+              <button class="assessment-step-btn" type="button" data-step="soll" disabled>3. To-Be Architecture</button>
+              <button class="assessment-step-btn" type="button" data-step="mapping" disabled>4. Mapping &amp; Gap Analysis</button>
               <button class="assessment-step-btn" type="button" data-step="summary" disabled>5. Summary</button>
             </nav>
 
             <section id="assessmentStepSetup" class="card assessment-step">
               <h3>1. Setup &amp; Context</h3>
-              <p>Checks the current Archi model for existing Ist/Soll views and confirms the assessment scope before starting. Mirrors the Setup &amp; Context Agent from the assessment spec.</p>
+              <p>Checks the current Archi model for existing As-Is/To-Be views and confirms the assessment scope before starting. Mirrors the Setup &amp; Context Agent from the assessment spec.</p>
               <div class="assessment-field-row">
-                <label>Ist view name
-                  <input id="assessmentIstViewName" type="text" value="Ist-Business-Prozesse" maxlength="120" />
+                <label>As-Is view name
+                  <input id="assessmentIstViewName" type="text" value="As-Is Business Processes" maxlength="120" />
                 </label>
-                <label>Soll view name
-                  <input id="assessmentSollViewName" type="text" value="Soll-Architektur" maxlength="120" />
+                <label>To-Be view name
+                  <input id="assessmentSollViewName" type="text" value="To-Be Architecture" maxlength="120" />
                 </label>
               </div>
               <button id="assessmentSetupBtn" class="btn primary" type="button">Check model state</button>
               <div id="assessmentSetupResult" class="assessment-result hidden"></div>
               <div class="assessment-step-actions">
                 <span></span>
-                <button id="assessmentSetupContinueBtn" class="btn primary" type="button" disabled>Continue to Ist-Aufnahme</button>
+                <button id="assessmentSetupContinueBtn" class="btn primary" type="button" disabled>Continue to As-Is Capture</button>
               </div>
             </section>
 
             <section id="assessmentStepIst" class="card assessment-step hidden">
-              <h3>2. Ist-Aufnahme (Business Process Extractor)</h3>
-              <p>Upload as-is process documentation (PDF, Excel, or text). Uses the same PDF-geometry-aware, evidence-gated extraction as the Workspace upload. Nothing is written to Archi until you review and apply below.</p>
+              <h3>2. As-Is Capture (Business Process Extractor)</h3>
+              <p>Upload As-Is Process documentation (PDF, Excel, or text). Uses the same PDF-geometry-aware, evidence-gated extraction as the Workspace upload. Nothing is written to Archi until you review and apply below.</p>
               <form id="assessmentIstForm" class="action-form">
                 <input id="assessmentIstFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
                 <button id="assessmentIstBtn" class="btn primary" type="submit">Preview extraction</button>
@@ -105,19 +105,19 @@
               </div>
               <div class="assessment-step-actions">
                 <button id="assessmentIstBackBtn" class="btn ghost" type="button">Back</button>
-                <button id="assessmentIstContinueBtn" class="btn primary" type="button" disabled>Continue to Soll-Architektur</button>
+                <button id="assessmentIstContinueBtn" class="btn primary" type="button" disabled>Continue to To-Be Architecture</button>
               </div>
             </section>
 
             <section id="assessmentStepSoll" class="card assessment-step hidden">
-              <h3>3. Soll-Architektur (Target Architecture Builder)</h3>
-              <p>Upload a target-state process document (e.g. a Soll SIPOC table or process diagram) -- it uses the exact same SIPOC-table / PDF-geometry-aware, evidence-gated extraction as Ist-Aufnahme, producing BusinessProcess elements and TriggeringRelationship connections tagged status=target and added to the Soll view from Setup. If you don't have a target document yet, let an agent propose one based on the Ist processes already in the model.</p>
+              <h3>3. To-Be Architecture (Target Architecture Builder)</h3>
+              <p>Upload a target-state process document (e.g. a To-Be SIPOC table or process diagram) -- it uses the exact same SIPOC-table / PDF-geometry-aware, evidence-gated extraction as As-Is Capture, producing BusinessProcess elements and TriggeringRelationship connections tagged status=target and added to the To-Be view from Setup. If you don't have a target document yet, let an agent propose one based on the As-Is processes already in the model.</p>
               <form id="assessmentSollForm" class="action-form">
                 <input id="assessmentSollFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
                 <button id="assessmentSollBtn" class="btn primary" type="submit">Preview extraction</button>
               </form>
               <div class="assessment-or-divider">or</div>
-              <button id="assessmentSollProposeBtn" class="btn primary" type="button">Propose Soll-Architektur (AI)</button>
+              <button id="assessmentSollProposeBtn" class="btn primary" type="button">Propose To-Be Architecture (AI)</button>
               <div id="assessmentSollStatus" class="action-status hidden"></div>
               <div id="assessmentSollPreview" class="assessment-preview hidden">
                 <div id="assessmentSollCounts" class="preview-counts"></div>
@@ -134,20 +134,20 @@
               </div>
               <div class="assessment-step-actions">
                 <button id="assessmentSollBackBtn" class="btn ghost" type="button">Back</button>
-                <button id="assessmentSollContinueBtn" class="btn primary" type="button" disabled>Continue to Mapping &amp; Gap-Analyse</button>
+                <button id="assessmentSollContinueBtn" class="btn primary" type="button" disabled>Continue to Mapping &amp; Gap Analysis</button>
               </div>
             </section>
 
             <section id="assessmentStepMapping" class="card assessment-step hidden">
-              <h3>4. Mapping &amp; Gap-Analyse</h3>
-              <p>Compares every Ist business process already in the model against the Soll business processes and classifies each pairing as a full match, partial match, legacy process with no Soll equivalent, or a new Soll process with no Ist equivalent. Applying creates a real Archi view with Ist and Soll processes side by side: matched pairs connected, unmatched ones shown standalone so gaps are visible at a glance.</p>
+              <h3>4. Mapping &amp; Gap Analysis</h3>
+              <p>Compares every As-Is business process already in the model against the To-Be business processes and classifies each pairing as a full match, partial match, legacy process with no To-Be equivalent, or a new To-Be process with no As-Is equivalent. Applying creates a real Archi view with As-Is and To-Be processes side by side: matched pairs connected, unmatched ones shown standalone so gaps are visible at a glance.</p>
               <button id="assessmentMappingRunBtn" class="btn primary" type="button">Run mapping &amp; gap analysis</button>
               <div id="assessmentMappingStatus" class="action-status hidden"></div>
               <div id="assessmentMappingResult" class="assessment-preview hidden">
                 <h4>Mappings</h4>
                 <div class="table-scroll">
                   <table id="assessmentMappingTable" class="preview-table">
-                    <thead><tr><th class="col-check"></th><th>Ist process</th><th>Match</th><th>Soll process</th><th>Rationale</th></tr></thead>
+                    <thead><tr><th class="col-check"></th><th>As-Is process</th><th>Match</th><th>To-Be process</th><th>Rationale</th></tr></thead>
                     <tbody></tbody>
                   </table>
                 </div>
@@ -159,7 +159,7 @@
                   </table>
                 </div>
                 <label class="assessment-mapping-view-name-label">Mapping view name
-                  <input id="assessmentMappingViewName" type="text" value="Ist-Soll Mapping" maxlength="120" />
+                  <input id="assessmentMappingViewName" type="text" value="As-Is To-Be Mapping" maxlength="120" />
                 </label>
                 <div class="preview-actions">
                   <button id="assessmentMappingApplyBtn" class="btn primary" type="button">Apply mappings to Archi</button>
@@ -173,18 +173,54 @@
 
             <section id="assessmentStepSummary" class="card assessment-step hidden">
               <h3>5. Business Summary</h3>
-              <p>Aggregates the mapping and gap results into a compact, management-ready summary.</p>
+              <p>Turns the mapping and gap results into a steerco-ready executive summary you can present or hand out as a PDF.</p>
               <button id="assessmentSummaryRunBtn" class="btn primary" type="button">Generate summary</button>
               <div id="assessmentSummaryStatus" class="action-status hidden"></div>
               <div id="assessmentSummaryResult" class="assessment-preview hidden">
-                <div id="assessmentSummaryStats" class="kv-grid"></div>
-                <h4>Executive summary</h4>
-                <p id="assessmentSummaryText" class="assessment-summary-text"></p>
-                <button id="assessmentSummaryCopyBtn" class="btn ghost small" type="button">Copy</button>
+                <div class="summary-toolbar">
+                  <button id="assessmentSummaryCopyBtn" class="btn ghost small" type="button">Copy as text</button>
+                  <button id="assessmentSummaryDownloadBtn" class="btn primary small" type="button">Download as PDF</button>
+                </div>
+
+                <article id="summarySlide" class="summary-slide">
+                  <header class="summary-slide-head">
+                    <div class="summary-slide-kicker">Architecture Assessment &mdash; Executive Summary</div>
+                    <h2 id="summaryHeadline" class="summary-headline"></h2>
+                    <span id="summaryReadinessBadge" class="summary-readiness-badge"></span>
+                  </header>
+
+                  <div id="summaryStatRow" class="summary-stat-row"></div>
+
+                  <div class="summary-columns">
+                    <section class="summary-block">
+                      <h4>Key findings</h4>
+                      <ul id="summaryFindingsList" class="summary-list"></ul>
+                    </section>
+                    <section class="summary-block summary-block-risk">
+                      <h4>Top risks</h4>
+                      <ul id="summaryRisksList" class="summary-list"></ul>
+                    </section>
+                  </div>
+
+                  <section class="summary-block summary-block-recommendation">
+                    <h4>Recommendation</h4>
+                    <p id="summaryRecommendationText"></p>
+                  </section>
+
+                  <section class="summary-block">
+                    <h4>Next steps</h4>
+                    <ol id="summaryNextStepsList" class="summary-list summary-list-numbered"></ol>
+                  </section>
+
+                  <footer class="summary-slide-footer">
+                    <span id="summaryGeneratedAt"></span>
+                    <span>Archi Local Chatbot &mdash; Architecture Assessment</span>
+                  </footer>
+                </article>
               </div>
               <div class="assessment-step-actions">
                 <button id="assessmentSummaryBackBtn" class="btn ghost" type="button">Back</button>
-                <span></span>
+                <button id="assessmentStartNewBtn" class="btn primary" type="button">Start New Assessment</button>
               </div>
             </section>
 

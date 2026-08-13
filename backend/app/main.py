@@ -598,8 +598,8 @@ def apply_plan(payload: ApplyPlanRequest) -> ActionResponse:
 
 @app.get("/api/assessment/setup", response_model=AssessmentSetupResponse)
 def assessment_setup(
-    ist_view_name: str = "Ist-Business-Prozesse",
-    soll_view_name: str = "Soll-Architektur",
+    ist_view_name: str = "As-Is Business Processes",
+    soll_view_name: str = "To-Be Architecture",
 ) -> AssessmentSetupResponse:
     try:
         result = chat_service.assessment_setup(ist_view_name=ist_view_name, soll_view_name=soll_view_name)
@@ -626,7 +626,7 @@ async def assessment_soll_architecture_preview(
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Soll-Architektur preview failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"To-Be Architecture preview failed: {exc}") from exc
     return AutomationPlanResponse(**plan)
 
 
@@ -640,7 +640,7 @@ def assessment_soll_architecture_propose(payload: SollProposalRequest) -> Automa
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Soll-Architektur proposal failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"To-Be Architecture proposal failed: {exc}") from exc
     return AutomationPlanResponse(**plan)
 
 

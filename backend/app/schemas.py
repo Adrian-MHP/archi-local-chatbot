@@ -145,13 +145,13 @@ class GapEntry(BaseModel):
 
 
 class SollProposalRequest(BaseModel):
-    ist_view_name: str = Field(default="Ist-Business-Prozesse", max_length=120)
+    ist_view_name: str = Field(default="As-Is Business Processes", max_length=120)
     view_name: str | None = Field(default=None, max_length=120)
 
 
 class MappingGapRequest(BaseModel):
-    ist_view_name: str = Field(default="Ist-Business-Prozesse", max_length=120)
-    soll_view_name: str = Field(default="Soll-Architektur", max_length=120)
+    ist_view_name: str = Field(default="As-Is Business Processes", max_length=120)
+    soll_view_name: str = Field(default="To-Be Architecture", max_length=120)
 
 
 class MappingGapResponse(BaseModel):
@@ -164,7 +164,7 @@ class MappingGapResponse(BaseModel):
 
 class MappingApplyRequest(BaseModel):
     mappings: List[MappingEntry] = Field(default_factory=list)
-    view_name: str = Field(default="Ist-Soll Mapping", max_length=120)
+    view_name: str = Field(default="As-Is To-Be Mapping", max_length=120)
 
 
 class MappingApplyResponse(BaseModel):
@@ -187,8 +187,16 @@ class AssessmentSummaryResponse(BaseModel):
     partial_matches: int = Field(default=0, ge=0)
     gap_count: int = Field(default=0, ge=0)
     critical_gap_count: int = Field(default=0, ge=0)
+    medium_gap_count: int = Field(default=0, ge=0)
+    low_gap_count: int = Field(default=0, ge=0)
     average_similarity: float = Field(default=0.0, ge=0.0, le=100.0)
     maturity_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    readiness_label: str = ""
+    headline: str = ""
+    key_findings: List[str] = Field(default_factory=list)
+    top_risks: List[str] = Field(default_factory=list)
+    recommendation: str = ""
+    next_steps: List[str] = Field(default_factory=list)
     executive_summary: str = ""
 
 

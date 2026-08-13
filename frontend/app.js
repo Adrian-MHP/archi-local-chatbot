@@ -29,6 +29,7 @@ const state = {
     istPlan: null,
     sollPlan: null,
     mappingResult: null,
+    summaryResult: null,
   },
 };
 
@@ -112,10 +113,18 @@ const elements = {
   assessmentSummaryRunBtn: document.getElementById("assessmentSummaryRunBtn"),
   assessmentSummaryStatus: document.getElementById("assessmentSummaryStatus"),
   assessmentSummaryResult: document.getElementById("assessmentSummaryResult"),
-  assessmentSummaryStats: document.getElementById("assessmentSummaryStats"),
-  assessmentSummaryText: document.getElementById("assessmentSummaryText"),
   assessmentSummaryCopyBtn: document.getElementById("assessmentSummaryCopyBtn"),
+  assessmentSummaryDownloadBtn: document.getElementById("assessmentSummaryDownloadBtn"),
+  summaryHeadline: document.getElementById("summaryHeadline"),
+  summaryReadinessBadge: document.getElementById("summaryReadinessBadge"),
+  summaryStatRow: document.getElementById("summaryStatRow"),
+  summaryFindingsList: document.getElementById("summaryFindingsList"),
+  summaryRisksList: document.getElementById("summaryRisksList"),
+  summaryRecommendationText: document.getElementById("summaryRecommendationText"),
+  summaryNextStepsList: document.getElementById("summaryNextStepsList"),
+  summaryGeneratedAt: document.getElementById("summaryGeneratedAt"),
   assessmentSummaryBackBtn: document.getElementById("assessmentSummaryBackBtn"),
+  assessmentStartNewBtn: document.getElementById("assessmentStartNewBtn"),
 };
 
 function validateRequiredElements() {
@@ -669,8 +678,8 @@ function markAssessmentStepComplete(step) {
 }
 
 async function runAssessmentSetup() {
-  const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
-  const sollViewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+  const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
+  const sollViewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
   elements.assessmentSetupBtn.disabled = true;
   elements.assessmentSetupResult.classList.add("hidden");
   try {
@@ -773,7 +782,7 @@ async function loadAssessmentIstPreview() {
   try {
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("view_name", elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse");
+    formData.append("view_name", elements.assessmentIstViewName.value.trim() || "As-Is Business Processes");
     const res = await fetch("/api/actions/business-process-upload/preview", { method: "POST", body: formData });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
@@ -852,7 +861,7 @@ async function loadAssessmentSollPreview() {
   try {
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("view_name", elements.assessmentSollViewName.value.trim() || "Soll-Architektur");
+    formData.append("view_name", elements.assessmentSollViewName.value.trim() || "To-Be Architecture");
     const res = await fetch("/api/assessment/soll-architecture/preview", { method: "POST", body: formData });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
@@ -877,10 +886,10 @@ async function proposeAssessmentSollArchitecture() {
   if (state.assessment.pending) return;
   state.assessment.pending = true;
   elements.assessmentSollProposeBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentSollStatus, "Generating a Soll-Architektur proposal from the Ist processes...", "pending");
+  setAssessmentStatus(elements.assessmentSollStatus, "Generating a To-Be Architecture proposal from the As-Is processes...", "pending");
   try {
-    const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
-    const viewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+    const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
+    const viewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
     const res = await fetch("/api/assessment/soll-architecture/propose", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -949,11 +958,62 @@ function discardAssessmentSollPlan() {
   setAssessmentStatus(elements.assessmentSollStatus, "Preview discarded. Nothing was written to Archi.", "neutral");
 }
 
+function freshAssessmentViewNameStamp() {
+  return new Date().toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function startNewAssessment() {
+  // Reusing a prior cycle's view name would mix this new cycle's mapping analysis with the old
+  // one's data -- mapping is scoped to whatever's actually on the configured As-Is/To-Be views, so
+  // a genuinely fresh, non-colliding name is what makes "start new assessment" actually mean it.
+  const stamp = freshAssessmentViewNameStamp();
+  elements.assessmentIstViewName.value = `As-Is Business Processes (${stamp})`;
+  elements.assessmentSollViewName.value = `To-Be Architecture (${stamp})`;
+  elements.assessmentMappingViewName.value = `As-Is To-Be Mapping (${stamp})`;
+
+  elements.assessmentIstFile.value = "";
+  elements.assessmentSollFile.value = "";
+
+  elements.assessmentSetupResult.classList.add("hidden");
+  elements.assessmentSetupContinueBtn.disabled = true;
+  elements.assessmentIstStatus.classList.add("hidden");
+  elements.assessmentIstPreview.classList.add("hidden");
+  elements.assessmentIstContinueBtn.disabled = true;
+  elements.assessmentSollStatus.classList.add("hidden");
+  elements.assessmentSollPreview.classList.add("hidden");
+  elements.assessmentSollContinueBtn.disabled = true;
+  elements.assessmentMappingStatus.classList.add("hidden");
+  elements.assessmentMappingResult.classList.add("hidden");
+  elements.assessmentMappingContinueBtn.disabled = true;
+  elements.assessmentSummaryStatus.classList.add("hidden");
+  elements.assessmentSummaryResult.classList.add("hidden");
+
+  document.querySelectorAll(".assessment-step-btn").forEach((btn) => {
+    btn.disabled = btn.dataset.step !== "setup";
+  });
+
+  state.assessment = {
+    currentStep: "setup",
+    completedSteps: new Set(),
+    pending: false,
+    istPlan: null,
+    sollPlan: null,
+    mappingResult: null,
+    summaryResult: null,
+  };
+  setAssessmentStep("setup");
+}
+
 const ASSESSMENT_MATCH_TYPE_LABELS = {
   full: "Full match",
   partial: "Partial match",
-  legacy_no_soll: "Legacy (no Soll)",
-  gap_new: "New (no Ist)",
+  legacy_no_soll: "Legacy (no To-Be)",
+  gap_new: "New (no As-Is)",
 };
 
 const ASSESSMENT_CRITICALITY_LABELS = { high: "High", medium: "Medium", low: "Low" };
@@ -990,7 +1050,7 @@ function renderAssessmentMappingTable(data) {
     checkbox.checked = mapping.include;
     checkbox.disabled = !hasEndpoint;
     checkbox.title = hasEndpoint
-      ? "Matched pairs are connected in the mapping view; Ist-only/Soll-only rows are shown standalone."
+      ? "Matched pairs are connected in the mapping view; As-Is-only/To-Be-only rows are shown standalone."
       : "";
     checkbox.addEventListener("change", () => {
       mapping.include = checkbox.checked;
@@ -1064,8 +1124,8 @@ async function runAssessmentMapping() {
   elements.assessmentMappingRunBtn.disabled = true;
   setAssessmentStatus(elements.assessmentMappingStatus, "Running mapping & gap analysis...", "pending");
   try {
-    const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
-    const sollViewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+    const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
+    const sollViewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
     const res = await fetch("/api/assessment/mapping/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1103,7 +1163,7 @@ async function applyAssessmentMappings() {
   elements.assessmentMappingApplyBtn.disabled = true;
   setAssessmentStatus(elements.assessmentMappingStatus, "Building the mapping view in Archi...", "pending");
   try {
-    const viewName = elements.assessmentMappingViewName.value.trim() || "Ist-Soll Mapping";
+    const viewName = elements.assessmentMappingViewName.value.trim() || "As-Is To-Be Mapping";
     const res = await fetch("/api/assessment/mapping/apply", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1128,30 +1188,99 @@ async function applyAssessmentMappings() {
   }
 }
 
+function buildSummaryPlainText(data) {
+  const lines = [];
+  lines.push("ARCHITECTURE ASSESSMENT — EXECUTIVE SUMMARY");
+  if (data.readiness_label) lines.push(`Readiness: ${data.readiness_label} (maturity ${data.maturity_score}%)`);
+  lines.push("");
+  if (data.headline) {
+    lines.push(data.headline);
+    lines.push("");
+  }
+  lines.push(
+    `As-Is processes: ${data.ist_process_count}  ·  To-Be processes: ${data.soll_process_count}  ·  ` +
+      `Full matches: ${data.full_matches}  ·  Partial matches: ${data.partial_matches}  ·  ` +
+      `Gaps: ${data.gap_count} (high: ${data.critical_gap_count}, medium: ${data.medium_gap_count}, low: ${data.low_gap_count})`
+  );
+  lines.push("");
+  if (data.key_findings && data.key_findings.length) {
+    lines.push("KEY FINDINGS");
+    data.key_findings.forEach((f) => lines.push(`- ${f}`));
+    lines.push("");
+  }
+  if (data.top_risks && data.top_risks.length) {
+    lines.push("TOP RISKS");
+    data.top_risks.forEach((r) => lines.push(`- ${r}`));
+    lines.push("");
+  }
+  if (data.recommendation) {
+    lines.push("RECOMMENDATION");
+    lines.push(data.recommendation);
+    lines.push("");
+  }
+  if (data.next_steps && data.next_steps.length) {
+    lines.push("NEXT STEPS");
+    data.next_steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
+    lines.push("");
+  }
+  if (data.executive_summary) {
+    lines.push("SUMMARY");
+    lines.push(data.executive_summary);
+  }
+  return lines.join("\n").trim();
+}
+
+function readinessLevelSlug(label) {
+  const key = String(label || "").toLowerCase();
+  if (key === "advanced") return "advanced";
+  if (key === "early stage") return "early-stage";
+  return "progressing";
+}
+
 function renderAssessmentSummary(data) {
-  const stats = elements.assessmentSummaryStats;
-  stats.innerHTML = "";
-  const rows = [
-    ["Ist processes mapped", data.ist_process_count],
-    ["Soll processes mapped", data.soll_process_count],
-    ["Full matches", data.full_matches],
-    ["Partial matches", data.partial_matches],
-    ["Gaps identified", data.gap_count],
-    ["Critical gaps", data.critical_gap_count],
-    ["Average similarity", `${data.average_similarity}%`],
-    ["Maturity score", `${data.maturity_score}%`],
+  state.assessment.summaryResult = data;
+
+  elements.summaryHeadline.textContent = data.headline || "Assessment summary";
+  elements.summaryReadinessBadge.textContent = `${data.readiness_label || "—"} · ${data.maturity_score}% maturity`;
+  elements.summaryReadinessBadge.dataset.level = readinessLevelSlug(data.readiness_label);
+
+  const statRow = elements.summaryStatRow;
+  statRow.innerHTML = "";
+  const tiles = [
+    ["As-Is processes", data.ist_process_count, false],
+    ["To-Be processes", data.soll_process_count, false],
+    ["Full matches", data.full_matches, false],
+    ["Partial matches", data.partial_matches, false],
+    ["Total gaps", data.gap_count, false],
+    ["High-criticality gaps", data.critical_gap_count, data.critical_gap_count > 0],
   ];
-  for (const [label, value] of rows) {
-    const div = document.createElement("div");
-    const span = document.createElement("span");
-    span.textContent = label;
+  for (const [label, value, warn] of tiles) {
+    const tile = document.createElement("div");
+    tile.className = warn ? "summary-stat-tile summary-stat-warn" : "summary-stat-tile";
     const strong = document.createElement("strong");
     strong.textContent = String(value);
-    div.appendChild(span);
-    div.appendChild(strong);
-    stats.appendChild(div);
+    const span = document.createElement("span");
+    span.textContent = label;
+    tile.appendChild(strong);
+    tile.appendChild(span);
+    statRow.appendChild(tile);
   }
-  elements.assessmentSummaryText.textContent = data.executive_summary || "";
+
+  const fillList = (listEl, items, emptyText) => {
+    listEl.innerHTML = "";
+    const values = items && items.length ? items : [emptyText];
+    for (const text of values) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      listEl.appendChild(li);
+    }
+  };
+  fillList(elements.summaryFindingsList, data.key_findings, "No specific findings generated.");
+  fillList(elements.summaryRisksList, data.top_risks, "No risks identified.");
+  fillList(elements.summaryNextStepsList, data.next_steps, "No next steps generated.");
+
+  elements.summaryRecommendationText.textContent = data.recommendation || "No recommendation generated.";
+  elements.summaryGeneratedAt.textContent = `Generated ${new Date().toLocaleString()}`;
 }
 
 async function runAssessmentSummary() {
@@ -1222,8 +1351,9 @@ function attachAssessmentEventHandlers() {
   elements.assessmentSummaryRunBtn.addEventListener("click", runAssessmentSummary);
   elements.assessmentSummaryBackBtn.addEventListener("click", () => setAssessmentStep("mapping"));
   elements.assessmentSummaryCopyBtn.addEventListener("click", async () => {
+    if (!state.assessment.summaryResult) return;
     try {
-      await navigator.clipboard.writeText(elements.assessmentSummaryText.textContent || "");
+      await navigator.clipboard.writeText(buildSummaryPlainText(state.assessment.summaryResult));
       const original = elements.assessmentSummaryCopyBtn.textContent;
       elements.assessmentSummaryCopyBtn.textContent = "Copied";
       setTimeout(() => {
@@ -1232,6 +1362,19 @@ function attachAssessmentEventHandlers() {
     } catch (err) {
       // clipboard unavailable; ignore
     }
+  });
+
+  elements.assessmentSummaryDownloadBtn.addEventListener("click", () => {
+    if (!state.assessment.summaryResult) return;
+    window.print();
+  });
+
+  elements.assessmentStartNewBtn.addEventListener("click", () => {
+    if (state.assessment.pending) return;
+    if (!confirm("Start a new assessment? This clears the current wizard progress (nothing already created in Archi is deleted).")) {
+      return;
+    }
+    startNewAssessment();
   });
 }
 
