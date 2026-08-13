@@ -8,7 +8,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8000:8000"
+      - "38000:8000"
     restart: unless-stopped
 
   frontend:
@@ -18,5 +18,5 @@ services:
     depends_on:
       - backend
     ports:
-      - "8080:80"
+      - "38080:80"
     restart: unless-stopped

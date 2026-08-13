@@ -40,6 +40,7 @@ from .schemas import (
     MappingApplyResponse,
     MappingGapRequest,
     MappingGapResponse,
+    SollProposalRequest,
 )
 
 load_dotenv()
@@ -612,12 +613,13 @@ async def assessment_soll_architecture_preview(
     file: UploadFile = File(...),
     view_name: str | None = Form(default=None),
 ) -> AutomationPlanResponse:
-    text, source_name, _pdf_bytes = await _extract_text_from_upload(file)
+    text, source_name, pdf_bytes = await _extract_text_from_upload(file)
     try:
         plan = chat_service.plan_soll_architecture(
             content_text=text,
             source_name=source_name,
             view_name=view_name,
+            pdf_bytes=pdf_bytes,
         )
     except HTTPException:
         raise
@@ -625,6 +627,20 @@ async def assessment_soll_architecture_preview(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Soll-Architektur preview failed: {exc}") from exc
+    return AutomationPlanResponse(**plan)
+
+
+@app.post("/api/assessment/soll-architecture/propose", response_model=AutomationPlanResponse)
+def assessment_soll_architecture_propose(payload: SollProposalRequest) -> AutomationPlanResponse:
+    try:
+        plan = chat_service.propose_soll_architecture(
+            ist_view_name=payload.ist_view_name,
+            view_name=payload.view_name,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Soll-Architektur proposal failed: {exc}") from exc
     return AutomationPlanResponse(**plan)
 
 
@@ -646,7 +662,7 @@ def assessment_mapping_preview(payload: MappingGapRequest) -> MappingGapResponse
 def assessment_mapping_apply(payload: MappingApplyRequest) -> MappingApplyResponse:
     mapping_dicts = [m.model_dump() for m in payload.mappings]
     try:
-        result = chat_service.apply_mapping_relationships(mappings=mapping_dicts)
+        result = chat_service.apply_mapping_relationships(mappings=mapping_dicts, view_name=payload.view_name)
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

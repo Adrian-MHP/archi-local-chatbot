@@ -11,6 +11,7 @@ from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
 
 from . import meta_model
 from . import pdf_diagram
+from . import pdf_table
 from .config import Settings
 from .mcp_client import McpClient, McpTool
 
@@ -324,12 +325,20 @@ class ChatService:
         if isinstance(candidate, list):
             return [item for item in candidate if isinstance(item, dict)]
 
-        for key in ("items", "data", "results", "views", "elements", "relationships"):
+        # This MCP server wraps every search/list tool's payload as {"result": [...]} inside
+        # a text content block (never structuredContent) -- "result" (singular) must be checked
+        # or every search-elements/search-relationships/get-views call silently returns nothing.
+        for key in ("result", "items", "data", "results", "views", "elements", "relationships"):
             value = result.get(key)
             if isinstance(value, list):
                 dict_items = [item for item in value if isinstance(item, dict)]
                 if dict_items:
                     return dict_items
+
+        # Last resort: a single list-valued field, whatever it's called.
+        list_valued = [v for v in result.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
+        if len(list_valued) == 1:
+            return list_valued[0]
 
         content = result.get("content")
         if isinstance(content, list):
@@ -345,7 +354,7 @@ class ChatService:
 
     @staticmethod
     def _max_automation_ops() -> int:
-        return 150
+        return 200
 
     def _call_model_for_json(self, *, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         create_kwargs: Dict[str, Any] = dict(
@@ -363,7 +372,24 @@ class ChatService:
     def _mcp_call(self, tool_name: str, args: Dict[str, Any], used_tools: List[str]) -> Dict[str, Any]:
         result = self.mcp.call_tool(tool_name, args)
         used_tools.append(tool_name)
-        return self._unwrap_mcp_result(result)
+        unwrapped = self._unwrap_mcp_result(result)
+
+        # This MCP server reports tool-level failures (e.g. bulk-mutate's ArchiMate validation
+        # rejecting an invalid relationship pairing) as a plain {"error": {...}} payload rather
+        # than an MCP protocol error, so call_tool() never raises on its own -- without this check
+        # a rejected bulk-mutate (nothing created, no proposal, no error) looks identical to a
+        # real success to every caller, which is silently misreported as applied.
+        error = unwrapped.get("error") if isinstance(unwrapped, dict) else None
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("code") or "MCP tool call failed")
+            correction = error.get("suggestedCorrection")
+            if correction:
+                message = f"{message} ({correction})"
+            raise RuntimeError(f"{tool_name} failed: {message}")
+        if isinstance(unwrapped, dict) and unwrapped.get("allSucceeded") is False:
+            raise RuntimeError(f"{tool_name} did not fully succeed: {json.dumps(unwrapped)[:500]}")
+
+        return unwrapped
 
     def _find_existing_view_id(
         self,
@@ -625,8 +651,8 @@ class ChatService:
 
         if len(operations) > self._max_automation_ops():
             raise RuntimeError(
-                f"Automation plan generated {len(operations)} operations, exceeding the MCP bulk limit of 150. "
-                "Please reduce the scope of the uploaded document."
+                f"Automation plan generated {len(operations)} operations, exceeding the MCP bulk limit of "
+                f"{self._max_automation_ops()}. Please reduce the scope of the uploaded document."
             )
 
         if operations:
@@ -1022,11 +1048,24 @@ class ChatService:
             return None
 
         preferred_view_name = self._normalize_name(view_name or "Business Process View", fallback="Business Process View")
-        box_lines = "\n".join(f"{box['id']}: {box['text']}" for box in boxes)
+
+        def _left_margin_pct(box: Dict[str, Any]) -> int | None:
+            page_width = box.get("page_width")
+            if not page_width:
+                return None
+            return round(box["bbox"][0] / page_width * 100)
+
+        box_lines = "\n".join(
+            f"{box['id']}: {box['text']}"
+            + (f" [left-margin: {pct}%]" if (pct := _left_margin_pct(box)) is not None else "")
+            for box in boxes
+        )
         user_prompt = (
             "Each line below is a box extracted directly from a diagram's vector geometry, given as "
-            '"<id>: <exact text>". Classify the ROLE of each box. Do not rename, translate, shorten, or '
-            "alter the text in any way -- it is used verbatim regardless of your classification.\n"
+            '"<id>: <exact text>", optionally followed by how far its left edge sits from the page\'s '
+            "left margin as a percentage of page width. Classify the ROLE of each box. Do not rename, "
+            "translate, shorten, or alter the text in any way -- it is used verbatim regardless of your "
+            "classification.\n"
             "Return strict JSON only with this schema:\n"
             "{\n"
             '  "view_name": "string",\n'
@@ -1038,6 +1077,14 @@ class ChatService:
             "- \"object\" = a business object, document, record, or data artifact being referenced (a noun).\n"
             "- \"ignore\" = a swimlane/lane name, system name, page title, legend, decision-branch label "
             "like 'yes'/'no', or any other non-process, non-object label.\n"
+            "- A swimlane/row label sits in a narrow strip flush against the page's left margin (a low "
+            "left-margin percentage, clustered together with other row labels at roughly the same value) "
+            "and is repeated once per row purely to name that row/department. A box with the SAME or "
+            "similar wording that sits further right (a meaningfully larger left-margin percentage, in the "
+            "diagram's main content area) is a real activity or deliverable, not a restated lane name -- "
+            "classify it as process/object on its own merits even if it echoes its row's label (e.g. a row "
+            "labeled 'Master Layout' legitimately contains a real task box also called 'MAIN LAYOUT' further "
+            "into the content area; only the narrow left-margin one is the lane label to ignore).\n"
             "- Classify every id listed below exactly once. Do not add ids that are not listed.\n"
             "- confidence must be between 0 and 1.\n\n"
             f"Preferred view name: {preferred_view_name}\n\n"
@@ -1068,19 +1115,24 @@ class ChatService:
                 role_by_id[box_id] = role
 
         max_steps = max(1, self.settings.max_action_steps)
-        process_box_ids = [box["id"] for box in boxes if role_by_id.get(box["id"]) == "process"]
+
+        # Reading order (top-to-bottom lanes, left-to-right within a lane) rather than raw PDF
+        # coordinates: real diagrams are often drawn tightly packed or with swimlane offsets that,
+        # copied 1:1, produce an unreadable/overlapping layout in Archi and in the preview.
+        def reading_order_key(box: Dict[str, Any]) -> tuple[float, float]:
+            bx0, by0 = box["bbox"][0], box["bbox"][1]
+            return (round(by0 / 80.0), bx0)
+
+        ordered_boxes = sorted(boxes, key=reading_order_key)
+        process_box_ids = [box["id"] for box in ordered_boxes if role_by_id.get(box["id"]) == "process"]
         accepted_process_ids = set(process_box_ids[:max_steps])
         truncated = len(process_box_ids) > len(accepted_process_ids)
 
-        xs = [box["bbox"][0] for box in boxes]
-        ys = [box["bbox"][1] for box in boxes]
-        min_x, min_y = (min(xs), min(ys)) if xs and ys else (0.0, 0.0)
-
         elements: Dict[str, Dict[str, str]] = {}
-        layout_positions: Dict[str, Dict[str, int]] = {}
         key_by_box_id: Dict[int, str] = {}
+        ordered_process_keys: List[str] = []
 
-        for box in boxes:
+        for box in ordered_boxes:
             role = role_by_id.get(box["id"])
             if role == "process" and box["id"] not in accepted_process_ids:
                 continue
@@ -1091,19 +1143,11 @@ class ChatService:
                 continue
             element_type = "BusinessProcess" if role == "process" else "BusinessObject"
             key = f"{element_type}::{self._norm_key(name)}"
+            is_new = key not in elements
             elements.setdefault(key, {"type": element_type, "name": name})
             key_by_box_id[box["id"]] = key
-
-            bx0, by0, bx1, by1 = box["bbox"]
-            layout_positions.setdefault(
-                key,
-                {
-                    "x": int(round(bx0 - min_x)) + 100,
-                    "y": int(round(by0 - min_y)) + 100,
-                    "width": max(120, int(round(bx1 - bx0))),
-                    "height": max(60, int(round(by1 - by0))),
-                },
-            )
+            if role == "process" and is_new:
+                ordered_process_keys.append(key)
 
         if not elements:
             return None
@@ -1137,12 +1181,99 @@ class ChatService:
                 rel_item["accessType"] = "readwrite"
             relationships.append(rel_item)
 
+        detected_connection_count = len(relationships)
+        sequence_inferred = False
+        if not any(r["type"] == "TriggeringRelationship" for r in relationships) and len(ordered_process_keys) > 1:
+            # No process-to-process arrows were geometrically detected (a drawing style my heuristics
+            # didn't recognize, or the diagram genuinely has none) -- fall back to the document's
+            # reading order rather than leaving every step disconnected.
+            sequence_inferred = True
+            for idx in range(1, len(ordered_process_keys)):
+                source_key = ordered_process_keys[idx - 1]
+                target_key = ordered_process_keys[idx]
+                pair_key = ("TriggeringRelationship", source_key, target_key)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                relationships.append({"type": "TriggeringRelationship", "source_key": source_key, "target_key": target_key})
+
+        # Preserve the PDF's own swimlane/table arrangement instead of reshaping into an
+        # arbitrary sqrt grid: every accepted element still has the real box it came from, so
+        # cluster those boxes back into rows (lanes) and columns (phase/time groups) by position
+        # -- elements that lined up vertically or horizontally in the source diagram still line
+        # up here. Pages are laid out as separate stacked blocks since raw PDF coordinates reset
+        # per page and aren't comparable across pages.
+        box_by_key: Dict[str, Dict[str, Any]] = {}
+        for box in ordered_boxes:
+            key = key_by_box_id.get(box["id"])
+            if key:
+                box_by_key.setdefault(key, box)
+
+        def cluster_axis(pairs: List[tuple[str, float]], *, gap_threshold: float) -> Dict[str, int]:
+            cluster_by_key: Dict[str, int] = {}
+            cluster = 0
+            prev_value: float | None = None
+            for key, value in sorted(pairs, key=lambda pair: pair[1]):
+                if prev_value is not None and (value - prev_value) > gap_threshold:
+                    cluster += 1
+                cluster_by_key[key] = cluster
+                prev_value = value
+            return cluster_by_key
+
+        start_x = 100
+        col_gap = 260
+        # Sequential gap-threshold clustering can occasionally chain two visually-distinct
+        # columns together through a run of borderline gaps, landing more than one element in
+        # the same (row, col) cell; those get stacked vertically within the cell below. row_gap
+        # must comfortably fit a few stacked levels (each box_height + 16) or a stacked box can
+        # bleed down into the next row's boxes.
+        row_gap = 340
+        page_gap_rows = 1
+        box_width, box_height = 220, 80
+
+        layout_positions: Dict[str, Dict[str, int]] = {}
+        y_offset = 110
+        pages_present = sorted({box["page"] for box in box_by_key.values()})
+        for page_no in pages_present:
+            page_keys = [key for key in box_by_key if box_by_key[key]["page"] == page_no]
+            page_boxes = [box_by_key[key] for key in page_keys]
+            heights = sorted(b["bbox"][3] - b["bbox"][1] for b in page_boxes)
+            widths = sorted(b["bbox"][2] - b["bbox"][0] for b in page_boxes)
+            row_threshold = max(20.0, heights[len(heights) // 2] * 1.8)
+            col_threshold = max(20.0, widths[len(widths) // 2] * 1.5)
+
+            row_of_key = cluster_axis([(key, box_by_key[key]["bbox"][1]) for key in page_keys], gap_threshold=row_threshold)
+            col_of_key = cluster_axis([(key, box_by_key[key]["bbox"][0]) for key in page_keys], gap_threshold=col_threshold)
+
+            occupied: Dict[tuple[int, int], int] = {}
+            max_row = 0
+            for key in page_keys:
+                row, col = row_of_key[key], col_of_key[key]
+                max_row = max(max_row, row)
+                cell = (row, col)
+                stack_index = occupied.get(cell, 0)
+                occupied[cell] = stack_index + 1
+                layout_positions[key] = {
+                    "x": start_x + col * col_gap,
+                    "y": y_offset + row * row_gap + stack_index * (box_height + 16),
+                    "width": box_width,
+                    "height": box_height,
+                }
+
+            y_offset += (max_row + 1 + page_gap_rows) * row_gap
+
         resolved_view_name = self._normalize_name(parsed.get("view_name", preferred_view_name), fallback=preferred_view_name)
         process_count = sum(1 for item in elements.values() if item["type"] == "BusinessProcess")
         warnings = [
-            f"Extracted directly from the PDF's drawn shapes: {len(boxes)} boxes and {len(relationships)} "
+            f"Extracted directly from the PDF's drawn shapes: {len(boxes)} boxes and {detected_connection_count} "
             "connections detected from real lines/arrows in the document (not inferred from text order)."
         ]
+        if sequence_inferred:
+            warnings.append(
+                "No process-to-process arrows could be geometrically detected in this PDF, so steps were "
+                "connected in the document's reading order (left-to-right, top-to-bottom) instead. Review the "
+                "preview and adjust the flow in Archi if this doesn't match the real process."
+            )
         if truncated:
             warnings.append(f"Process steps were truncated to the configured maximum of {max_steps}.")
 
@@ -1156,6 +1287,248 @@ class ChatService:
             "warnings": warnings,
         }
 
+    def _extract_business_process_plan_from_sipoc(
+        self,
+        *,
+        sipoc: Dict[str, Any],
+        source_name: str,
+        view_name: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Build a plan straight from a SIPOC table's step column (ID/Process Step/Supplier/
+        Input/Process/Output/Customer rows), rather than the diagram box/arrow heuristics.
+
+        A SIPOC table names each step in its own "Process Step" column and lists steps in a
+        single sequential column -- there is no ambiguity to resolve with an LLM classification
+        pass, and the row order itself IS the process chain, so this connects consecutive steps
+        directly instead of asking a model to infer sequence.
+        """
+        raw_steps = sipoc.get("steps") or []
+        if not raw_steps:
+            return None
+
+        preferred_view_name = self._normalize_name(view_name or "Business Process View", fallback="Business Process View")
+        max_steps = max(1, self.settings.max_action_steps)
+        truncated = len(raw_steps) > max_steps
+
+        elements: Dict[str, Dict[str, str]] = {}
+        relationships: List[Dict[str, str]] = []
+        ordered_keys: List[str] = []
+
+        for raw_step in raw_steps[:max_steps]:
+            name = self._normalize_name(raw_step.get("name", ""), fallback="")
+            if not name:
+                continue
+            key = f"BusinessProcess::{self._norm_key(name)}"
+            if key in elements:
+                # Same step name repeated (e.g. a continuation header row slipped through) --
+                # keep the chain moving without creating a duplicate node.
+                if not ordered_keys or ordered_keys[-1] != key:
+                    ordered_keys.append(key)
+                continue
+
+            doc_parts: List[str] = []
+            step_id = raw_step.get("id", "")
+            if step_id:
+                doc_parts.append(f"ID: {step_id}")
+            for label, field in (("Supplier", "supplier"), ("Input", "input"), ("Process", "process"), ("Output", "output"), ("Customer", "customer")):
+                value = raw_step.get(field, "")
+                if value:
+                    doc_parts.append(f"{label}: {value}")
+            documentation = self._normalize_name(" | ".join(doc_parts), fallback="", max_len=400)
+
+            elements[key] = {"type": "BusinessProcess", "name": name}
+            if documentation:
+                elements[key]["documentation"] = documentation
+            ordered_keys.append(key)
+
+        if not ordered_keys:
+            return None
+
+        seen_pairs: set[tuple[str, str]] = set()
+        for idx in range(1, len(ordered_keys)):
+            source_key, target_key = ordered_keys[idx - 1], ordered_keys[idx]
+            if source_key == target_key or (source_key, target_key) in seen_pairs:
+                continue
+            seen_pairs.add((source_key, target_key))
+            relationships.append({"type": "TriggeringRelationship", "source_key": source_key, "target_key": target_key})
+
+        # A SIPOC table is inherently one linear chain, not a 2D layout -- wrap it into readable
+        # rows rather than a single very wide line.
+        start_x = 100
+        col_gap = 260
+        row_gap = 220
+        box_width, box_height = 220, 80
+        columns_per_row = max(1, math.ceil(math.sqrt(max(1, len(ordered_keys)))))
+
+        layout_positions: Dict[str, Dict[str, int]] = {}
+        for index, key in enumerate(ordered_keys):
+            col = index % columns_per_row
+            row = index // columns_per_row
+            layout_positions[key] = {
+                "x": start_x + col * col_gap,
+                "y": 110 + row * row_gap,
+                "width": box_width,
+                "height": box_height,
+            }
+
+        warnings = [
+            f"Extracted directly from a SIPOC table's Process Step column: {len(ordered_keys)} step(s) "
+            "chained in the table's own row order."
+        ]
+        if truncated:
+            warnings.append(f"Process steps were truncated to the configured maximum of {max_steps}.")
+
+        return {
+            "view_name": preferred_view_name,
+            "elements": elements,
+            "relationships": relationships,
+            "layout_positions": layout_positions,
+            "steps_processed": len(ordered_keys),
+            "steps_truncated": truncated,
+            "warnings": warnings,
+        }
+
+    @staticmethod
+    def _looks_like_sipoc_text(content_text: str) -> bool:
+        normalized = content_text.lower()
+        return "process step" in normalized or "prozessschritt" in normalized
+
+    def _extract_business_process_plan_from_sipoc_llm(
+        self,
+        *,
+        content_text: str,
+        source_name: str,
+        view_name: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Constrained LLM fallback for SIPOC documents whose detailed table isn't a PyMuPDF-
+        recognizable ruled grid (extract_sipoc_steps returned None), but whose flattened text
+        clearly contains a "Process Step" column heading. Deliberately narrow and rule-bound --
+        ID + Process Step only, strict top-to-bottom sequential chaining, no semantic inference,
+        every name evidence-checked against the source text -- rather than the open-ended
+        extraction that risks hallucinating names or connections.
+        """
+        preferred_view_name = self._normalize_name(view_name or "Business Process View", fallback="Business Process View")
+        user_prompt = (
+            "Extract the as-is process steps from a SIPOC (Supplier-Input-Process-Output-Customer) "
+            "document's DETAILED table only.\n\n"
+            "The input may contain a SIPOC overview section and a detailed SIPOC table. Only use the "
+            "detailed table, which lists one row per process step with columns similar to: ID, Process "
+            "Step, Supplier, Input, Process, Output, Customer.\n\n"
+            "Relevant columns: ID, Process Step.\n"
+            "Columns that must NOT be used to name a process step: Supplier, Input, Process, Output, "
+            "Customer.\n"
+            "The 'Process Step' column contains the short step name. The 'Process' column contains a "
+            "longer activity description and must never be used as the step name.\n\n"
+            "Extraction rules:\n"
+            "1. Extract each row of the detailed SIPOC table.\n"
+            "2. Preserve the exact top-to-bottom row order, including across a page break.\n"
+            "3. Copy the Process Step value verbatim -- do not rename, translate, shorten, or enrich it.\n"
+            "4. Do not create process steps from the SIPOC overview section or from the Process column.\n"
+            "5. Do not infer additional process steps that are not literally a row in the table.\n"
+            "6. If an ID is missing for a row, use \"missing\". If a process step name is missing, skip "
+            "that row.\n\n"
+            "Connections: connect ONLY consecutive rows in table order (step 1 to 2, 2 to 3, ...). Never "
+            "infer cross-connections, loops, or connections based on semantic meaning or on Supplier/"
+            "Input/Process/Output/Customer values -- the caller builds the sequential chain from your row "
+            "order, so just return the rows in order.\n\n"
+            "Return strict JSON only with this schema:\n"
+            "{\n"
+            '  "process_steps": [{"order": 1, "id": "A1", "process_step": "string"}],\n'
+            '  "validation_notes": ["string"]\n'
+            "}\n"
+            "If no detailed SIPOC table with a Process Step column is present at all, return "
+            '{"process_steps": [], "validation_notes": ["no detailed SIPOC table found"]}.\n\n'
+            f"Input:\n{content_text[: self.settings.max_upload_text_chars]}"
+        )
+        parsed = self._call_model_for_json(
+            system_prompt=(
+                "You are a strict data-extraction engine for SIPOC process tables. Extract only what is "
+                "literally present in the Process Step column, in table order. Never invent, infer, "
+                "translate, or reorder steps."
+            ),
+            user_prompt=user_prompt,
+        )
+
+        raw_steps = parsed.get("process_steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            return None
+
+        max_steps = max(1, self.settings.max_action_steps)
+        truncated = len(raw_steps) > max_steps
+        source_text = content_text[: self.settings.max_upload_text_chars]
+
+        elements: Dict[str, Dict[str, str]] = {}
+        ordered_keys: List[str] = []
+        discarded_low_evidence = 0
+        for raw_step in raw_steps[:max_steps]:
+            if not isinstance(raw_step, dict):
+                continue
+            name = self._normalize_name(raw_step.get("process_step", ""), fallback="")
+            if not name:
+                continue
+            if not self._has_text_evidence(name, source_text):
+                discarded_low_evidence += 1
+                continue
+            key = f"BusinessProcess::{self._norm_key(name)}"
+            if key not in elements:
+                elements[key] = {"type": "BusinessProcess", "name": name}
+                step_id = raw_step.get("id")
+                if step_id and step_id != "missing":
+                    elements[key]["documentation"] = f"ID: {step_id}"
+            if not ordered_keys or ordered_keys[-1] != key:
+                ordered_keys.append(key)
+
+        if not ordered_keys:
+            return None
+
+        relationships: List[Dict[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for idx in range(1, len(ordered_keys)):
+            source_key, target_key = ordered_keys[idx - 1], ordered_keys[idx]
+            if source_key == target_key or (source_key, target_key) in seen_pairs:
+                continue
+            seen_pairs.add((source_key, target_key))
+            relationships.append({"type": "TriggeringRelationship", "source_key": source_key, "target_key": target_key})
+
+        start_x = 100
+        col_gap = 260
+        row_gap = 220
+        box_width, box_height = 220, 80
+        columns_per_row = max(1, math.ceil(math.sqrt(max(1, len(ordered_keys)))))
+        layout_positions: Dict[str, Dict[str, int]] = {}
+        for index, key in enumerate(ordered_keys):
+            col = index % columns_per_row
+            row = index // columns_per_row
+            layout_positions[key] = {
+                "x": start_x + col * col_gap,
+                "y": 110 + row * row_gap,
+                "width": box_width,
+                "height": box_height,
+            }
+
+        warnings = [
+            "No ruled SIPOC table could be parsed directly from the PDF's structure; used a constrained "
+            f"extraction restricted to the Process Step column instead: {len(ordered_keys)} step(s) "
+            "chained in document order."
+        ]
+        if discarded_low_evidence:
+            warnings.append(f"Discarded {discarded_low_evidence} step candidate(s) not found verbatim in the source text.")
+        validation_notes = parsed.get("validation_notes")
+        if isinstance(validation_notes, list):
+            warnings.extend(str(note) for note in validation_notes if note)
+        if truncated:
+            warnings.append(f"Process steps were truncated to the configured maximum of {max_steps}.")
+
+        return {
+            "view_name": preferred_view_name,
+            "elements": elements,
+            "relationships": relationships,
+            "layout_positions": layout_positions,
+            "steps_processed": len(ordered_keys),
+            "steps_truncated": truncated,
+            "warnings": warnings,
+        }
+
     def _extract_business_process_plan(
         self,
         *,
@@ -1165,6 +1538,31 @@ class ChatService:
         pdf_bytes: bytes | None = None,
     ) -> Dict[str, Any]:
         if pdf_bytes:
+            try:
+                sipoc = pdf_table.extract_sipoc_steps(pdf_bytes)
+            except Exception:  # noqa: BLE001
+                sipoc = None
+            if sipoc:
+                sipoc_plan = self._extract_business_process_plan_from_sipoc(
+                    sipoc=sipoc, source_name=source_name, view_name=view_name
+                )
+                if sipoc_plan:
+                    return sipoc_plan
+
+            if self._looks_like_sipoc_text(content_text):
+                # The PDF's structure didn't give PyMuPDF a ruled grid to detect (e.g. a
+                # borderless or non-standard table render), but the text unambiguously names a
+                # "Process Step" column -- worth a narrow, rule-bound extraction pass rather than
+                # falling straight to the diagram box/arrow heuristics, which mangle table rows.
+                try:
+                    sipoc_llm_plan = self._extract_business_process_plan_from_sipoc_llm(
+                        content_text=content_text, source_name=source_name, view_name=view_name
+                    )
+                except Exception:  # noqa: BLE001
+                    sipoc_llm_plan = None
+                if sipoc_llm_plan:
+                    return sipoc_llm_plan
+
             try:
                 diagram = pdf_diagram.extract_diagram_structure(pdf_bytes)
             except Exception:  # noqa: BLE001
@@ -1454,11 +1852,18 @@ class ChatService:
         content_text: str,
         source_name: str,
         view_name: str | None = None,
+        pdf_bytes: bytes | None = None,
     ) -> Dict[str, Any]:
-        extracted = self._extract_requirements_plan(
+        """A target-state upload (e.g. a Soll SIPOC table or process diagram) describes the same
+        kind of content as an Ist upload -- process steps and their sequence -- so it reuses the
+        exact same SIPOC-table / PDF-geometry / evidence-gated text extraction as Ist-Aufnahme,
+        just tagged as "target" instead of running the separate ApplicationComponent-oriented
+        product-architecture extraction meant for requirement documents."""
+        extracted = self._extract_business_process_plan(
             content_text=content_text,
             source_name=source_name,
             view_name=view_name or "Soll-Architektur",
+            pdf_bytes=pdf_bytes,
         )
         tagged_elements = {
             key: {**item, "properties": {**item.get("properties", {}), "status": "target"}}
@@ -1466,6 +1871,121 @@ class ChatService:
         }
         extracted = {**extracted, "elements": tagged_elements}
         return self._format_plan_response(action="assessment-soll-upload", source_name=source_name, extracted=extracted)
+
+    def propose_soll_architecture(
+        self,
+        *,
+        ist_view_name: str,
+        view_name: str | None = None,
+    ) -> Dict[str, Any]:
+        """Generate a Soll-Architektur proposal directly from the Ist processes already in the model,
+        for when no separate target-requirements document exists yet to upload in step 3."""
+        used_tools: List[str] = []
+        result = self._mcp_call("search-elements", {"query": "", "type": "BusinessProcess", "limit": 500}, used_tools)
+        all_processes = self._result_list(result, "elements")
+
+        ist_names: List[str] = []
+        for item in all_processes:
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            status = self._property_value(item.get("properties"), "status").lower()
+            if status != "target":
+                ist_names.append(name)
+
+        if not ist_names:
+            raise RuntimeError(
+                f"No Ist business processes found in the model (view '{ist_view_name}'). Run Ist-Aufnahme first."
+            )
+
+        preferred_view_name = self._normalize_name(view_name or "Soll-Architektur", fallback="Soll-Architektur")
+        process_lines = "\n".join(f"- {name}" for name in ist_names)
+
+        user_prompt = (
+            "You are proposing a TO-BE (Soll) business process architecture based on the following AS-IS "
+            "(Ist) business processes already in the model. Improve on them the way a target-state "
+            "architecture typically would: automate manual-sounding steps, consolidate obviously redundant "
+            "or duplicate steps, modernize outdated tooling references, and add at most a few clearly "
+            "justified new capabilities (e.g. self-service, automation, AI-assisted variants). Do not invent "
+            "an unrelated process landscape -- every proposed process must trace back to (replace, merge, or "
+            "extend) something in the Ist list below.\n"
+            "Return strict JSON only with this schema:\n"
+            "{\n"
+            '  "view_name": "string",\n'
+            '  "elements": [{"name": "string", "type": "BusinessProcess", "description": "1 sentence: how '
+            'this relates to the Ist process(es) it is based on"}],\n'
+            '  "relationships": [{"type": "TriggeringRelationship", "source": "element name", "target": '
+            '"element name"}]\n'
+            "}\n"
+            "Rules:\n"
+            "- Use only BusinessProcess for elements (this proposal is process-level).\n"
+            "- Keep between 4 and 30 elements.\n"
+            "- Connect the proposed processes in their intended sequential order via TriggeringRelationship.\n"
+            "- No explanation text, only the JSON object.\n\n"
+            f"Preferred view name: {preferred_view_name}\n\n"
+            f"Ist business processes already in the model:\n{process_lines}"
+        )
+        parsed = self._call_model_for_json(
+            system_prompt="You are an enterprise architecture target-state design engine. Output strict JSON only.",
+            user_prompt=user_prompt,
+        )
+
+        raw_elements = parsed.get("elements")
+        raw_relationships = parsed.get("relationships")
+        if not isinstance(raw_elements, list) or not raw_elements:
+            raise RuntimeError("Could not generate a Soll-Architektur proposal from the current Ist processes.")
+        if not isinstance(raw_relationships, list):
+            raw_relationships = []
+
+        elements: Dict[str, Dict[str, Any]] = {}
+        key_by_name: Dict[str, str] = {}
+        for item in raw_elements:
+            if not isinstance(item, dict):
+                continue
+            name = self._normalize_name(item.get("name", ""), fallback="")
+            if not name:
+                continue
+            key = f"BusinessProcess::{self._norm_key(name)}"
+            if key in elements:
+                continue
+            elements[key] = {
+                "type": "BusinessProcess",
+                "name": name,
+                "documentation": self._normalize_name(item.get("description", ""), fallback="", max_len=400),
+                "properties": {"status": "target"},
+            }
+            key_by_name.setdefault(self._norm_key(name), key)
+
+        if not elements:
+            raise RuntimeError("Could not generate a Soll-Architektur proposal from the current Ist processes.")
+
+        relationships: List[Dict[str, str]] = []
+        for item in raw_relationships:
+            if not isinstance(item, dict):
+                continue
+            source_key = key_by_name.get(self._norm_key(item.get("source", "")))
+            target_key = key_by_name.get(self._norm_key(item.get("target", "")))
+            if not source_key or not target_key or source_key == target_key:
+                continue
+            relationships.append({"type": "TriggeringRelationship", "source_key": source_key, "target_key": target_key})
+
+        resolved_view_name = self._normalize_name(parsed.get("view_name", preferred_view_name), fallback=preferred_view_name)
+        extracted = {
+            "view_name": resolved_view_name,
+            "elements": elements,
+            "relationships": relationships,
+            "layout_positions": self._grid_layout_positions(elements),
+            "steps_processed": len(elements),
+            "steps_truncated": False,
+            "warnings": [
+                f"AI-generated proposal based on {len(ist_names)} existing Ist business process(es). Review "
+                "carefully before applying -- this is a suggested target state, not an extraction from a "
+                "source document."
+            ],
+        }
+        return self._format_plan_response(
+            action="assessment-soll-upload", source_name="AI-proposed from Ist-Aufnahme", extracted=extracted
+        )
 
     @staticmethod
     def _property_value(properties: Any, key: str) -> str:
@@ -1501,6 +2021,15 @@ class ChatService:
             raise RuntimeError(
                 "No Soll business processes found (elements tagged status=target). Run Soll-Architektur first."
             )
+
+        # A full mapping+gap analysis over hundreds of processes in one LLM call gets slow enough to
+        # risk gateway timeouts and degrades output quality. Cap and surface it as a warning rather
+        # than silently truncating or hanging.
+        max_mapping_items = max(1, self.settings.max_action_steps)
+        ist_truncated = len(ist_processes) > max_mapping_items
+        soll_truncated = len(soll_processes) > max_mapping_items
+        ist_processes = ist_processes[:max_mapping_items]
+        soll_processes = soll_processes[:max_mapping_items]
 
         ist_by_id = {p["id"]: p["name"] for p in ist_processes}
         soll_by_id = {p["id"]: p["name"] for p in soll_processes}
@@ -1607,6 +2136,10 @@ class ChatService:
             warnings.append(f"{unmapped_ist} Ist process(es) were not covered by any mapping entry.")
         if unmapped_soll > 0:
             warnings.append(f"{unmapped_soll} Soll process(es) were not covered by any mapping entry.")
+        if ist_truncated:
+            warnings.append(f"Ist processes were truncated to the first {max_mapping_items} for this analysis.")
+        if soll_truncated:
+            warnings.append(f"Soll processes were truncated to the first {max_mapping_items} for this analysis.")
 
         return {
             "ist_view_name": ist_view_name,
@@ -1617,52 +2150,105 @@ class ChatService:
             "used_tools": used_tools,
         }
 
-    def apply_mapping_relationships(self, *, mappings: List[Dict[str, Any]]) -> Dict[str, Any]:
-        included = [m for m in mappings if m.get("include", True) and m.get("ist_key") and m.get("soll_key")]
-        if not included:
-            raise RuntimeError("No mapping pairs with both an Ist and a Soll process were selected to apply.")
+    def apply_mapping_relationships(
+        self,
+        *,
+        mappings: List[Dict[str, Any]],
+        view_name: str = "Ist-Soll Mapping",
+    ) -> Dict[str, Any]:
+        """Create the Ist<->Soll traceability relationships AND a real Archi view visualizing them:
+        an Ist row and a Soll row, matched pairs vertically aligned and connected, unmatched
+        processes (legacy-no-Soll / new-no-Ist) shown standalone in their row so the gap is visible
+        at a glance -- not just a relationship buried in the model."""
+        included = [m for m in mappings if m.get("include", True)]
+        matched = [m for m in included if m.get("ist_key") and m.get("soll_key")]
+        ist_only = [m for m in included if m.get("ist_key") and not m.get("soll_key")]
+        soll_only = [m for m in included if m.get("soll_key") and not m.get("ist_key")]
 
-        used_tools: List[str] = []
-        existing_relationships = self._collect_existing_relationships(used_tools)
-        operations: List[Dict[str, Any]] = []
-        created = 0
+        if not matched and not ist_only and not soll_only:
+            raise RuntimeError("No mappings were selected to apply.")
+
+        preferred_view_name = self._normalize_name(view_name or "Ist-Soll Mapping", fallback="Ist-Soll Mapping")
         match_labels = {"full": "full match", "partial": "partial match"}
 
-        for mapping in included:
-            ist_id = str(mapping["ist_key"])
-            soll_id = str(mapping["soll_key"])
-            existing = existing_relationships.get((self._norm_key("AssociationRelationship"), ist_id, soll_id))
-            if existing:
-                continue
+        elements_by_key: Dict[str, Dict[str, str]] = {}
+        relationships: List[Dict[str, str]] = []
+        layout_positions: Dict[str, Dict[str, int]] = {}
+
+        start_x = 100
+        col_gap = 260
+        ist_y = 110
+        soll_y = 420
+        box_w, box_h = 220, 90
+        col_index = 0
+
+        for mapping in matched:
+            ist_key = f"ist::{mapping['ist_key']}"
+            soll_key = f"soll::{mapping['soll_key']}"
+            elements_by_key[ist_key] = {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "Ist process")}
+            elements_by_key[soll_key] = {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "Soll process")}
+            x = start_x + col_index * col_gap
+            layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
+            layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
             label = match_labels.get(str(mapping.get("match_type", "")), "mapped to")
-            operations.append(
+            # RealizationRelationship is not a valid ArchiMate pairing between two BusinessProcess
+            # elements (confirmed by the MCP server's own validator: BULK_VALIDATION_FAILED, valid
+            # types for BusinessProcess->BusinessProcess are Composition/Aggregation/Serving/
+            # Triggering/Flow/Specialization/Association) -- every prior "successful" apply was
+            # silently rejected wholesale before _mcp_call was fixed to actually check for errors.
+            # AssociationRelationship is the correct, always-valid ArchiMate type here; "realizes"
+            # is still conveyed via the connection's name/label (source=Soll, target=Ist) since that
+            # was the intended traceability semantics.
+            relationships.append(
                 {
-                    "tool": "create-relationship",
-                    "params": {
-                        "type": "AssociationRelationship",
-                        "sourceId": ist_id,
-                        "targetId": soll_id,
-                        "name": f"Assessment mapping ({label})",
-                    },
+                    "type": "AssociationRelationship",
+                    "source_key": soll_key,
+                    "target_key": ist_key,
+                    "name": f"realizes ({label})",
                 }
             )
-            created += 1
+            col_index += 1
 
-        if operations:
-            self._mcp_call(
-                "bulk-mutate",
-                {
-                    "operations": operations,
-                    "description": "Architecture assessment Ist-Soll mapping",
-                    "intent": "Create traceability links between Ist and Soll business processes",
-                },
-                used_tools,
+        for mapping in ist_only:
+            ist_key = f"ist::{mapping['ist_key']}"
+            elements_by_key.setdefault(
+                ist_key, {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "Ist process")}
             )
+            x = start_x + col_index * col_gap
+            layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
+            col_index += 1
 
+        for mapping in soll_only:
+            soll_key = f"soll::{mapping['soll_key']}"
+            elements_by_key.setdefault(
+                soll_key, {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "Soll process")}
+            )
+            x = start_x + col_index * col_gap
+            layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
+            col_index += 1
+
+        execution = self._execute_view_plan(
+            action_label="Ist-Soll mapping visualization",
+            source_name="Mapping & Gap-Analyse",
+            view_name=preferred_view_name,
+            elements_by_key=elements_by_key,
+            relationships=relationships,
+            layout_positions=layout_positions,
+        )
+
+        resolved_view_name = str(execution.get("view_name", preferred_view_name))
+        summary = (
+            f"Created mapping view '{resolved_view_name}': {len(matched)} matched pair(s) connected, "
+            f"{len(ist_only)} Ist-only (legacy, no Soll equivalent), {len(soll_only)} Soll-only (new, no Ist "
+            f"equivalent) shown standalone. {execution.get('created_relationships', 0)} new relationship(s) created. "
+            "If Archi approval mode is enabled, approve the proposal to apply changes."
+        )
         return {
-            "summary": f"Created {created} Ist-Soll mapping relationship(s).",
-            "created_relationships": created,
-            "used_tools": used_tools,
+            "summary": summary,
+            "view_name": resolved_view_name,
+            "view_id": execution.get("view_id"),
+            "created_relationships": int(execution.get("created_relationships", 0)),
+            "used_tools": list(execution.get("used_tools", [])),
         }
 
     def generate_assessment_summary(

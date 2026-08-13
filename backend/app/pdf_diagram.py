@@ -16,6 +16,10 @@ MIN_CONNECTOR_LENGTH = 15.0
 MAX_ENDPOINT_TO_BOX_DISTANCE = 40.0
 MAX_ARROWHEAD_TO_ENDPOINT_DISTANCE = 15.0
 MAX_PAGES = 6
+# A rect spanning nearly the full page width or height is a structural element -- a swimlane/
+# table-row band or the outer table border -- never a real task box. Real content boxes are
+# always substantially narrower/shorter than the page they're drawn on.
+CONTAINER_SPAN_FRACTION = 0.85
 
 
 def pdf_diagram_support_available() -> bool:
@@ -86,12 +90,19 @@ def _is_box_drawing(drawing: Dict[str, Any]) -> "fitz.Rect | None":
     return None
 
 
-def _extract_box_rects(drawings: List[Dict[str, Any]]) -> List["fitz.Rect"]:
+def _extract_box_rects(
+    drawings: List[Dict[str, Any]], page_width: float | None = None, page_height: float | None = None
+) -> List["fitz.Rect"]:
     candidates: List["fitz.Rect"] = []
     for drawing in drawings:
         rect = _is_box_drawing(drawing)
-        if rect is not None:
-            candidates.append(rect)
+        if rect is None:
+            continue
+        if page_width and rect.width >= page_width * CONTAINER_SPAN_FRACTION:
+            continue
+        if page_height and rect.height >= page_height * CONTAINER_SPAN_FRACTION:
+            continue
+        candidates.append(rect)
 
     deduped: List["fitz.Rect"] = []
     for rect in candidates:
@@ -101,28 +112,48 @@ def _extract_box_rects(drawings: List[Dict[str, Any]]) -> List["fitz.Rect"]:
 
 
 def _assign_text_to_boxes(
-    box_rects: List["fitz.Rect"], text_dict: Dict[str, Any], page_index: int, start_id: int
+    box_rects: List["fitz.Rect"], text_dict: Dict[str, Any], page_index: int
 ) -> List[Dict[str, Any]]:
+    """Assign each text span to the SMALLEST box rect that contains it.
+
+    Diagramming tools commonly draw a swimlane/table-row (or whole-table) rectangle underneath
+    several individual task boxes. A span's center can therefore fall inside more than one
+    candidate rect at once. Assigning it to every containing rect (the old behavior) merges an
+    entire lane's worth of labels into one giant box; the smallest containing rect is always the
+    most specific (innermost, real content) box, so ties resolve to it instead.
+    """
+    parts_by_index: Dict[int, List[Tuple[float, float, str]]] = {}
+    for block in text_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0)))
+                center = fitz.Point((span_rect.x0 + span_rect.x1) / 2, (span_rect.y0 + span_rect.y1) / 2)
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                best_index = None
+                best_area = None
+                for idx, rect in enumerate(box_rects):
+                    if not rect.contains(center):
+                        continue
+                    area = rect.width * rect.height
+                    if best_area is None or area < best_area:
+                        best_area = area
+                        best_index = idx
+                if best_index is None:
+                    continue
+                parts_by_index.setdefault(best_index, []).append((round(span_rect.y0, 1), span_rect.x0, text))
+
     boxes: List[Dict[str, Any]] = []
     for offset, rect in enumerate(box_rects):
-        parts: List[Tuple[float, float, str]] = []
-        for block in text_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    span_rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0)))
-                    center = fitz.Point((span_rect.x0 + span_rect.x1) / 2, (span_rect.y0 + span_rect.y1) / 2)
-                    if rect.contains(center):
-                        text = str(span.get("text", "")).strip()
-                        if text:
-                            parts.append((round(span_rect.y0, 1), span_rect.x0, text))
-        parts.sort()
+        parts = sorted(parts_by_index.get(offset, []))
         text = " ".join(p[2] for p in parts).strip()
         text = " ".join(text.split())
         if not text:
             continue
         boxes.append(
             {
-                "id": start_id + offset,
+                "id": offset,
                 "page": page_index,
                 "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
                 "text": text,
@@ -205,19 +236,31 @@ def extract_diagram_structure(pdf_bytes: bytes) -> Dict[str, Any] | None:
             except Exception:  # noqa: BLE001
                 continue
 
-            box_rects = _extract_box_rects(drawings)
+            box_rects = _extract_box_rects(drawings, page.rect.width, page.rect.height)
             if not box_rects:
                 continue
-            boxes = _assign_text_to_boxes(box_rects, text_dict, page_index, start_id=len(all_boxes))
+            boxes = _assign_text_to_boxes(box_rects, text_dict, page_index)
             if not boxes:
                 continue
+            for box in boxes:
+                box["page_width"] = page.rect.width
 
             arrowheads = _extract_arrowhead_points(drawings)
             connectors = _extract_connectors(drawings)
 
+            def _nearest_box(point: "fitz.Point") -> Dict[str, Any] | None:
+                # Break distance ties (commonly 0, when a point sits inside more than one
+                # remaining box rect) in favor of the smallest box -- the most specific match.
+                def sort_key(b: Dict[str, Any]) -> tuple[float, float]:
+                    rect = fitz.Rect(b["bbox"])
+                    return (_point_to_rect_distance(point, rect), rect.width * rect.height)
+
+                return min(boxes, key=sort_key, default=None)
+
+            page_connections: List[Dict[str, Any]] = []
             for start, end in connectors:
-                box_a = min(boxes, key=lambda b: _point_to_rect_distance(start, fitz.Rect(b["bbox"])), default=None)
-                box_b = min(boxes, key=lambda b: _point_to_rect_distance(end, fitz.Rect(b["bbox"])), default=None)
+                box_a = _nearest_box(start)
+                box_b = _nearest_box(end)
                 if not box_a or not box_b or box_a["id"] == box_b["id"]:
                     continue
                 if _point_to_rect_distance(start, fitz.Rect(box_a["bbox"])) > MAX_ENDPOINT_TO_BOX_DISTANCE:
@@ -233,9 +276,21 @@ def extract_diagram_structure(pdf_bytes: bytes) -> Dict[str, Any] | None:
                 elif nearest_to_start is not None and _dist(nearest_to_start, start) <= MAX_ARROWHEAD_TO_ENDPOINT_DISTANCE:
                     source_id, target_id, confidence = box_b["id"], box_a["id"], 0.95
 
-                all_connections.append({"source_id": source_id, "target_id": target_id, "confidence": confidence})
+                page_connections.append({"source_id": source_id, "target_id": target_id, "confidence": confidence})
 
+            # Box ids so far were local to this page (0..k-1, from _assign_text_to_boxes) so that
+            # matching above could work on a clean, page-scoped list. Remap to globally unique ids
+            # now -- offsets into box_rects can exceed the page's surviving box count once
+            # container/empty-text candidates are filtered out, so reusing len(all_boxes) as a
+            # per-page start_id (the previous approach) could collide with a later page's ids.
+            id_map = {box["id"]: len(all_boxes) + local_id for local_id, box in enumerate(boxes)}
+            for box in boxes:
+                box["id"] = id_map[box["id"]]
             all_boxes.extend(boxes)
+            for conn in page_connections:
+                conn["source_id"] = id_map[conn["source_id"]]
+                conn["target_id"] = id_map[conn["target_id"]]
+            all_connections.extend(page_connections)
     finally:
         doc.close()
 

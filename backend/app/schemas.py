@@ -144,6 +144,11 @@ class GapEntry(BaseModel):
     related_soll_name: str | None = Field(default=None, max_length=200)
 
 
+class SollProposalRequest(BaseModel):
+    ist_view_name: str = Field(default="Ist-Business-Prozesse", max_length=120)
+    view_name: str | None = Field(default=None, max_length=120)
+
+
 class MappingGapRequest(BaseModel):
     ist_view_name: str = Field(default="Ist-Business-Prozesse", max_length=120)
     soll_view_name: str = Field(default="Soll-Architektur", max_length=120)
@@ -159,10 +164,13 @@ class MappingGapResponse(BaseModel):
 
 class MappingApplyRequest(BaseModel):
     mappings: List[MappingEntry] = Field(default_factory=list)
+    view_name: str = Field(default="Ist-Soll Mapping", max_length=120)
 
 
 class MappingApplyResponse(BaseModel):
     summary: str
+    view_name: str | None = None
+    view_id: str | None = None
     created_relationships: int = Field(default=0, ge=0)
     used_tools: List[str] = Field(default_factory=list)
 

@@ -18,14 +18,9 @@ const state = {
   healthPollTimer: null,
   persistTimer: null,
   pendingAction: null,
-  currentPlan: null,
-  previewFileLabel: "",
   actionLog: [],
-  activeTab: "workspaceTab",
+  activeTab: "assessmentTab",
   chatCollapsed: false,
-  diagramZoom: 1,
-  diagramPan: { x: 0, y: 0 },
-  diagramDrag: null,
   metaModel: null,
   assessment: {
     currentStep: "setup",
@@ -38,10 +33,6 @@ const state = {
 };
 
 const ASSESSMENT_STEPS = ["setup", "ist", "soll", "mapping", "summary"];
-
-const DIAGRAM_ZOOM_MIN = 0.2;
-const DIAGRAM_ZOOM_MAX = 4;
-const DIAGRAM_ZOOM_STEP = 1.25;
 
 const elements = {
   appGrid: document.getElementById("appGrid"),
@@ -76,28 +67,6 @@ const elements = {
   refreshHealthBtn: document.getElementById("refreshHealthBtn"),
   refreshHealthInlineBtn: document.getElementById("refreshHealthInlineBtn"),
   refreshToolsBtn: document.getElementById("refreshToolsBtn"),
-  businessProcessForm: document.getElementById("businessProcessForm"),
-  businessProcessFile: document.getElementById("businessProcessFile"),
-  businessProcessViewName: document.getElementById("businessProcessViewName"),
-  businessProcessBtn: document.getElementById("businessProcessBtn"),
-  actionStatus: document.getElementById("actionStatus"),
-  previewPanel: document.getElementById("previewPanel"),
-  previewEmptyState: document.getElementById("previewEmptyState"),
-  previewContent: document.getElementById("previewContent"),
-  previewViewName: document.getElementById("previewViewName"),
-  previewSourceBadge: document.getElementById("previewSourceBadge"),
-  previewCounts: document.getElementById("previewCounts"),
-  previewWarnings: document.getElementById("previewWarnings"),
-  previewDiagram: document.getElementById("previewDiagram"),
-  previewDiagramStage: document.getElementById("previewDiagramStage"),
-  diagramZoomInBtn: document.getElementById("diagramZoomInBtn"),
-  diagramZoomOutBtn: document.getElementById("diagramZoomOutBtn"),
-  diagramResetViewBtn: document.getElementById("diagramResetViewBtn"),
-  diagramZoomLabel: document.getElementById("diagramZoomLabel"),
-  elementsTable: document.getElementById("elementsTable"),
-  relationshipsTable: document.getElementById("relationshipsTable"),
-  discardPreviewBtn: document.getElementById("discardPreviewBtn"),
-  applyPreviewBtn: document.getElementById("applyPreviewBtn"),
   actionLog: document.getElementById("actionLog"),
   metaModelBtn: document.getElementById("metaModelBtn"),
   metaModelModal: document.getElementById("metaModelModal"),
@@ -122,6 +91,7 @@ const elements = {
   assessmentSollForm: document.getElementById("assessmentSollForm"),
   assessmentSollFile: document.getElementById("assessmentSollFile"),
   assessmentSollBtn: document.getElementById("assessmentSollBtn"),
+  assessmentSollProposeBtn: document.getElementById("assessmentSollProposeBtn"),
   assessmentSollStatus: document.getElementById("assessmentSollStatus"),
   assessmentSollPreview: document.getElementById("assessmentSollPreview"),
   assessmentSollCounts: document.getElementById("assessmentSollCounts"),
@@ -136,6 +106,7 @@ const elements = {
   assessmentMappingTable: document.getElementById("assessmentMappingTable"),
   assessmentGapTable: document.getElementById("assessmentGapTable"),
   assessmentMappingApplyBtn: document.getElementById("assessmentMappingApplyBtn"),
+  assessmentMappingViewName: document.getElementById("assessmentMappingViewName"),
   assessmentMappingBackBtn: document.getElementById("assessmentMappingBackBtn"),
   assessmentMappingContinueBtn: document.getElementById("assessmentMappingContinueBtn"),
   assessmentSummaryRunBtn: document.getElementById("assessmentSummaryRunBtn"),
@@ -594,21 +565,6 @@ function renderToolList(errorMessage = "") {
   }
 }
 
-/* ---------------- Upload preview / apply workflow ---------------- */
-
-const PREVIEW_CONFIG = {
-  "business-process-upload": {
-    endpoint: "/api/actions/business-process-upload/preview",
-    fileInput: () => elements.businessProcessFile,
-    viewInput: () => elements.businessProcessViewName,
-    label: "Business process",
-  },
-};
-
-function buildKeyIndex(plan) {
-  return new Map((plan.elements || []).map((el) => [el.key, el]));
-}
-
 function typeColor(type) {
   const t = String(type || "");
   if (t.startsWith("Business")) {
@@ -626,458 +582,6 @@ function typeColor(type) {
 function truncateLabel(text, maxLen) {
   const t = String(text || "");
   return t.length > maxLen ? `${t.slice(0, maxLen - 1)}…` : t;
-}
-
-function wrapLabel(text, maxCharsPerLine, maxLines) {
-  const words = String(text || "").split(/\s+/).filter(Boolean);
-  const lines = [];
-  let current = "";
-  for (const word of words) {
-    const candidate = current ? `${current} ${word}` : word;
-    if (candidate.length > maxCharsPerLine && current) {
-      lines.push(current);
-      current = word;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) lines.push(current);
-  if (!lines.length) return [""];
-
-  if (lines.length > maxLines) {
-    const kept = lines.slice(0, maxLines);
-    const last = kept[maxLines - 1];
-    kept[maxLines - 1] = last.length > 2 ? `${last.slice(0, maxCharsPerLine - 1)}…` : `${last}…`;
-    return kept;
-  }
-  return lines;
-}
-
-function rectBoundaryPoint(cx, cy, halfW, halfH, dx, dy) {
-  if (!dx && !dy) return { x: cx, y: cy };
-  const candidates = [];
-  if (dx) candidates.push(halfW / Math.abs(dx));
-  if (dy) candidates.push(halfH / Math.abs(dy));
-  const t = Math.min(...candidates);
-  return { x: cx + dx * t, y: cy + dy * t };
-}
-
-function buildRelationshipLine(svgNS, sourcePos, targetPos, offsetX, offsetY) {
-  const cx1 = sourcePos.x + sourcePos.width / 2 + offsetX;
-  const cy1 = sourcePos.y + sourcePos.height / 2 + offsetY;
-  const cx2 = targetPos.x + targetPos.width / 2 + offsetX;
-  const cy2 = targetPos.y + targetPos.height / 2 + offsetY;
-  const dx = cx2 - cx1;
-  const dy = cy2 - cy1;
-  const len = Math.hypot(dx, dy) || 1;
-  const ux = dx / len;
-  const uy = dy / len;
-  const p1 = rectBoundaryPoint(cx1, cy1, sourcePos.width / 2, sourcePos.height / 2, ux, uy);
-  const p2 = rectBoundaryPoint(cx2, cy2, targetPos.width / 2, targetPos.height / 2, -ux, -uy);
-  const line = document.createElementNS(svgNS, "line");
-  line.setAttribute("x1", String(p1.x));
-  line.setAttribute("y1", String(p1.y));
-  line.setAttribute("x2", String(p2.x));
-  line.setAttribute("y2", String(p2.y));
-  line.setAttribute("class", "diagram-edge");
-  line.setAttribute("marker-end", "url(#archiArrowHead)");
-  return line;
-}
-
-function computeElementBoxHeight(pos, name) {
-  const paddingX = 8;
-  const nameStartY = 40;
-  const lineHeight = 15;
-  const maxLines = 6;
-  const maxCharsPerLine = Math.max(10, Math.floor((pos.width - paddingX * 2) / 6.4));
-  const nameLines = wrapLabel(name, maxCharsPerLine, maxLines);
-  const neededHeight = nameStartY + nameLines.length * lineHeight + 10;
-  return { nameLines, height: Math.max(pos.height, neededHeight), maxCharsPerLine };
-}
-
-function buildElementNode(svgNS, el, pos, offsetX, offsetY) {
-  const palette = typeColor(el.type);
-  const group = document.createElementNS(svgNS, "g");
-  const paddingX = 8;
-  const nameStartY = 40;
-  const lineHeight = 15;
-  const { nameLines, height: boxHeight } = computeElementBoxHeight(pos, el.name);
-
-  const rect = document.createElementNS(svgNS, "rect");
-  rect.setAttribute("x", String(pos.x + offsetX));
-  rect.setAttribute("y", String(pos.y + offsetY));
-  rect.setAttribute("width", String(pos.width));
-  rect.setAttribute("height", String(boxHeight));
-  rect.setAttribute("rx", "8");
-  rect.setAttribute("fill", palette.fill);
-  rect.setAttribute("stroke", palette.stroke);
-  rect.setAttribute("stroke-width", "1.3");
-  group.appendChild(rect);
-
-  const typeLabel = document.createElementNS(svgNS, "text");
-  typeLabel.setAttribute("x", String(pos.x + offsetX + paddingX));
-  typeLabel.setAttribute("y", String(pos.y + offsetY + 17));
-  typeLabel.setAttribute("class", "diagram-type-label");
-  typeLabel.setAttribute("fill", palette.stroke);
-  typeLabel.textContent = el.type;
-  group.appendChild(typeLabel);
-
-  const nameLabel = document.createElementNS(svgNS, "text");
-  nameLabel.setAttribute("class", "diagram-name-label");
-  nameLabel.setAttribute("fill", palette.text);
-  nameLines.forEach((line, index) => {
-    const tspan = document.createElementNS(svgNS, "tspan");
-    tspan.setAttribute("x", String(pos.x + offsetX + paddingX));
-    tspan.setAttribute("y", String(pos.y + offsetY + nameStartY + index * lineHeight));
-    tspan.textContent = line;
-    nameLabel.appendChild(tspan);
-  });
-  group.appendChild(nameLabel);
-
-  const titleEl = document.createElementNS(svgNS, "title");
-  titleEl.textContent = `${el.type}: ${el.name}`;
-  group.appendChild(titleEl);
-
-  return group;
-}
-
-function renderPreviewDiagram() {
-  const container = elements.previewDiagramStage;
-  container.innerHTML = "";
-  const plan = state.currentPlan;
-  if (!plan) return;
-
-  const includedElements = plan.elements.filter((el) => el.include);
-  const includedKeys = new Set(includedElements.map((el) => el.key));
-  const includedRelationships = plan.relationships.filter(
-    (rel) => rel.include && includedKeys.has(rel.source_key) && includedKeys.has(rel.target_key)
-  );
-
-  if (!includedElements.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "No elements selected.";
-    container.appendChild(empty);
-    return;
-  }
-
-  const positions = {};
-  includedElements.forEach((el, index) => {
-    const pos = plan.layout_positions ? plan.layout_positions[el.key] : null;
-    const basePos = pos || {
-      x: 100 + (index % 4) * 260,
-      y: 100 + Math.floor(index / 4) * 140,
-      width: 200,
-      height: 80,
-    };
-    // Grow the rendered box height to fit the full (word-wrapped) name so labels are
-    // never cut off with an ellipsis in the preview.
-    const { height } = computeElementBoxHeight(basePos, el.name);
-    positions[el.key] = { ...basePos, height };
-  });
-
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const pos of Object.values(positions)) {
-    minX = Math.min(minX, pos.x);
-    minY = Math.min(minY, pos.y);
-    maxX = Math.max(maxX, pos.x + pos.width);
-    maxY = Math.max(maxY, pos.y + pos.height);
-  }
-  const pad = 40;
-  const viewW = maxX - minX + pad * 2;
-  const viewH = maxY - minY + pad * 2;
-  const offsetX = -minX + pad;
-  const offsetY = -minY + pad;
-
-  const svgNS = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(svgNS, "svg");
-  svg.setAttribute("viewBox", `0 0 ${viewW} ${viewH}`);
-  svg.setAttribute("preserveAspectRatio", "xMinYMin meet");
-  svg.classList.add("diagram-svg");
-
-  const defs = document.createElementNS(svgNS, "defs");
-  const marker = document.createElementNS(svgNS, "marker");
-  marker.setAttribute("id", "archiArrowHead");
-  marker.setAttribute("markerWidth", "8");
-  marker.setAttribute("markerHeight", "8");
-  marker.setAttribute("refX", "7");
-  marker.setAttribute("refY", "4");
-  marker.setAttribute("orient", "auto");
-  const arrowPath = document.createElementNS(svgNS, "path");
-  arrowPath.setAttribute("d", "M0,0 L8,4 L0,8 Z");
-  arrowPath.setAttribute("fill", "#8497b5");
-  marker.appendChild(arrowPath);
-  defs.appendChild(marker);
-  svg.appendChild(defs);
-
-  for (const rel of includedRelationships) {
-    const sourcePos = positions[rel.source_key];
-    const targetPos = positions[rel.target_key];
-    if (!sourcePos || !targetPos) continue;
-    svg.appendChild(buildRelationshipLine(svgNS, sourcePos, targetPos, offsetX, offsetY));
-  }
-
-  for (const el of includedElements) {
-    const pos = positions[el.key];
-    if (!pos) continue;
-    svg.appendChild(buildElementNode(svgNS, el, pos, offsetX, offsetY));
-  }
-
-  container.appendChild(svg);
-}
-
-function applyDiagramTransform() {
-  elements.previewDiagramStage.style.transform =
-    `translate(${state.diagramPan.x}px, ${state.diagramPan.y}px) scale(${state.diagramZoom})`;
-  elements.diagramZoomLabel.textContent = `${Math.round(state.diagramZoom * 100)}%`;
-}
-
-function resetDiagramView() {
-  state.diagramZoom = 1;
-  state.diagramPan = { x: 0, y: 0 };
-  applyDiagramTransform();
-}
-
-function setDiagramZoom(nextZoom, anchor) {
-  const clamped = Math.min(DIAGRAM_ZOOM_MAX, Math.max(DIAGRAM_ZOOM_MIN, nextZoom));
-  if (anchor) {
-    const ratio = clamped / state.diagramZoom;
-    state.diagramPan = {
-      x: anchor.x - (anchor.x - state.diagramPan.x) * ratio,
-      y: anchor.y - (anchor.y - state.diagramPan.y) * ratio,
-    };
-  }
-  state.diagramZoom = clamped;
-  applyDiagramTransform();
-}
-
-function attachDiagramInteractions() {
-  const viewport = elements.previewDiagram;
-
-  viewport.addEventListener("wheel", (event) => {
-    if (!state.currentPlan) return;
-    event.preventDefault();
-    const rect = viewport.getBoundingClientRect();
-    const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-    const direction = event.deltaY < 0 ? DIAGRAM_ZOOM_STEP : 1 / DIAGRAM_ZOOM_STEP;
-    setDiagramZoom(state.diagramZoom * direction, anchor);
-  }, { passive: false });
-
-  viewport.addEventListener("mousedown", (event) => {
-    if (!state.currentPlan) return;
-    state.diagramDrag = {
-      startX: event.clientX,
-      startY: event.clientY,
-      startPan: { ...state.diagramPan },
-    };
-    viewport.classList.add("dragging");
-  });
-
-  window.addEventListener("mousemove", (event) => {
-    if (!state.diagramDrag) return;
-    const dx = event.clientX - state.diagramDrag.startX;
-    const dy = event.clientY - state.diagramDrag.startY;
-    state.diagramPan = {
-      x: state.diagramDrag.startPan.x + dx,
-      y: state.diagramDrag.startPan.y + dy,
-    };
-    applyDiagramTransform();
-  });
-
-  window.addEventListener("mouseup", () => {
-    if (!state.diagramDrag) return;
-    state.diagramDrag = null;
-    viewport.classList.remove("dragging");
-  });
-
-  viewport.addEventListener("dblclick", () => {
-    if (!state.currentPlan) return;
-    resetDiagramView();
-  });
-
-  elements.diagramZoomInBtn.addEventListener("click", () => setDiagramZoom(state.diagramZoom * DIAGRAM_ZOOM_STEP));
-  elements.diagramZoomOutBtn.addEventListener("click", () => setDiagramZoom(state.diagramZoom / DIAGRAM_ZOOM_STEP));
-  elements.diagramResetViewBtn.addEventListener("click", resetDiagramView);
-}
-
-function renderElementsTable() {
-  const tbody = elements.elementsTable.querySelector("tbody");
-  tbody.innerHTML = "";
-  const plan = state.currentPlan;
-  if (!plan) return;
-
-  if (!plan.elements.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 3;
-    td.className = "empty-state";
-    td.textContent = "No elements extracted.";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-    return;
-  }
-
-  plan.elements.forEach((el) => {
-    const tr = document.createElement("tr");
-    if (!el.include) tr.classList.add("row-excluded");
-
-    const checkTd = document.createElement("td");
-    checkTd.className = "col-check";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = el.include;
-    checkbox.addEventListener("change", () => {
-      el.include = checkbox.checked;
-      tr.classList.toggle("row-excluded", !el.include);
-      renderRelationshipsTable();
-      renderPreviewDiagram();
-      renderPreviewCounts();
-      updateActionButtonsState();
-    });
-    checkTd.appendChild(checkbox);
-    tr.appendChild(checkTd);
-
-    const typeTd = document.createElement("td");
-    typeTd.className = "cell-type";
-    typeTd.textContent = el.type;
-    tr.appendChild(typeTd);
-
-    const nameTd = document.createElement("td");
-    const nameInput = document.createElement("input");
-    nameInput.type = "text";
-    nameInput.value = el.name;
-    nameInput.maxLength = 120;
-    nameInput.className = "cell-name-input";
-    nameInput.addEventListener("input", () => {
-      el.name = nameInput.value;
-      renderRelationshipsTable();
-      renderPreviewDiagram();
-    });
-    nameTd.appendChild(nameInput);
-    tr.appendChild(nameTd);
-
-    tbody.appendChild(tr);
-  });
-}
-
-function renderRelationshipsTable() {
-  const tbody = elements.relationshipsTable.querySelector("tbody");
-  tbody.innerHTML = "";
-  const plan = state.currentPlan;
-  if (!plan) return;
-
-  if (!plan.relationships.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 3;
-    td.className = "empty-state";
-    td.textContent = "No relationships extracted.";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-    return;
-  }
-
-  const keyIndex = buildKeyIndex(plan);
-
-  plan.relationships.forEach((rel) => {
-    const sourceEl = keyIndex.get(rel.source_key);
-    const targetEl = keyIndex.get(rel.target_key);
-    const endpointsIncluded = Boolean(sourceEl && sourceEl.include && targetEl && targetEl.include);
-
-    const tr = document.createElement("tr");
-    if (!rel.include || !endpointsIncluded) tr.classList.add("row-excluded");
-
-    const checkTd = document.createElement("td");
-    checkTd.className = "col-check";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = rel.include;
-    checkbox.disabled = !endpointsIncluded;
-    checkbox.title = endpointsIncluded ? "" : "Both endpoints must be included first";
-    checkbox.addEventListener("change", () => {
-      rel.include = checkbox.checked;
-      tr.classList.toggle("row-excluded", !rel.include || !endpointsIncluded);
-      renderPreviewDiagram();
-      renderPreviewCounts();
-      updateActionButtonsState();
-    });
-    checkTd.appendChild(checkbox);
-    tr.appendChild(checkTd);
-
-    const typeTd = document.createElement("td");
-    typeTd.className = "cell-type";
-    typeTd.textContent = rel.type;
-    tr.appendChild(typeTd);
-
-    const endpointsTd = document.createElement("td");
-    const sourceName = sourceEl ? sourceEl.name : rel.source_key;
-    const targetName = targetEl ? targetEl.name : rel.target_key;
-    endpointsTd.textContent = `${sourceName} → ${targetName}`;
-    tr.appendChild(endpointsTd);
-
-    tbody.appendChild(tr);
-  });
-}
-
-function renderPreviewCounts() {
-  const plan = state.currentPlan;
-  if (!plan) return;
-  const keyIndex = buildKeyIndex(plan);
-  const includedElementsCount = plan.elements.filter((el) => el.include).length;
-  const includedRelationshipsCount = plan.relationships.filter((rel) => {
-    const sourceEl = keyIndex.get(rel.source_key);
-    const targetEl = keyIndex.get(rel.target_key);
-    return rel.include && sourceEl && sourceEl.include && targetEl && targetEl.include;
-  }).length;
-  elements.previewCounts.textContent =
-    `${includedElementsCount}/${plan.elements.length} elements selected · ` +
-    `${includedRelationshipsCount}/${plan.relationships.length} relationships selected · ` +
-    `${plan.steps_processed} steps processed`;
-}
-
-function renderPreviewWarnings() {
-  const plan = state.currentPlan;
-  const box = elements.previewWarnings;
-  box.innerHTML = "";
-  const messages = [];
-  if (plan) {
-    if (Array.isArray(plan.warnings)) messages.push(...plan.warnings);
-    if (plan.steps_truncated) messages.push("Input was truncated to fit configured automation limits.");
-  }
-  if (!messages.length) {
-    box.classList.add("hidden");
-    return;
-  }
-  box.classList.remove("hidden");
-  for (const message of messages) {
-    const p = document.createElement("p");
-    p.textContent = message;
-    box.appendChild(p);
-  }
-}
-
-function renderPreview() {
-  const plan = state.currentPlan;
-  if (!plan) {
-    elements.previewEmptyState.classList.remove("hidden");
-    elements.previewContent.classList.add("hidden");
-    updateActionButtonsState();
-    return;
-  }
-  elements.previewEmptyState.classList.add("hidden");
-  elements.previewContent.classList.remove("hidden");
-  elements.previewViewName.value = plan.view_name;
-  elements.previewSourceBadge.textContent = plan.source_name || state.previewFileLabel || "upload";
-  renderElementsTable();
-  renderRelationshipsTable();
-  renderPreviewDiagram();
-  renderPreviewCounts();
-  renderPreviewWarnings();
-  resetDiagramView();
-  updateActionButtonsState();
 }
 
 function pushActionLogEntry(entry) {
@@ -1115,125 +619,6 @@ function renderActionLog() {
     item.appendChild(summary);
 
     container.appendChild(item);
-  }
-}
-
-async function loadPreview(actionKey) {
-  if (state.pendingController || state.pendingAction) return;
-  const config = PREVIEW_CONFIG[actionKey];
-  if (!config) return;
-
-  const fileInput = config.fileInput();
-  const viewInput = config.viewInput();
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) {
-    setActionStatus("Select a file first.", "error");
-    return;
-  }
-  const viewName = String(viewInput.value || "").trim().slice(0, 120);
-
-  state.pendingAction = config.endpoint;
-  updateActionButtonsState();
-  setActionStatus(`Extracting preview from '${file.name}'...`, "pending");
-
-  try {
-    const formData = new FormData();
-    formData.append("file", file);
-    if (viewName) formData.append("view_name", viewName);
-
-    const response = await fetch(config.endpoint, { method: "POST", body: formData });
-    let data = {};
-    try {
-      data = await response.json();
-    } catch (err) {
-      data = {};
-    }
-    if (!response.ok) {
-      throw new Error(data.detail || `Preview failed with status ${response.status}`);
-    }
-
-    state.currentPlan = data;
-    state.previewFileLabel = file.name;
-    renderPreview();
-    setActionStatus(
-      `Preview ready from '${file.name}': ${data.elements.length} elements, ${data.relationships.length} relationships. ` +
-        "Review below, then click \"Create in Archi\" to apply.",
-      "ok"
-    );
-    fileInput.value = "";
-  } catch (err) {
-    setActionStatus(`Error: ${err.message || String(err)}`, "error");
-  } finally {
-    state.pendingAction = null;
-    updateActionButtonsState();
-  }
-}
-
-function discardPreview() {
-  if (!state.currentPlan) return;
-  state.currentPlan = null;
-  state.previewFileLabel = "";
-  renderPreview();
-  setActionStatus("Preview discarded. Nothing was written to Archi.", "neutral");
-}
-
-async function applyPreview() {
-  const plan = state.currentPlan;
-  if (!plan || state.pendingController || state.pendingAction) return;
-  if (!plan.elements.some((el) => el.include)) {
-    setActionStatus("Select at least one element before applying.", "error");
-    return;
-  }
-
-  state.pendingAction = "/api/actions/apply";
-  updateActionButtonsState();
-  setActionStatus(`Creating '${plan.view_name}' in Archi...`, "pending");
-
-  try {
-    const response = await fetch("/api/actions/apply", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan }),
-    });
-    let data = {};
-    try {
-      data = await response.json();
-    } catch (err) {
-      data = {};
-    }
-    if (!response.ok) {
-      throw new Error(data.detail || `Apply failed with status ${response.status}`);
-    }
-
-    const summary = data.summary || "Applied to Archi.";
-    setActionStatus(summary, "ok");
-    pushActionLogEntry({
-      action: plan.action,
-      viewName: data.view_name || plan.view_name,
-      summary,
-      tone: "ok",
-    });
-
-    const active = getActiveConversation();
-    appendTurn(active, "assistant", summary, data.used_tools || []);
-    persistState();
-    renderConversationList();
-    renderConversationHeader();
-    renderChatWindow();
-    updateLastUsedTools();
-
-    state.currentPlan = null;
-    state.previewFileLabel = "";
-    renderPreview();
-    await loadHealth();
-    await loadTools();
-  } catch (err) {
-    const message = `Error: ${err.message || String(err)}`;
-    setActionStatus(message, "error");
-    pushActionLogEntry({ action: plan.action, viewName: plan.view_name, summary: message, tone: "error" });
-  } finally {
-    state.pendingAction = null;
-    updateActionButtonsState();
   }
 }
 
@@ -1488,6 +873,37 @@ async function loadAssessmentSollPreview() {
   }
 }
 
+async function proposeAssessmentSollArchitecture() {
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentSollProposeBtn.disabled = true;
+  setAssessmentStatus(elements.assessmentSollStatus, "Generating a Soll-Architektur proposal from the Ist processes...", "pending");
+  try {
+    const istViewName = elements.assessmentIstViewName.value.trim() || "Ist-Business-Prozesse";
+    const viewName = elements.assessmentSollViewName.value.trim() || "Soll-Architektur";
+    const res = await fetch("/api/assessment/soll-architecture/propose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ist_view_name: istViewName, view_name: viewName }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Proposal failed (${res.status})`);
+    state.assessment.sollPlan = data;
+    elements.assessmentSollPreview.classList.remove("hidden");
+    renderAssessmentElementsTable(data, elements.assessmentSollTable.querySelector("tbody"), elements.assessmentSollCounts);
+    setAssessmentStatus(
+      elements.assessmentSollStatus,
+      `Proposal ready: ${data.elements.length} processes, ${data.relationships.length} relationships (tagged status=target). Review carefully, then click "Create in Archi".`,
+      "ok"
+    );
+  } catch (err) {
+    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
+  } finally {
+    state.assessment.pending = false;
+    elements.assessmentSollProposeBtn.disabled = false;
+  }
+}
+
 async function applyAssessmentSollPlan() {
   const plan = state.assessment.sollPlan;
   if (!plan || state.assessment.pending) return;
@@ -1564,19 +980,21 @@ function renderAssessmentMappingTable(data) {
   }
   data.mappings.forEach((mapping) => {
     const tr = document.createElement("tr");
-    const endpointsComplete = Boolean(mapping.ist_key && mapping.soll_key);
-    if (!mapping.include || !endpointsComplete) tr.classList.add("row-excluded");
+    const hasEndpoint = Boolean(mapping.ist_key || mapping.soll_key);
+    if (!mapping.include || !hasEndpoint) tr.classList.add("row-excluded");
 
     const checkTd = document.createElement("td");
     checkTd.className = "col-check";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = mapping.include;
-    checkbox.disabled = !endpointsComplete;
-    checkbox.title = endpointsComplete ? "" : "Only mappings with both an Ist and a Soll process can be applied";
+    checkbox.disabled = !hasEndpoint;
+    checkbox.title = hasEndpoint
+      ? "Matched pairs are connected in the mapping view; Ist-only/Soll-only rows are shown standalone."
+      : "";
     checkbox.addEventListener("change", () => {
       mapping.include = checkbox.checked;
-      tr.classList.toggle("row-excluded", !mapping.include || !endpointsComplete);
+      tr.classList.toggle("row-excluded", !mapping.include || !hasEndpoint);
     });
     checkTd.appendChild(checkbox);
     tr.appendChild(checkTd);
@@ -1676,26 +1094,27 @@ async function runAssessmentMapping() {
 async function applyAssessmentMappings() {
   const result = state.assessment.mappingResult;
   if (!result || state.assessment.pending) return;
-  const included = result.mappings.filter((m) => m.include && m.ist_key && m.soll_key);
+  const included = result.mappings.filter((m) => m.include && (m.ist_key || m.soll_key));
   if (!included.length) {
-    setAssessmentStatus(elements.assessmentMappingStatus, "Select at least one full/partial mapping to apply.", "error");
+    setAssessmentStatus(elements.assessmentMappingStatus, "Select at least one mapping to apply.", "error");
     return;
   }
   state.assessment.pending = true;
   elements.assessmentMappingApplyBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentMappingStatus, "Applying mappings to Archi...", "pending");
+  setAssessmentStatus(elements.assessmentMappingStatus, "Building the mapping view in Archi...", "pending");
   try {
+    const viewName = elements.assessmentMappingViewName.value.trim() || "Ist-Soll Mapping";
     const res = await fetch("/api/assessment/mapping/apply", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mappings: result.mappings }),
+      body: JSON.stringify({ mappings: result.mappings, view_name: viewName }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Applying mappings failed (${res.status})`);
     setAssessmentStatus(elements.assessmentMappingStatus, data.summary || "Mappings applied.", "ok");
     pushActionLogEntry({
       action: "assessment-mapping",
-      viewName: "Ist ↔ Soll mapping",
+      viewName: data.view_name || viewName,
       summary: data.summary || "Mappings applied.",
       tone: "ok",
     });
@@ -1790,6 +1209,7 @@ function attachAssessmentEventHandlers() {
     await loadAssessmentSollPreview();
   });
   elements.assessmentSollApplyBtn.addEventListener("click", applyAssessmentSollPlan);
+  elements.assessmentSollProposeBtn.addEventListener("click", proposeAssessmentSollArchitecture);
   elements.assessmentSollDiscardBtn.addEventListener("click", discardAssessmentSollPlan);
   elements.assessmentSollBackBtn.addEventListener("click", () => setAssessmentStep("ist"));
   elements.assessmentSollContinueBtn.addEventListener("click", () => setAssessmentStep("mapping"));
@@ -1946,12 +1366,10 @@ function renderAll() {
   renderChatWindow();
   renderHealth();
   renderToolList();
-  renderPreview();
   renderActionLog();
   updateMessageCounter();
   updateSendButtonState();
   updateRetryButtonState();
-  updateActionButtonsState();
 }
 
 function abortPendingRequest(message = "Request stopped by user.") {
@@ -2113,18 +1531,9 @@ function updateSendButtonState() {
   elements.sendBtn.disabled = Boolean(state.pendingController || state.pendingAction || !hasText || overLimit);
 }
 
-function updateActionButtonsState() {
-  const isBusy = Boolean(state.pendingController || state.pendingAction);
-  elements.businessProcessBtn.disabled = isBusy;
-  const hasIncludedElement = Boolean(state.currentPlan && state.currentPlan.elements.some((el) => el.include));
-  elements.applyPreviewBtn.disabled = isBusy || !hasIncludedElement;
-  elements.discardPreviewBtn.disabled = isBusy || !state.currentPlan;
-}
-
 function setSending(isSending) {
   elements.sendBtn.textContent = isSending ? "Sending..." : "Send";
   updateSendButtonState();
-  updateActionButtonsState();
   elements.stopBtn.disabled = !isSending;
   updateRetryButtonState();
 
@@ -2139,15 +1548,6 @@ function setSending(isSending) {
   }
   if (!isSending && existing) {
     existing.remove();
-  }
-}
-
-function setActionStatus(message, tone = "neutral") {
-  const box = elements.actionStatus;
-  box.textContent = String(message || "");
-  box.className = "action-status";
-  if (tone) {
-    box.classList.add(`action-${tone}`);
   }
 }
 
@@ -2257,7 +1657,6 @@ async function sendMessage(rawMessage) {
     state.pendingController = null;
     setSending(false);
     updateSendButtonState();
-    updateActionButtonsState();
     elements.messageInput.focus();
   }
 }
@@ -2410,20 +1809,6 @@ function attachEventHandlers() {
   elements.refreshHealthInlineBtn.addEventListener("click", loadHealth);
   elements.refreshToolsBtn.addEventListener("click", loadTools);
 
-  elements.businessProcessForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await loadPreview("business-process-upload");
-  });
-
-  elements.previewViewName.addEventListener("input", () => {
-    if (state.currentPlan) {
-      state.currentPlan.view_name = elements.previewViewName.value;
-    }
-  });
-
-  elements.discardPreviewBtn.addEventListener("click", discardPreview);
-  elements.applyPreviewBtn.addEventListener("click", applyPreview);
-
   elements.toolSearchInput.addEventListener("input", () => {
     renderToolList();
   });
@@ -2476,8 +1861,6 @@ function attachEventHandlers() {
       closeMetaModelModal();
     }
   });
-
-  attachDiagramInteractions();
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {

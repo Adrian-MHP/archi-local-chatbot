@@ -77,6 +77,17 @@ RELATIONSHIPS: List[Tuple[str, str, str, str, str]] = [
         "Standard ArchiMate process sequencing. Not explicitly drawn in the source diagram "
         "(which focuses on cross-layer realization/serving), but required to model process flow order.",
     ),
+    (
+        "BusinessProcess",
+        "AssociationRelationship",
+        "BusinessProcess",
+        "Realizes (mapping)",
+        "Ist-Soll traceability in the Mapping & Gap-Analyse view: the target (Soll) process is "
+        "linked to the as-is (Ist) process it replaces or fulfills, labeled 'realizes' on the "
+        "connection. RealizationRelationship itself is not a valid ArchiMate pairing between two "
+        "BusinessProcess elements (rejected by the MCP server's validator), so Association is the "
+        "correct type here with the semantic intent carried in the relationship name instead.",
+    ),
 ]
 
 

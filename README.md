@@ -66,9 +66,9 @@ docker compose up --build -d
 
 Open:
 
-- Frontend chat UI: `http://localhost:8080`
-- Backend health: `http://localhost:8000/api/health`
-- Backend MCP tools list: `http://localhost:8000/api/tools`
+- Frontend chat UI: `http://localhost:38080`
+- Backend health: `http://localhost:38000/api/health`
+- Backend MCP tools list: `http://localhost:38000/api/tools`
 
 ## Workspace UI
 
@@ -130,7 +130,7 @@ without having a working deployment).
 
 ### Chat with trace
 
-POST `http://localhost:8000/api/chat/trace`
+POST `http://localhost:38000/api/chat/trace`
 
 Returns normal chat output plus a detailed execution trace (rounds, retries, tool calls).
 
@@ -146,7 +146,7 @@ Example body:
 
 ### Streaming chat (SSE)
 
-POST `http://localhost:8000/api/chat/stream`
+POST `http://localhost:38000/api/chat/stream`
 
 Streams response chunks as Server-Sent Events with event names:
 
@@ -170,13 +170,13 @@ Example body:
 
 ### Conversation export
 
-POST `http://localhost:8000/api/conversations/export`
+POST `http://localhost:38000/api/conversations/export`
 
 Validates and normalizes a conversation payload for backup or transfer.
 
 ### Conversation import
 
-POST `http://localhost:8000/api/conversations/import`
+POST `http://localhost:38000/api/conversations/import`
 
 Accepts either:
 
@@ -218,3 +218,25 @@ Then serve frontend separately or open a static server and point calls to `/api`
 - Upload says no readable text:
   - For scanned PDFs, run OCR first.
   - For legacy Excel `.xls`, convert to `.xlsx` and retry.
+
+- App loads but new endpoints/features consistently 404 or hang, even right after a successful
+  rebuild (verified working via `docker compose exec` or `curl` from inside WSL, but not from a
+  Windows browser at `http://localhost:<port>`) -- two distinct root causes have hit this app on
+  this machine, both presenting identically:
+  - **Orphaned `docker-proxy` processes** surviving `docker compose down` (visible via
+    `ps -ef | grep docker-proxy` inside WSL, usually much older than the current containers). They
+    keep holding the old host port and silently swallow requests to newly added routes.
+    `docker system prune -f` does not clean these up, and killing them requires root.
+  - **A second, independent Docker engine also serving the same port.** If Docker Desktop is
+    installed, it runs containers inside its own separate WSL VM (`wsl --list --verbose` shows it
+    as `docker-desktop`), completely independent from a plain WSL distro's native Docker engine.
+    If a copy of this app was ever built/started while Docker Desktop's engine was the active
+    `docker context`, that old copy can keep running and keep answering on the same port forever,
+    invisible to `docker compose ps` run against the native engine. Diagnose from **Windows**
+    PowerShell (not WSL) with `netstat -ano | findstr :<port>` to get the PID, then
+    `tasklist | findstr <PID>` -- if that PID is `wslrelay.exe`, check `wsl --list --verbose` for a
+    second running distro and check Docker Desktop's own dashboard for a stale container.
+  - Workaround already applied each time this has recurred: pick a fresh, previously-unused port
+    pair in `docker-compose.yml` and rebuild. The app has moved from `8000`/`8080`, to
+    `18000`/`18080`, to `28000`/`28080`, and now to `38000`/`38080`. A fresh port number always
+    dodges whatever is squatting on the old one, regardless of which of the two causes above it is.
