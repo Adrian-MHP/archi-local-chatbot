@@ -12,6 +12,7 @@ class Settings:
     azure_openai_model: str
     azure_openai_fallback_model: str
     azure_openai_extraction_model: str
+    azure_openai_summary_model: str
     mcp_server_url: str
     mcp_bearer_token: str
     app_host: str
@@ -41,9 +42,10 @@ def get_settings() -> Settings:
     return Settings(
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
         azure_openai_base_url=_normalize_azure_base_url(os.getenv("AZURE_OPENAI_BASE_URL", "")),
-        azure_openai_model=os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4").strip(),
+        azure_openai_model=os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4-pro").strip(),
         azure_openai_fallback_model=os.getenv("AZURE_OPENAI_FALLBACK_MODEL", "").strip(),
         azure_openai_extraction_model=os.getenv("AZURE_OPENAI_EXTRACTION_MODEL", "").strip(),
+        azure_openai_summary_model=os.getenv("AZURE_OPENAI_SUMMARY_MODEL", "").strip(),
         mcp_server_url=os.getenv("MCP_SERVER_URL", "http://127.0.0.1:18090/mcp").strip(),
         mcp_bearer_token=os.getenv("MCP_BEARER_TOKEN", "").strip(),
         app_host=os.getenv("APP_HOST", "0.0.0.0").strip(),

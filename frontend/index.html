@@ -65,15 +65,9 @@
 
             <section id="assessmentStepSetup" class="card assessment-step">
               <h3>1. Setup &amp; Context</h3>
-              <p>Checks the current Archi model for existing As-Is/To-Be views and confirms the assessment scope before starting. Mirrors the Setup &amp; Context Agent from the assessment spec.</p>
-              <div class="assessment-field-row">
-                <label>As-Is view name
-                  <input id="assessmentIstViewName" type="text" value="As-Is Business Processes" maxlength="120" />
-                </label>
-                <label>To-Be view name
-                  <input id="assessmentSollViewName" type="text" value="To-Be Architecture" maxlength="120" />
-                </label>
-              </div>
+              <p>Define one or more As-Is/To-Be source pairs -- each pair gets its own separate Archi views, never merged with another pair's. Then check the current Archi model for existing views before starting. Mirrors the Setup &amp; Context Agent from the assessment spec.</p>
+              <div id="assessmentPairRows" class="assessment-pair-rows"></div>
+              <button id="assessmentPairAddBtn" class="btn ghost small" type="button">+ Add source pair</button>
               <button id="assessmentSetupBtn" class="btn primary" type="button">Check model state</button>
               <div id="assessmentSetupResult" class="assessment-result hidden"></div>
               <div class="assessment-step-actions">
@@ -84,25 +78,11 @@
 
             <section id="assessmentStepIst" class="card assessment-step hidden">
               <h3>2. As-Is Capture (Business Process Extractor)</h3>
-              <p>Upload As-Is Process documentation (PDF, Excel, or text). Uses the same PDF-geometry-aware, evidence-gated extraction as the Workspace upload. Nothing is written to Archi until you review and apply below.</p>
-              <form id="assessmentIstForm" class="action-form">
-                <input id="assessmentIstFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
-                <button id="assessmentIstBtn" class="btn primary" type="submit">Preview extraction</button>
-              </form>
-              <div id="assessmentIstStatus" class="action-status hidden"></div>
-              <div id="assessmentIstPreview" class="assessment-preview hidden">
-                <div id="assessmentIstCounts" class="preview-counts"></div>
-                <div class="table-scroll">
-                  <table id="assessmentIstTable" class="preview-table">
-                    <thead><tr><th class="col-check"></th><th>Type</th><th>Name</th></tr></thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-                <div class="preview-actions">
-                  <button id="assessmentIstDiscardBtn" class="btn ghost" type="button">Discard</button>
-                  <button id="assessmentIstApplyBtn" class="btn primary" type="button">Create in Archi</button>
-                </div>
+              <p>Upload the As-Is Process document(s) for each source defined in Setup. Files uploaded into the same source are still chained together (drag to reorder), but sources are never merged with each other -- each becomes its own separate Archi view. Nothing is written to Archi until you review and apply.</p>
+              <div class="assessment-pair-list-toolbar">
+                <button id="assessmentIstApplyAllBtn" class="btn ghost small" type="button">Create all in Archi</button>
               </div>
+              <div id="assessmentIstPairList" class="assessment-pair-capture-list"></div>
               <div class="assessment-step-actions">
                 <button id="assessmentIstBackBtn" class="btn ghost" type="button">Back</button>
                 <button id="assessmentIstContinueBtn" class="btn primary" type="button" disabled>Continue to To-Be Architecture</button>
@@ -111,27 +91,11 @@
 
             <section id="assessmentStepSoll" class="card assessment-step hidden">
               <h3>3. To-Be Architecture (Target Architecture Builder)</h3>
-              <p>Upload a target-state process document (e.g. a To-Be SIPOC table or process diagram) -- it uses the exact same SIPOC-table / PDF-geometry-aware, evidence-gated extraction as As-Is Capture, producing BusinessProcess elements and TriggeringRelationship connections tagged status=target and added to the To-Be view from Setup. If you don't have a target document yet, let an agent propose one based on the As-Is processes already in the model.</p>
-              <form id="assessmentSollForm" class="action-form">
-                <input id="assessmentSollFile" type="file" accept=".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json" required />
-                <button id="assessmentSollBtn" class="btn primary" type="submit">Preview extraction</button>
-              </form>
-              <div class="assessment-or-divider">or</div>
-              <button id="assessmentSollProposeBtn" class="btn primary" type="button">Propose To-Be Architecture (AI)</button>
-              <div id="assessmentSollStatus" class="action-status hidden"></div>
-              <div id="assessmentSollPreview" class="assessment-preview hidden">
-                <div id="assessmentSollCounts" class="preview-counts"></div>
-                <div class="table-scroll">
-                  <table id="assessmentSollTable" class="preview-table">
-                    <thead><tr><th class="col-check"></th><th>Type</th><th>Name</th></tr></thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-                <div class="preview-actions">
-                  <button id="assessmentSollDiscardBtn" class="btn ghost" type="button">Discard</button>
-                  <button id="assessmentSollApplyBtn" class="btn primary" type="button">Create in Archi</button>
-                </div>
+              <p>Upload the To-Be process document(s) for each source, or let an agent propose one from that source's As-Is processes. Each source keeps its own separate Archi view, paired with its As-Is source from Setup. Each upload is checked against its paired As-Is processes so an unrelated document gets flagged.</p>
+              <div class="assessment-pair-list-toolbar">
+                <button id="assessmentSollApplyAllBtn" class="btn ghost small" type="button">Create all in Archi</button>
               </div>
+              <div id="assessmentSollPairList" class="assessment-pair-capture-list"></div>
               <div class="assessment-step-actions">
                 <button id="assessmentSollBackBtn" class="btn ghost" type="button">Back</button>
                 <button id="assessmentSollContinueBtn" class="btn primary" type="button" disabled>Continue to Mapping &amp; Gap Analysis</button>
@@ -140,31 +104,14 @@
 
             <section id="assessmentStepMapping" class="card assessment-step hidden">
               <h3>4. Mapping &amp; Gap Analysis</h3>
-              <p>Compares every As-Is business process already in the model against the To-Be business processes and classifies each pairing as a full match, partial match, legacy process with no To-Be equivalent, or a new To-Be process with no As-Is equivalent. Applying creates a real Archi view with As-Is and To-Be processes side by side: matched pairs connected, unmatched ones shown standalone so gaps are visible at a glance.</p>
-              <button id="assessmentMappingRunBtn" class="btn primary" type="button">Run mapping &amp; gap analysis</button>
+              <p>Compares each As-Is business process view against its paired To-Be view and classifies each pairing as a full match, partial match, legacy process with no To-Be equivalent, or a new To-Be process with no As-Is equivalent. Confirm or correct the pairing below before running the analysis. Applying creates a separate mapping view per pair in Archi.</p>
+              <div id="assessmentPairingReview" class="assessment-pairing-review"></div>
+              <button id="assessmentMappingRunBtn" class="btn primary" type="button">Run mapping &amp; gap analysis for all pairs</button>
               <div id="assessmentMappingStatus" class="action-status hidden"></div>
-              <div id="assessmentMappingResult" class="assessment-preview hidden">
-                <h4>Mappings</h4>
-                <div class="table-scroll">
-                  <table id="assessmentMappingTable" class="preview-table">
-                    <thead><tr><th class="col-check"></th><th>As-Is process</th><th>Match</th><th>To-Be process</th><th>Rationale</th></tr></thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-                <h4>Gap report</h4>
-                <div class="table-scroll">
-                  <table id="assessmentGapTable" class="preview-table">
-                    <thead><tr><th>Category</th><th>Criticality</th><th>Description</th></tr></thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-                <label class="assessment-mapping-view-name-label">Mapping view name
-                  <input id="assessmentMappingViewName" type="text" value="As-Is To-Be Mapping" maxlength="120" />
-                </label>
-                <div class="preview-actions">
-                  <button id="assessmentMappingApplyBtn" class="btn primary" type="button">Apply mappings to Archi</button>
-                </div>
+              <div class="assessment-pair-list-toolbar">
+                <button id="assessmentMappingApplyAllBtn" class="btn ghost small" type="button">Apply all pairs to Archi</button>
               </div>
+              <div id="assessmentMappingPairList" class="assessment-pair-mapping-list"></div>
               <div class="assessment-step-actions">
                 <button id="assessmentMappingBackBtn" class="btn ghost" type="button">Back</button>
                 <button id="assessmentMappingContinueBtn" class="btn primary" type="button" disabled>Continue to Summary</button>
@@ -190,6 +137,8 @@
                   </header>
 
                   <div id="summaryStatRow" class="summary-stat-row"></div>
+
+                  <div id="summaryPairBreakdown" class="summary-pair-breakdown hidden"></div>
 
                   <div class="summary-columns">
                     <section class="summary-block">

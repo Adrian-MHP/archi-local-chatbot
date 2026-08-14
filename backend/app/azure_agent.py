@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any, Dict, List, Tuple
 
+import httpx
 from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
 
 from . import meta_model
@@ -153,6 +154,7 @@ class ChatService:
                 models.append(candidate)
 
         last_rate_limit_error: Exception | None = None
+        last_error: Exception | None = None
 
         for model in models:
             kwargs_for_model = dict(create_kwargs)
@@ -163,6 +165,7 @@ class ChatService:
                     return self._call_model_once(kwargs_for_model), model, attempt
                 except RateLimitError as exc:
                     last_rate_limit_error = exc
+                    last_error = exc
                     if attempt >= self.settings.max_model_retries:
                         break
 
@@ -173,20 +176,29 @@ class ChatService:
                     retry_after = min(max(retry_after, 0.2), 30.0)
                     time.sleep(retry_after)
                 except APIStatusError as exc:
+                    last_error = exc
                     status = getattr(exc, "status_code", None)
-                    if status != 429:
-                        raise
-                    last_rate_limit_error = exc
-                    if attempt >= self.settings.max_model_retries:
-                        break
+                    if status == 429:
+                        last_rate_limit_error = exc
+                        if attempt >= self.settings.max_model_retries:
+                            break
+                        retry_after = self._extract_retry_after_seconds(exc)
+                        if retry_after is None:
+                            retry_after = self.settings.model_retry_backoff_seconds * (2 ** attempt)
+                        retry_after = min(max(retry_after, 0.2), 30.0)
+                        time.sleep(retry_after)
+                        continue
+                    # A non-rate-limit API error (misconfigured deployment name, deployment
+                    # doesn't support this operation, etc.) won't be fixed by retrying the SAME
+                    # model -- but a different configured model/deployment might work, so move on
+                    # to the next fallback candidate instead of failing the whole request outright.
+                    break
 
-                    retry_after = self._extract_retry_after_seconds(exc)
-                    if retry_after is None:
-                        retry_after = self.settings.model_retry_backoff_seconds * (2 ** attempt)
-                    retry_after = min(max(retry_after, 0.2), 30.0)
-                    time.sleep(retry_after)
-
-        if last_rate_limit_error is not None:
+        # last_error is last_rate_limit_error (object identity) only when the FINAL failure
+        # encountered across every model tried was a rate limit -- if a later, non-rate-limit
+        # failure occurred on a subsequent fallback model, last_error has moved on and this is
+        # False, so the generic message below (with the real last error) is raised instead.
+        if last_rate_limit_error is not None and last_error is last_rate_limit_error:
             if len(models) > 1:
                 raise RuntimeError(
                     "Azure rate limit exceeded for both primary and fallback model deployments. "
@@ -196,6 +208,12 @@ class ChatService:
                 "Azure rate limit exceeded for the configured model deployment. "
                 "Please wait and retry, or configure AZURE_OPENAI_FALLBACK_MODEL."
             ) from last_rate_limit_error
+
+        if last_error is not None:
+            tried = ", ".join(models)
+            raise RuntimeError(
+                f"All configured model deployments failed (tried: {tried}). Last error: {last_error}"
+            ) from last_error
 
         # Should not happen, but keep a clear failure mode.
         raise RuntimeError("Model request failed without a recoverable response.")
@@ -368,7 +386,9 @@ class ChatService:
     def _max_automation_ops() -> int:
         return 200
 
-    def _call_model_for_json(self, *, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+    def _call_model_for_json(
+        self, *, system_prompt: str, user_prompt: str, model_override: str | None = None
+    ) -> Dict[str, Any]:
         create_kwargs: Dict[str, Any] = dict(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -376,10 +396,60 @@ class ChatService:
             ],
             temperature=0,
         )
-        extraction_model = self.settings.azure_openai_extraction_model or self.settings.azure_openai_model
-        response, _model_used, _retries = self._call_model_with_retries(create_kwargs, primary_model=extraction_model)
+        # Three model tiers: day-to-day chat (azure_openai_model), reasoning-heavy extraction/
+        # mapping/proposal work (azure_openai_extraction_model), and the assessment's final
+        # synthesis step (azure_openai_summary_model, passed via model_override) -- each falls
+        # back to the tier below it if unset, down to the base chat model.
+        effective_model = (
+            model_override
+            or self.settings.azure_openai_extraction_model
+            or self.settings.azure_openai_model
+        )
+        response, _model_used, _retries = self._call_model_with_retries(create_kwargs, primary_model=effective_model)
         content = response.choices[0].message.content or ""
         return self._extract_json_object(content)
+
+    def _call_model_for_json_via_responses_api(
+        self, *, model: str, system_prompt: str, user_prompt: str
+    ) -> Dict[str, Any]:
+        """Some Azure OpenAI deployments -- confirmed live for this project's gpt-5.4-pro-4 tier --
+        are reasoning models only exposed via the newer Responses API (/openai/responses), not the
+        Chat Completions API every other call in this file uses. The installed openai SDK (1.51.2)
+        predates .responses.create() support, so this calls it directly over HTTP rather than
+        bumping a core dependency for one model tier. Raises on any failure; callers are expected
+        to catch and fall back to _call_model_for_json (which never uses this path)."""
+        base = self.settings.azure_openai_base_url.rstrip("/")
+        if base.endswith("/openai/v1"):
+            responses_url = base[: -len("v1")] + "responses"
+        else:
+            responses_url = f"{base}/openai/responses"
+        responses_url += "?api-version=2025-04-01-preview"
+
+        response = httpx.post(
+            responses_url,
+            json={
+                "model": model,
+                "instructions": system_prompt,
+                "input": user_prompt,
+            },
+            headers={"Content-Type": "application/json", "api-key": self.settings.azure_openai_api_key},
+            timeout=self.settings.request_timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("status") != "completed":
+            error = data.get("error") or {}
+            raise RuntimeError(f"Responses API call did not complete: {error.get('message', data.get('status'))}")
+
+        for item in data.get("output", []):
+            if item.get("type") != "message":
+                continue
+            for block in item.get("content", []):
+                if block.get("type") == "output_text":
+                    return self._extract_json_object(str(block.get("text", "")))
+
+        raise RuntimeError("Responses API returned no output text.")
 
     def _mcp_call(self, tool_name: str, args: Dict[str, Any], used_tools: List[str]) -> Dict[str, Any]:
         result = self.mcp.call_tool(tool_name, args)
@@ -1609,18 +1679,131 @@ class ChatService:
             content_text=content_text, source_name=source_name, view_name=view_name
         )
 
+    @staticmethod
+    def _first_last_business_process_keys(elements: Dict[str, Dict[str, str]]) -> tuple[str | None, str | None]:
+        process_keys = [key for key, item in elements.items() if item.get("type") == "BusinessProcess"]
+        if not process_keys:
+            return None, None
+        return process_keys[0], process_keys[-1]
+
+    def _merge_extraction_plans(
+        self,
+        *,
+        plans: List[Dict[str, Any]],
+        source_labels: List[str],
+        view_name: str,
+    ) -> Dict[str, Any]:
+        """Merge one extraction plan per uploaded file, in the caller-specified order, into a
+        single connected plan: each file keeps its own (already well-laid-out) internal structure,
+        stacked top to bottom in order, with the previous file's last process chained via
+        TriggeringRelationship to the next file's first process -- so multiple documents that
+        together describe one end-to-end process actually read as one chain, not N disconnected
+        islands. A single-file call degenerates to just that file's plan, tagged with its source."""
+        if len(plans) == 1:
+            solo = plans[0]
+            tagged_elements = {
+                key: {**item, "documentation": f"[{source_labels[0]}] {item.get('documentation', '')}".strip()}
+                for key, item in solo["elements"].items()
+            }
+            return {**solo, "view_name": view_name or solo["view_name"], "elements": tagged_elements}
+
+        elements: Dict[str, Dict[str, str]] = {}
+        relationships: List[Dict[str, str]] = []
+        layout_positions: Dict[str, Dict[str, int]] = {}
+        seen_relationships: set[tuple[str, str, str]] = set()
+        warnings: List[str] = []
+        total_steps = 0
+        any_truncated = False
+        previous_last_key: str | None = None
+        row_gap_between_files = 260
+        y_offset = 0
+
+        for plan, label in zip(plans, source_labels):
+            for key, item in plan["elements"].items():
+                doc = str(item.get("documentation", "")).strip()
+                if key in elements:
+                    existing_doc = str(elements[key].get("documentation", ""))
+                    if label not in existing_doc:
+                        elements[key]["documentation"] = f"{existing_doc} | Also in: {label}".strip(" |")
+                    continue
+                elements[key] = {**item, "documentation": f"[{label}] {doc}".strip()}
+
+            for rel in plan["relationships"]:
+                rel_tuple = (rel["type"], rel["source_key"], rel["target_key"])
+                if rel_tuple in seen_relationships:
+                    continue
+                seen_relationships.add(rel_tuple)
+                relationships.append(rel)
+
+            file_positions = plan.get("layout_positions") or {}
+            max_extent = y_offset
+            for key, pos in file_positions.items():
+                shifted = {**pos, "y": int(pos.get("y", 0)) + y_offset}
+                layout_positions.setdefault(key, shifted)
+                max_extent = max(max_extent, shifted["y"] + int(pos.get("height", 80)))
+            if file_positions:
+                y_offset = max_extent + row_gap_between_files
+
+            total_steps += int(plan.get("steps_processed", 0))
+            if plan.get("steps_truncated"):
+                any_truncated = True
+            for warning in plan.get("warnings", []):
+                warnings.append(f"[{label}] {warning}")
+
+            first_key, last_key = self._first_last_business_process_keys(plan["elements"])
+            if previous_last_key and first_key:
+                rel_tuple = ("TriggeringRelationship", previous_last_key, first_key)
+                if rel_tuple not in seen_relationships:
+                    seen_relationships.add(rel_tuple)
+                    relationships.append(
+                        {"type": "TriggeringRelationship", "source_key": previous_last_key, "target_key": first_key}
+                    )
+            if last_key:
+                previous_last_key = last_key
+
+        warnings.insert(
+            0,
+            f"Merged {len(plans)} files in this order: {', '.join(source_labels)}. Each file's last "
+            "process was chained to the next file's first process -- review the relationships table "
+            "and adjust if that doesn't match the real flow.",
+        )
+
+        return {
+            "view_name": view_name or "Business Process View",
+            "elements": elements,
+            "relationships": relationships,
+            "layout_positions": layout_positions,
+            "steps_processed": total_steps,
+            "steps_truncated": any_truncated,
+            "warnings": warnings,
+        }
+
     def plan_business_process_automation(
         self,
         *,
-        content_text: str,
-        source_name: str,
+        uploads: List[Tuple[str, str, bytes | None]],
         view_name: str | None = None,
-        pdf_bytes: bytes | None = None,
     ) -> Dict[str, Any]:
-        extracted = self._extract_business_process_plan(
-            content_text=content_text, source_name=source_name, view_name=view_name, pdf_bytes=pdf_bytes
+        """uploads is an ORDERED list of (content_text, source_name, pdf_bytes) -- one per file, in
+        the sequence the user arranged them in (e.g. via the drag-drop reorder list in the wizard).
+        A single upload behaves exactly as before; multiple uploads are extracted independently
+        (each gets its best-available extraction method) and then chained together in order."""
+        if not uploads:
+            raise RuntimeError("No files were provided.")
+        plans = [
+            self._extract_business_process_plan(
+                content_text=content_text, source_name=source_name, view_name=view_name, pdf_bytes=pdf_bytes
+            )
+            for content_text, source_name, pdf_bytes in uploads
+        ]
+        source_labels = [source_name for _content_text, source_name, _pdf_bytes in uploads]
+        merged = self._merge_extraction_plans(
+            plans=plans, source_labels=source_labels, view_name=view_name or plans[0]["view_name"]
         )
-        return self._format_plan_response(action="business-process-upload", source_name=source_name, extracted=extracted)
+        combined_source_name = source_labels[0] if len(source_labels) == 1 else f"{len(source_labels)} files"
+        return self._format_plan_response(
+            action="business-process-upload", source_name=combined_source_name, extracted=merged
+        )
 
     def run_business_process_automation(
         self,
@@ -1878,31 +2061,93 @@ class ChatService:
             "notes": notes,
         }
 
+    def _check_soll_relevance_to_ist(
+        self, *, ist_view_name: str, soll_names: List[str], used_tools: List[str]
+    ) -> str | None:
+        """Best-effort, non-blocking sanity check: does this newly-extracted To-Be content look
+        like a plausible target-state counterpart for the As-Is processes already captured, or
+        does it look like the wrong document got uploaded? Never raises -- a failed check just
+        means no warning, not a blocked upload."""
+        try:
+            ist_view_id = self._find_existing_view_id(view_name=ist_view_name, used_tools=used_tools)
+            if not ist_view_id:
+                return None
+            ist_processes = self._collect_view_business_processes(view_id=ist_view_id, used_tools=used_tools)
+            ist_names = [p["name"] for p in ist_processes]
+            if not ist_names or not soll_names:
+                return None
+
+            user_prompt = (
+                "You are sanity-checking a target-state (To-Be) process upload against the as-is "
+                "(As-Is) processes already captured for the same architecture assessment.\n"
+                f"As-Is processes already captured:\n" + "\n".join(f"- {n}" for n in ist_names[:60]) + "\n\n"
+                f"Newly uploaded To-Be process names:\n" + "\n".join(f"- {n}" for n in soll_names[:60]) + "\n\n"
+                'Return strict JSON only: {"relevant": true|false, "reason": "one short sentence"}.\n'
+                "relevant=true if the To-Be content plausibly represents a target-state evolution of "
+                "(at least some of) the As-Is scope -- new, renamed, consolidated, or automated steps "
+                "are all still relevant. relevant=false only if the content looks like it addresses a "
+                "clearly different process or domain entirely (e.g. As-Is is an offer process and this "
+                "document is about something unrelated like HR onboarding)."
+            )
+            parsed = self._call_model_for_json(
+                system_prompt="You are a careful architecture assessment QA checker. Output strict JSON only.",
+                user_prompt=user_prompt,
+            )
+            if parsed.get("relevant") is False:
+                reason = str(parsed.get("reason", "")).strip()
+                suffix = f" ({reason})" if reason else ""
+                return (
+                    f"This document's content doesn't look closely related to your As-Is processes{suffix} "
+                    "-- double check this is the right target-state document before continuing."
+                )
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     def plan_soll_architecture(
         self,
         *,
-        content_text: str,
-        source_name: str,
+        uploads: List[Tuple[str, str, bytes | None]],
         view_name: str | None = None,
-        pdf_bytes: bytes | None = None,
+        ist_view_name: str | None = None,
     ) -> Dict[str, Any]:
         """A target-state upload (e.g. a To-Be SIPOC table or process diagram) describes the same
         kind of content as an As-Is upload -- process steps and their sequence -- so it reuses the
         exact same SIPOC-table / PDF-geometry / evidence-gated text extraction as As-Is Capture,
         just tagged as "target" instead of running the separate ApplicationComponent-oriented
-        product-architecture extraction meant for requirement documents."""
-        extracted = self._extract_business_process_plan(
-            content_text=content_text,
-            source_name=source_name,
-            view_name=view_name or "To-Be Architecture",
-            pdf_bytes=pdf_bytes,
-        )
+        product-architecture extraction meant for requirement documents. uploads is an ORDERED list,
+        same multi-file chaining behavior as plan_business_process_automation."""
+        if not uploads:
+            raise RuntimeError("No files were provided.")
+        resolved_view_name = view_name or "To-Be Business Processes"
+        plans = [
+            self._extract_business_process_plan(
+                content_text=content_text, source_name=source_name, view_name=resolved_view_name, pdf_bytes=pdf_bytes
+            )
+            for content_text, source_name, pdf_bytes in uploads
+        ]
+        source_labels = [source_name for _content_text, source_name, _pdf_bytes in uploads]
+        merged = self._merge_extraction_plans(plans=plans, source_labels=source_labels, view_name=resolved_view_name)
+
         tagged_elements = {
             key: {**item, "properties": {**item.get("properties", {}), "status": "target"}}
-            for key, item in extracted["elements"].items()
+            for key, item in merged["elements"].items()
         }
-        extracted = {**extracted, "elements": tagged_elements}
-        return self._format_plan_response(action="assessment-soll-upload", source_name=source_name, extracted=extracted)
+        merged = {**merged, "elements": tagged_elements}
+
+        if ist_view_name:
+            used_tools: List[str] = []
+            soll_names = [item["name"] for item in tagged_elements.values() if item.get("type") == "BusinessProcess"]
+            relevance_warning = self._check_soll_relevance_to_ist(
+                ist_view_name=ist_view_name, soll_names=soll_names, used_tools=used_tools
+            )
+            if relevance_warning:
+                merged = {**merged, "warnings": [relevance_warning, *merged.get("warnings", [])]}
+
+        combined_source_name = source_labels[0] if len(source_labels) == 1 else f"{len(source_labels)} files"
+        return self._format_plan_response(
+            action="assessment-soll-upload", source_name=combined_source_name, extracted=merged
+        )
 
     def propose_soll_architecture(
         self,
@@ -1928,7 +2173,7 @@ class ChatService:
                 f"No As-Is business processes found on view '{ist_view_name}'. Run As-Is Capture first."
             )
 
-        preferred_view_name = self._normalize_name(view_name or "To-Be Architecture", fallback="To-Be Architecture")
+        preferred_view_name = self._normalize_name(view_name or "To-Be Business Processes", fallback="To-Be Business Processes")
         process_lines = "\n".join(f"- {name}" for name in ist_names)
 
         user_prompt = (
@@ -2178,12 +2423,17 @@ class ChatService:
         self,
         *,
         mappings: List[Dict[str, Any]],
+        gaps: List[Dict[str, Any]] | None = None,
         view_name: str = "As-Is To-Be Mapping",
     ) -> Dict[str, Any]:
         """Create the As-Is<->To-Be traceability relationships AND a real Archi view visualizing them:
         an As-Is row and a To-Be row, matched pairs vertically aligned and connected, unmatched
         processes (legacy-no-To-Be / new-no-As-Is) shown standalone in their row so the gap is visible
-        at a glance -- not just a relationship buried in the model."""
+        at a glance -- not just a relationship buried in the model. Also pulls in each included
+        process's EXISTING TriggeringRelationship connections to other included processes (the
+        internal As-Is/To-Be flow already captured during As-Is Capture / To-Be Architecture) so
+        the mapping view shows the full picture, not just the new cross-mapping links; and creates
+        one Gap element per identified gap, linked to its affected process(es) via "affects"."""
         included = [m for m in mappings if m.get("include", True)]
         matched = [m for m in included if m.get("ist_key") and m.get("soll_key")]
         ist_only = [m for m in included if m.get("ist_key") and not m.get("soll_key")]
@@ -2198,19 +2448,36 @@ class ChatService:
         elements_by_key: Dict[str, Dict[str, str]] = {}
         relationships: List[Dict[str, str]] = []
         layout_positions: Dict[str, Dict[str, int]] = {}
+        # real Archi element id -> my internal key, so existing relationships between two included
+        # processes (found by real id) can be looked up and re-added to this view.
+        key_by_real_id: Dict[str, str] = {}
+        # normalized process name -> my internal key, so gaps (which only carry names) can be
+        # linked to the process(es) they affect.
+        key_by_process_name: Dict[str, str] = {}
 
         start_x = 100
         col_gap = 260
         ist_y = 110
         soll_y = 420
+        gap_y = 730
         box_w, box_h = 220, 90
         col_index = 0
+
+        def register_process(internal_key: str, real_id: Any, name: str) -> None:
+            if real_id:
+                key_by_real_id[str(real_id)] = internal_key
+            if name:
+                key_by_process_name.setdefault(self._norm_key(name), internal_key)
 
         for mapping in matched:
             ist_key = f"ist::{mapping['ist_key']}"
             soll_key = f"soll::{mapping['soll_key']}"
-            elements_by_key[ist_key] = {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "As-Is process")}
-            elements_by_key[soll_key] = {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "To-Be process")}
+            ist_name = str(mapping.get("ist_name") or "As-Is process")
+            soll_name = str(mapping.get("soll_name") or "To-Be process")
+            elements_by_key[ist_key] = {"type": "BusinessProcess", "name": ist_name}
+            elements_by_key[soll_key] = {"type": "BusinessProcess", "name": soll_name}
+            register_process(ist_key, mapping.get("ist_key"), ist_name)
+            register_process(soll_key, mapping.get("soll_key"), soll_name)
             x = start_x + col_index * col_gap
             layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
             layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
@@ -2235,21 +2502,91 @@ class ChatService:
 
         for mapping in ist_only:
             ist_key = f"ist::{mapping['ist_key']}"
-            elements_by_key.setdefault(
-                ist_key, {"type": "BusinessProcess", "name": str(mapping.get("ist_name") or "As-Is process")}
-            )
+            ist_name = str(mapping.get("ist_name") or "As-Is process")
+            elements_by_key.setdefault(ist_key, {"type": "BusinessProcess", "name": ist_name})
+            register_process(ist_key, mapping.get("ist_key"), ist_name)
             x = start_x + col_index * col_gap
             layout_positions[ist_key] = {"x": x, "y": ist_y, "width": box_w, "height": box_h}
             col_index += 1
 
         for mapping in soll_only:
             soll_key = f"soll::{mapping['soll_key']}"
-            elements_by_key.setdefault(
-                soll_key, {"type": "BusinessProcess", "name": str(mapping.get("soll_name") or "To-Be process")}
-            )
+            soll_name = str(mapping.get("soll_name") or "To-Be process")
+            elements_by_key.setdefault(soll_key, {"type": "BusinessProcess", "name": soll_name})
+            register_process(soll_key, mapping.get("soll_key"), soll_name)
             x = start_x + col_index * col_gap
             layout_positions[soll_key] = {"x": x, "y": soll_y, "width": box_w, "height": box_h}
             col_index += 1
+
+        # Pull in each included process's existing TriggeringRelationship connections to other
+        # included processes -- the internal As-Is/To-Be flow already captured earlier in the
+        # wizard -- so the mapping view shows the full picture, not just the new cross-mapping
+        # links. _execute_view_plan recognizes these as already-existing relationships (matched by
+        # real id) and just adds a visual connection; it does not create duplicates.
+        used_tools: List[str] = []
+        existing_relationships = self._collect_existing_relationships(used_tools)
+        trigger_type_key = self._norm_key("TriggeringRelationship")
+        seen_trigger_pairs: set[tuple[str, str]] = set()
+        for (rel_type_key, source_id, target_id), _rel_id in existing_relationships.items():
+            if rel_type_key != trigger_type_key:
+                continue
+            source_key = key_by_real_id.get(source_id)
+            target_key = key_by_real_id.get(target_id)
+            if not source_key or not target_key or source_key == target_key:
+                continue
+            pair = (source_key, target_key)
+            if pair in seen_trigger_pairs:
+                continue
+            seen_trigger_pairs.add(pair)
+            relationships.append({"type": "TriggeringRelationship", "source_key": source_key, "target_key": target_key})
+
+        # Gap elements: one per identified gap, linked to whichever included process(es) it
+        # affects via an "affects" relationship.
+        category_labels = {
+            "missing_process": "Missing process",
+            "redundancy": "Redundancy",
+            "structural_difference": "Structural difference",
+            "tooling_data_gap": "Tooling/data gap",
+        }
+        gap_name_counts: Dict[str, int] = {}
+        gap_list = gaps or []
+        for index, gap in enumerate(gap_list):
+            category = str(gap.get("category", "")).strip()
+            category_label = category_labels.get(category, category or "Gap")
+            related_ist = str(gap.get("related_ist_name") or "").strip()
+            related_soll = str(gap.get("related_soll_name") or "").strip()
+            related = related_ist or related_soll
+            base_name = f"{category_label}: {related}" if related else f"{category_label} gap"
+            norm_base = self._norm_key(base_name)
+            occurrence = gap_name_counts.get(norm_base, 0)
+            gap_name_counts[norm_base] = occurrence + 1
+            candidate_name = base_name if occurrence == 0 else f"{base_name} ({occurrence + 1})"
+            gap_name = self._normalize_name(candidate_name, fallback=f"Gap {index + 1}")
+
+            gap_key = f"gap::{index}"
+            elements_by_key[gap_key] = {
+                "type": "Gap",
+                "name": gap_name,
+                "documentation": self._normalize_name(
+                    f"[{gap.get('criticality', 'medium')}] {gap.get('description', '')}", fallback="", max_len=400
+                ),
+            }
+            layout_positions[gap_key] = {"x": start_x + index * col_gap, "y": gap_y, "width": box_w, "height": box_h}
+
+            for related_name in (related_ist, related_soll):
+                if not related_name:
+                    continue
+                target_key = key_by_process_name.get(self._norm_key(related_name))
+                if not target_key:
+                    continue
+                relationships.append(
+                    {
+                        "type": "AssociationRelationship",
+                        "source_key": gap_key,
+                        "target_key": target_key,
+                        "name": "affects",
+                    }
+                )
 
         execution = self._execute_view_plan(
             action_label="As-Is/To-Be mapping visualization",
@@ -2264,7 +2601,8 @@ class ChatService:
         summary = (
             f"Created mapping view '{resolved_view_name}': {len(matched)} matched pair(s) connected, "
             f"{len(ist_only)} As-Is-only (legacy, no To-Be equivalent), {len(soll_only)} To-Be-only (new, no As-Is "
-            f"equivalent) shown standalone. {execution.get('created_relationships', 0)} new relationship(s) created. "
+            f"equivalent) shown standalone, {len(gap_list)} gap element(s) linked to affected processes. "
+            f"{execution.get('created_relationships', 0)} new relationship(s) created. "
             "If Archi approval mode is enabled, approve the proposal to apply changes."
         )
         return {
@@ -2272,7 +2610,7 @@ class ChatService:
             "view_name": resolved_view_name,
             "view_id": execution.get("view_id"),
             "created_relationships": int(execution.get("created_relationships", 0)),
-            "used_tools": list(execution.get("used_tools", [])),
+            "used_tools": used_tools + list(execution.get("used_tools", [])),
         }
 
     def generate_assessment_summary(
@@ -2352,13 +2690,28 @@ class ChatService:
             "padding with lower-severity items dressed up as risks.\n"
             "- No explanation text outside the JSON object."
         )
-        parsed = self._call_model_for_json(
-            system_prompt=(
-                "You write steerco-grade architecture assessment summaries: concise, decision-oriented, and "
-                "strictly grounded in the data you're given. Output strict JSON only."
-            ),
-            user_prompt=summary_prompt,
+        summary_system_prompt = (
+            "You write steerco-grade architecture assessment summaries: concise, decision-oriented, and "
+            "strictly grounded in the data you're given. Output strict JSON only."
         )
+        summary_model = self.settings.azure_openai_summary_model
+        parsed: Dict[str, Any] | None = None
+        if summary_model:
+            try:
+                parsed = self._call_model_for_json_via_responses_api(
+                    model=summary_model, system_prompt=summary_system_prompt, user_prompt=summary_prompt
+                )
+            except Exception:  # noqa: BLE001
+                # This deployment might not actually be a Responses-API-only model, or might be
+                # temporarily unavailable -- either way, fall through to the normal Chat Completions
+                # path (which has its own model-tier fallback chain) rather than failing the summary.
+                parsed = None
+        if parsed is None:
+            parsed = self._call_model_for_json(
+                system_prompt=summary_system_prompt,
+                user_prompt=summary_prompt,
+                model_override=summary_model or None,
+            )
 
         def _str_list(raw: Any, *, max_items: int, max_len: int) -> List[str]:
             if not isinstance(raw, list):

@@ -88,6 +88,14 @@ RELATIONSHIPS: List[Tuple[str, str, str, str, str]] = [
         "BusinessProcess elements (rejected by the MCP server's validator), so Association is the "
         "correct type here with the semantic intent carried in the relationship name instead.",
     ),
+    (
+        "Gap",
+        "AssociationRelationship",
+        "BusinessProcess",
+        "Affects",
+        "Mapping & Gap Analysis: each identified gap is modeled as its own Gap element and linked "
+        "to the As-Is/To-Be process(es) it relates to, labeled 'affects' on the connection.",
+    ),
 ]
 
 

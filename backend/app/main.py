@@ -520,16 +520,14 @@ async def requirements_upload_action(
 
 @app.post("/api/actions/business-process-upload/preview", response_model=AutomationPlanResponse)
 async def business_process_upload_preview(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     view_name: str | None = Form(default=None),
 ) -> AutomationPlanResponse:
-    text, source_name, pdf_bytes = await _extract_text_from_upload(file)
+    uploads = [await _extract_text_from_upload(file) for file in files]
     try:
         plan = chat_service.plan_business_process_automation(
-            content_text=text,
-            source_name=source_name,
+            uploads=uploads,
             view_name=view_name,
-            pdf_bytes=pdf_bytes,
         )
     except HTTPException:
         raise
@@ -599,7 +597,7 @@ def apply_plan(payload: ApplyPlanRequest) -> ActionResponse:
 @app.get("/api/assessment/setup", response_model=AssessmentSetupResponse)
 def assessment_setup(
     ist_view_name: str = "As-Is Business Processes",
-    soll_view_name: str = "To-Be Architecture",
+    soll_view_name: str = "To-Be Business Processes",
 ) -> AssessmentSetupResponse:
     try:
         result = chat_service.assessment_setup(ist_view_name=ist_view_name, soll_view_name=soll_view_name)
@@ -610,16 +608,16 @@ def assessment_setup(
 
 @app.post("/api/assessment/soll-architecture/preview", response_model=AutomationPlanResponse)
 async def assessment_soll_architecture_preview(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
     view_name: str | None = Form(default=None),
+    ist_view_name: str | None = Form(default=None),
 ) -> AutomationPlanResponse:
-    text, source_name, pdf_bytes = await _extract_text_from_upload(file)
+    uploads = [await _extract_text_from_upload(file) for file in files]
     try:
         plan = chat_service.plan_soll_architecture(
-            content_text=text,
-            source_name=source_name,
+            uploads=uploads,
             view_name=view_name,
-            pdf_bytes=pdf_bytes,
+            ist_view_name=ist_view_name,
         )
     except HTTPException:
         raise
@@ -661,8 +659,11 @@ def assessment_mapping_preview(payload: MappingGapRequest) -> MappingGapResponse
 @app.post("/api/assessment/mapping/apply", response_model=MappingApplyResponse)
 def assessment_mapping_apply(payload: MappingApplyRequest) -> MappingApplyResponse:
     mapping_dicts = [m.model_dump() for m in payload.mappings]
+    gap_dicts = [g.model_dump() for g in payload.gaps]
     try:
-        result = chat_service.apply_mapping_relationships(mappings=mapping_dicts, view_name=payload.view_name)
+        result = chat_service.apply_mapping_relationships(
+            mappings=mapping_dicts, gaps=gap_dicts, view_name=payload.view_name
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

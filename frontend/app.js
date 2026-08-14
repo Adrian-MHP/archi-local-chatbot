@@ -26,9 +26,7 @@ const state = {
     currentStep: "setup",
     completedSteps: new Set(),
     pending: false,
-    istPlan: null,
-    sollPlan: null,
-    mappingResult: null,
+    pairs: [],
     summaryResult: null,
   },
 };
@@ -73,41 +71,24 @@ const elements = {
   metaModelModal: document.getElementById("metaModelModal"),
   metaModelCloseBtn: document.getElementById("metaModelCloseBtn"),
   metaModelBody: document.getElementById("metaModelBody"),
-  assessmentIstViewName: document.getElementById("assessmentIstViewName"),
-  assessmentSollViewName: document.getElementById("assessmentSollViewName"),
+  assessmentPairRows: document.getElementById("assessmentPairRows"),
+  assessmentPairAddBtn: document.getElementById("assessmentPairAddBtn"),
   assessmentSetupBtn: document.getElementById("assessmentSetupBtn"),
   assessmentSetupResult: document.getElementById("assessmentSetupResult"),
   assessmentSetupContinueBtn: document.getElementById("assessmentSetupContinueBtn"),
-  assessmentIstForm: document.getElementById("assessmentIstForm"),
-  assessmentIstFile: document.getElementById("assessmentIstFile"),
-  assessmentIstBtn: document.getElementById("assessmentIstBtn"),
-  assessmentIstStatus: document.getElementById("assessmentIstStatus"),
-  assessmentIstPreview: document.getElementById("assessmentIstPreview"),
-  assessmentIstCounts: document.getElementById("assessmentIstCounts"),
-  assessmentIstTable: document.getElementById("assessmentIstTable"),
-  assessmentIstDiscardBtn: document.getElementById("assessmentIstDiscardBtn"),
-  assessmentIstApplyBtn: document.getElementById("assessmentIstApplyBtn"),
+  assessmentIstApplyAllBtn: document.getElementById("assessmentIstApplyAllBtn"),
+  assessmentIstPairList: document.getElementById("assessmentIstPairList"),
   assessmentIstBackBtn: document.getElementById("assessmentIstBackBtn"),
   assessmentIstContinueBtn: document.getElementById("assessmentIstContinueBtn"),
-  assessmentSollForm: document.getElementById("assessmentSollForm"),
-  assessmentSollFile: document.getElementById("assessmentSollFile"),
-  assessmentSollBtn: document.getElementById("assessmentSollBtn"),
-  assessmentSollProposeBtn: document.getElementById("assessmentSollProposeBtn"),
-  assessmentSollStatus: document.getElementById("assessmentSollStatus"),
-  assessmentSollPreview: document.getElementById("assessmentSollPreview"),
-  assessmentSollCounts: document.getElementById("assessmentSollCounts"),
-  assessmentSollTable: document.getElementById("assessmentSollTable"),
-  assessmentSollDiscardBtn: document.getElementById("assessmentSollDiscardBtn"),
-  assessmentSollApplyBtn: document.getElementById("assessmentSollApplyBtn"),
+  assessmentSollApplyAllBtn: document.getElementById("assessmentSollApplyAllBtn"),
+  assessmentSollPairList: document.getElementById("assessmentSollPairList"),
   assessmentSollBackBtn: document.getElementById("assessmentSollBackBtn"),
   assessmentSollContinueBtn: document.getElementById("assessmentSollContinueBtn"),
+  assessmentPairingReview: document.getElementById("assessmentPairingReview"),
   assessmentMappingRunBtn: document.getElementById("assessmentMappingRunBtn"),
   assessmentMappingStatus: document.getElementById("assessmentMappingStatus"),
-  assessmentMappingResult: document.getElementById("assessmentMappingResult"),
-  assessmentMappingTable: document.getElementById("assessmentMappingTable"),
-  assessmentGapTable: document.getElementById("assessmentGapTable"),
-  assessmentMappingApplyBtn: document.getElementById("assessmentMappingApplyBtn"),
-  assessmentMappingViewName: document.getElementById("assessmentMappingViewName"),
+  assessmentMappingApplyAllBtn: document.getElementById("assessmentMappingApplyAllBtn"),
+  assessmentMappingPairList: document.getElementById("assessmentMappingPairList"),
   assessmentMappingBackBtn: document.getElementById("assessmentMappingBackBtn"),
   assessmentMappingContinueBtn: document.getElementById("assessmentMappingContinueBtn"),
   assessmentSummaryRunBtn: document.getElementById("assessmentSummaryRunBtn"),
@@ -118,6 +99,7 @@ const elements = {
   summaryHeadline: document.getElementById("summaryHeadline"),
   summaryReadinessBadge: document.getElementById("summaryReadinessBadge"),
   summaryStatRow: document.getElementById("summaryStatRow"),
+  summaryPairBreakdown: document.getElementById("summaryPairBreakdown"),
   summaryFindingsList: document.getElementById("summaryFindingsList"),
   summaryRisksList: document.getElementById("summaryRisksList"),
   summaryRecommendationText: document.getElementById("summaryRecommendationText"),
@@ -664,6 +646,15 @@ function setAssessmentStep(step) {
     if (panel) panel.classList.toggle("hidden", key !== step);
   });
   refreshAssessmentStepperClasses();
+  // Re-render per-pair lists on entry so a view name edited in Setup (after this step was already
+  // visited once) is reflected immediately, since view names double as the identifiers sent to the
+  // backend -- a stale card header could otherwise mislead the user about which source it's for.
+  if (step === "ist") renderAssessmentCaptureList("ist");
+  if (step === "soll") renderAssessmentCaptureList("soll");
+  if (step === "mapping") {
+    renderAssessmentPairingReview();
+    renderAssessmentMappingPairList();
+  }
 }
 
 function markAssessmentStepComplete(step) {
@@ -677,35 +668,171 @@ function markAssessmentStepComplete(step) {
   refreshAssessmentStepperClasses();
 }
 
-async function runAssessmentSetup() {
-  const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
-  const sollViewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
-  elements.assessmentSetupBtn.disabled = true;
-  elements.assessmentSetupResult.classList.add("hidden");
-  try {
-    const params = new URLSearchParams({ ist_view_name: istViewName, soll_view_name: sollViewName });
-    const res = await fetch(`/api/assessment/setup?${params.toString()}`);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Setup check failed (${res.status})`);
+/* ---------------- Multi-source pair model (Setup step 1) ---------------- */
 
-    const box = elements.assessmentSetupResult;
+function createAssessmentPair(index, suffix = "") {
+  const n = index + 1;
+  const istViewName = `As-Is Business Process Source ${n}${suffix}`;
+  const sollViewName = `To-Be Business Process Source ${n}${suffix}`;
+  return {
+    id: createId(),
+    istViewName,
+    sollViewName,
+    setupNotes: [],
+    setupChecked: false,
+    istFiles: [],
+    istPlan: null,
+    istApplied: false,
+    istStatus: { message: "", tone: "neutral" },
+    sollFiles: [],
+    sollPlan: null,
+    sollApplied: false,
+    sollStatus: { message: "", tone: "neutral" },
+    // mappingSollViewName is the human-in-the-loop-corrected pairing for step 4; starts equal to
+    // sollViewName but is independently editable so correcting it there doesn't silently rewrite
+    // what was typed in Setup.
+    mappingSollViewName: sollViewName,
+    mappingViewName: `${istViewName} to ${sollViewName} Mapping`,
+    mappingResult: null,
+    mappingApplied: false,
+    mappingStatus: { message: "", tone: "neutral" },
+  };
+}
+
+function getAssessmentPair(pairId) {
+  return state.assessment.pairs.find((p) => p.id === pairId) || null;
+}
+
+function addAssessmentPair() {
+  state.assessment.pairs.push(createAssessmentPair(state.assessment.pairs.length));
+  renderAssessmentPairRows();
+}
+
+function removeAssessmentPair(pairId) {
+  if (state.assessment.pairs.length <= 1) return;
+  state.assessment.pairs = state.assessment.pairs.filter((p) => p.id !== pairId);
+  renderAssessmentPairRows();
+}
+
+function findDuplicateAssessmentViewNames() {
+  const seen = new Set();
+  const duplicates = [];
+  const check = (name) => {
+    const key = String(name || "").trim().toLowerCase();
+    if (!key) return;
+    if (seen.has(key)) duplicates.push(name);
+    else seen.add(key);
+  };
+  for (const pair of state.assessment.pairs) {
+    check(pair.istViewName);
+    check(pair.sollViewName);
+  }
+  return duplicates;
+}
+
+function renderAssessmentPairRows() {
+  const container = elements.assessmentPairRows;
+  container.innerHTML = "";
+  state.assessment.pairs.forEach((pair, index) => {
+    const row = document.createElement("div");
+    row.className = "assessment-pair-row";
+
+    const badge = document.createElement("span");
+    badge.className = "file-order-badge";
+    badge.textContent = String(index + 1);
+    row.appendChild(badge);
+
+    const fieldRow = document.createElement("div");
+    fieldRow.className = "assessment-field-row";
+
+    const istLabel = document.createElement("label");
+    istLabel.textContent = "As-Is Input / View";
+    const istInput = document.createElement("input");
+    istInput.type = "text";
+    istInput.maxLength = 120;
+    istInput.value = pair.istViewName;
+    istInput.addEventListener("input", () => {
+      pair.istViewName = istInput.value;
+    });
+    istLabel.appendChild(istInput);
+    fieldRow.appendChild(istLabel);
+
+    const sollLabel = document.createElement("label");
+    sollLabel.textContent = "To-Be Input / View";
+    const sollInput = document.createElement("input");
+    sollInput.type = "text";
+    sollInput.maxLength = 120;
+    sollInput.value = pair.sollViewName;
+    sollInput.addEventListener("input", () => {
+      pair.sollViewName = sollInput.value;
+    });
+    sollLabel.appendChild(sollInput);
+    fieldRow.appendChild(sollLabel);
+
+    row.appendChild(fieldRow);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "file-order-remove";
+    removeBtn.textContent = "×";
+    removeBtn.title = "Remove this source pair";
+    removeBtn.disabled = state.assessment.pairs.length <= 1;
+    removeBtn.addEventListener("click", () => removeAssessmentPair(pair.id));
+    row.appendChild(removeBtn);
+
+    container.appendChild(row);
+  });
+}
+
+async function runAssessmentSetup() {
+  const box = elements.assessmentSetupResult;
+  const duplicates = findDuplicateAssessmentViewNames();
+  if (duplicates.length) {
     box.innerHTML = "";
     box.classList.remove("hidden");
-    for (const note of data.notes || []) {
-      const p = document.createElement("p");
-      p.textContent = note;
-      box.appendChild(p);
+    const p = document.createElement("p");
+    p.textContent = `Error: view names must be unique across pairs. Duplicate: ${duplicates.join(", ")}`;
+    box.appendChild(p);
+    return;
+  }
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentSetupBtn.disabled = true;
+  box.classList.add("hidden");
+  try {
+    for (const pair of state.assessment.pairs) {
+      const params = new URLSearchParams({ ist_view_name: pair.istViewName, soll_view_name: pair.sollViewName });
+      const res = await fetch(`/api/assessment/setup?${params.toString()}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Setup check failed for '${pair.istViewName}' (${res.status})`);
+      pair.setupNotes = data.notes || [];
+      pair.setupChecked = true;
     }
+    box.innerHTML = "";
+    box.classList.remove("hidden");
+    state.assessment.pairs.forEach((pair, index) => {
+      const group = document.createElement("div");
+      group.className = "assessment-result-pair-group";
+      const heading = document.createElement("strong");
+      heading.textContent = `Pair ${index + 1}: ${pair.istViewName} / ${pair.sollViewName}`;
+      group.appendChild(heading);
+      for (const note of pair.setupNotes) {
+        const p = document.createElement("p");
+        p.textContent = note;
+        group.appendChild(p);
+      }
+      box.appendChild(group);
+    });
     elements.assessmentSetupContinueBtn.disabled = false;
     markAssessmentStepComplete("setup");
   } catch (err) {
-    const box = elements.assessmentSetupResult;
     box.innerHTML = "";
     box.classList.remove("hidden");
     const p = document.createElement("p");
     p.textContent = `Error: ${err.message || String(err)}`;
     box.appendChild(p);
   } finally {
+    state.assessment.pending = false;
     elements.assessmentSetupBtn.disabled = false;
   }
 }
@@ -769,160 +896,365 @@ function renderAssessmentElementsTable(plan, tbodyEl, countsEl) {
   if (countsEl) updateAssessmentCounts(plan, countsEl);
 }
 
-async function loadAssessmentIstPreview() {
-  const file = elements.assessmentIstFile.files && elements.assessmentIstFile.files[0];
-  if (!file) {
-    setAssessmentStatus(elements.assessmentIstStatus, "Select a file first.", "error");
+/* ---------------- Multi-file drag-drop ordering (As-Is / To-Be uploads) ---------------- */
+
+function uploadErrorMessage(res, data) {
+  if (data && data.detail) return data.detail;
+  if (res.status === 413) {
+    return "These files are too large combined. Try uploading fewer files at once, or split large documents.";
+  }
+  return `Preview failed (${res.status})`;
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderFileOrderList(listEl, files, { onRemove, onReorder }) {
+  listEl.innerHTML = "";
+  let dragIndex = null;
+
+  files.forEach((file, index) => {
+    const li = document.createElement("li");
+    li.className = "file-order-item";
+    li.draggable = true;
+
+    const handle = document.createElement("span");
+    handle.className = "file-order-handle";
+    handle.textContent = "⣿";
+    handle.setAttribute("aria-hidden", "true");
+    li.appendChild(handle);
+
+    const badge = document.createElement("span");
+    badge.className = "file-order-badge";
+    badge.textContent = String(index + 1);
+    li.appendChild(badge);
+
+    const info = document.createElement("span");
+    info.className = "file-order-info";
+    const name = document.createElement("span");
+    name.className = "file-order-name";
+    name.textContent = file.name;
+    name.title = file.name;
+    const size = document.createElement("span");
+    size.className = "file-order-size";
+    size.textContent = formatFileSize(file.size);
+    info.appendChild(name);
+    info.appendChild(size);
+    li.appendChild(info);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "file-order-remove";
+    removeBtn.textContent = "×";
+    removeBtn.title = "Remove this file";
+    removeBtn.addEventListener("click", () => onRemove(index));
+    li.appendChild(removeBtn);
+
+    li.addEventListener("dragstart", (event) => {
+      dragIndex = index;
+      li.classList.add("dragging");
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+    });
+    li.addEventListener("dragend", () => {
+      li.classList.remove("dragging");
+      listEl.querySelectorAll(".file-order-item").forEach((item) => item.classList.remove("drag-over"));
+      dragIndex = null;
+    });
+    li.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      if (dragIndex === null || dragIndex === index) return;
+      li.classList.add("drag-over");
+    });
+    li.addEventListener("dragleave", () => {
+      li.classList.remove("drag-over");
+    });
+    li.addEventListener("drop", (event) => {
+      event.preventDefault();
+      li.classList.remove("drag-over");
+      if (dragIndex === null || dragIndex === index) return;
+      onReorder(dragIndex, index);
+    });
+
+    listEl.appendChild(li);
+  });
+}
+
+function renderPlanWarningsBox(boxEl, warnings) {
+  boxEl.innerHTML = "";
+  if (!warnings || !warnings.length) {
+    boxEl.classList.add("hidden");
+    return;
+  }
+  boxEl.classList.remove("hidden");
+  for (const message of warnings) {
+    const p = document.createElement("p");
+    p.textContent = message;
+    boxEl.appendChild(p);
+  }
+}
+
+/* ---------------- Steps 2 & 3: per-pair, side-parameterized capture ---------------- */
+
+function getPairFiles(pair, side) {
+  return side === "ist" ? pair.istFiles : pair.sollFiles;
+}
+function setPairFiles(pair, side, files) {
+  if (side === "ist") pair.istFiles = files;
+  else pair.sollFiles = files;
+}
+function getPairPlan(pair, side) {
+  return side === "ist" ? pair.istPlan : pair.sollPlan;
+}
+function setPairPlan(pair, side, plan) {
+  if (side === "ist") pair.istPlan = plan;
+  else pair.sollPlan = plan;
+}
+function getPairApplied(pair, side) {
+  return side === "ist" ? pair.istApplied : pair.sollApplied;
+}
+function setPairApplied(pair, side, val) {
+  if (side === "ist") pair.istApplied = val;
+  else pair.sollApplied = val;
+}
+function getPairStatus(pair, side) {
+  return side === "ist" ? pair.istStatus : pair.sollStatus;
+}
+function setPairStatus(pair, side, message, tone) {
+  const status = { message, tone };
+  if (side === "ist") pair.istStatus = status;
+  else pair.sollStatus = status;
+}
+function getPairViewName(pair, side) {
+  return side === "ist" ? pair.istViewName : pair.sollViewName;
+}
+
+function buildAssessmentCaptureCard(pair, side) {
+  const card = document.createElement("div");
+  card.className = "assessment-pair-capture-card";
+
+  const head = document.createElement("div");
+  head.className = "assessment-pair-card-head";
+  const title = document.createElement("h4");
+  title.textContent = getPairViewName(pair, side);
+  head.appendChild(title);
+  const statusBadge = document.createElement("span");
+  statusBadge.className = "assessment-pair-card-status";
+  statusBadge.textContent = getPairApplied(pair, side) ? "Created in Archi" : "Not yet created";
+  statusBadge.dataset.state = getPairApplied(pair, side) ? "done" : "pending";
+  head.appendChild(statusBadge);
+  card.appendChild(head);
+
+  const form = document.createElement("form");
+  form.className = "action-form";
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = ".pdf,.xlsx,.xlsm,.csv,.txt,.md,.json";
+  fileInput.multiple = true;
+  const submitBtn = document.createElement("button");
+  submitBtn.type = "submit";
+  submitBtn.className = "btn primary";
+  submitBtn.textContent = "Preview extraction";
+  form.appendChild(fileInput);
+  form.appendChild(submitBtn);
+  card.appendChild(form);
+
+  const files = getPairFiles(pair, side);
+  const orderHint = document.createElement("p");
+  orderHint.className = "file-order-hint";
+  orderHint.textContent =
+    "Multiple files selected. Drag to arrange them in the order their processes connect -- the last step of each file will be chained to the first step of the next.";
+  orderHint.classList.toggle("hidden", files.length < 2);
+  card.appendChild(orderHint);
+
+  const fileListEl = document.createElement("ul");
+  fileListEl.className = "file-order-list";
+  fileListEl.classList.toggle("hidden", files.length === 0);
+  card.appendChild(fileListEl);
+  renderFileOrderList(fileListEl, files, {
+    onRemove: (index) => {
+      setPairFiles(pair, side, getPairFiles(pair, side).filter((_f, i) => i !== index));
+      renderAssessmentCaptureList(side);
+    },
+    onReorder: (fromIndex, toIndex) => {
+      const updated = [...getPairFiles(pair, side)];
+      const [moved] = updated.splice(fromIndex, 1);
+      updated.splice(toIndex, 0, moved);
+      setPairFiles(pair, side, updated);
+      renderAssessmentCaptureList(side);
+    },
+  });
+
+  const statusEl = document.createElement("div");
+  statusEl.className = "action-status";
+  const status = getPairStatus(pair, side);
+  if (status && status.message) {
+    statusEl.textContent = status.message;
+    statusEl.classList.add(`action-${status.tone || "neutral"}`);
+  } else {
+    statusEl.classList.add("hidden");
+  }
+  card.appendChild(statusEl);
+
+  const plan = getPairPlan(pair, side);
+  const previewEl = document.createElement("div");
+  previewEl.className = "assessment-preview";
+  previewEl.classList.toggle("hidden", !plan);
+  const countsEl = document.createElement("div");
+  countsEl.className = "preview-counts";
+  previewEl.appendChild(countsEl);
+  const warningsEl = document.createElement("div");
+  warningsEl.className = "preview-warnings hidden";
+  previewEl.appendChild(warningsEl);
+  const tableScroll = document.createElement("div");
+  tableScroll.className = "table-scroll";
+  const table = document.createElement("table");
+  table.className = "preview-table";
+  table.innerHTML = `<thead><tr><th class="col-check"></th><th>Type</th><th>Name</th></tr></thead><tbody></tbody>`;
+  tableScroll.appendChild(table);
+  previewEl.appendChild(tableScroll);
+  const actionsEl = document.createElement("div");
+  actionsEl.className = "preview-actions";
+  const discardBtn = document.createElement("button");
+  discardBtn.type = "button";
+  discardBtn.className = "btn ghost";
+  discardBtn.textContent = "Discard";
+  const applyBtn = document.createElement("button");
+  applyBtn.type = "button";
+  applyBtn.className = "btn primary";
+  applyBtn.textContent = "Create in Archi";
+  actionsEl.appendChild(discardBtn);
+  actionsEl.appendChild(applyBtn);
+  previewEl.appendChild(actionsEl);
+  card.appendChild(previewEl);
+
+  if (plan) {
+    renderAssessmentElementsTable(plan, table.querySelector("tbody"), countsEl);
+    renderPlanWarningsBox(warningsEl, plan.warnings);
+  }
+
+  if (side === "soll") {
+    const divider = document.createElement("div");
+    divider.className = "assessment-or-divider";
+    divider.textContent = "or";
+    card.appendChild(divider);
+    const proposeBtn = document.createElement("button");
+    proposeBtn.type = "button";
+    proposeBtn.className = "btn primary";
+    proposeBtn.textContent = "Propose To-Be Architecture (AI)";
+    proposeBtn.addEventListener("click", () => proposeAssessmentPairSollArchitecture(pair.id));
+    card.appendChild(proposeBtn);
+  }
+
+  fileInput.addEventListener("change", () => {
+    setPairFiles(pair, side, [...getPairFiles(pair, side), ...Array.from(fileInput.files || [])]);
+    fileInput.value = "";
+    renderAssessmentCaptureList(side);
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await loadAssessmentPairPreview(pair.id, side);
+  });
+  discardBtn.addEventListener("click", () => discardAssessmentPairPlan(pair.id, side));
+  applyBtn.addEventListener("click", () => applyAssessmentPairPlan(pair.id, side));
+
+  return card;
+}
+
+function renderAssessmentCaptureList(side) {
+  const container = side === "ist" ? elements.assessmentIstPairList : elements.assessmentSollPairList;
+  container.innerHTML = "";
+  for (const pair of state.assessment.pairs) {
+    container.appendChild(buildAssessmentCaptureCard(pair, side));
+  }
+}
+
+async function loadAssessmentPairPreview(pairId, side) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair) return;
+  const files = getPairFiles(pair, side);
+  if (!files.length) {
+    setPairStatus(pair, side, "Select at least one file first.", "error");
+    renderAssessmentCaptureList(side);
     return;
   }
   if (state.assessment.pending) return;
   state.assessment.pending = true;
-  elements.assessmentIstBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentIstStatus, `Extracting preview from '${file.name}'...`, "pending");
+  const label = files.length === 1 ? `'${files[0].name}'` : `${files.length} files`;
+  setPairStatus(pair, side, `Extracting preview from ${label}...`, "pending");
+  renderAssessmentCaptureList(side);
   try {
     const formData = new FormData();
-    formData.append("file", file);
-    formData.append("view_name", elements.assessmentIstViewName.value.trim() || "As-Is Business Processes");
-    const res = await fetch("/api/actions/business-process-upload/preview", { method: "POST", body: formData });
+    for (const file of files) formData.append("files", file);
+    formData.append("view_name", getPairViewName(pair, side));
+    let endpoint = "/api/actions/business-process-upload/preview";
+    if (side === "soll") {
+      endpoint = "/api/assessment/soll-architecture/preview";
+      formData.append("ist_view_name", pair.istViewName);
+    }
+    const res = await fetch(endpoint, { method: "POST", body: formData });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
-    state.assessment.istPlan = data;
-    elements.assessmentIstPreview.classList.remove("hidden");
-    renderAssessmentElementsTable(data, elements.assessmentIstTable.querySelector("tbody"), elements.assessmentIstCounts);
-    setAssessmentStatus(
-      elements.assessmentIstStatus,
+    if (!res.ok) throw new Error(uploadErrorMessage(res, data));
+    setPairPlan(pair, side, data);
+    setPairStatus(
+      pair,
+      side,
       `Preview ready: ${data.elements.length} elements, ${data.relationships.length} relationships. Review, then click "Create in Archi".`,
       "ok"
     );
-    elements.assessmentIstFile.value = "";
+    setPairFiles(pair, side, []);
   } catch (err) {
-    setAssessmentStatus(elements.assessmentIstStatus, `Error: ${err.message || String(err)}`, "error");
+    setPairStatus(pair, side, `Error: ${err.message || String(err)}`, "error");
   } finally {
     state.assessment.pending = false;
-    elements.assessmentIstBtn.disabled = false;
+    renderAssessmentCaptureList(side);
   }
 }
 
-async function applyAssessmentIstPlan() {
-  const plan = state.assessment.istPlan;
-  if (!plan || state.assessment.pending) return;
-  if (!plan.elements.some((el) => el.include)) {
-    setAssessmentStatus(elements.assessmentIstStatus, "Select at least one element before applying.", "error");
-    return;
-  }
+async function proposeAssessmentPairSollArchitecture(pairId) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair || state.assessment.pending) return;
   state.assessment.pending = true;
-  elements.assessmentIstApplyBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentIstStatus, `Creating '${plan.view_name}' in Archi...`, "pending");
+  setPairStatus(pair, "soll", "Generating a To-Be Architecture proposal from the As-Is processes...", "pending");
+  renderAssessmentCaptureList("soll");
   try {
-    const res = await fetch("/api/actions/apply", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Apply failed (${res.status})`);
-    setAssessmentStatus(elements.assessmentIstStatus, data.summary || "Applied to Archi.", "ok");
-    pushActionLogEntry({
-      action: "business-process-upload",
-      viewName: data.view_name || plan.view_name,
-      summary: data.summary || "Applied to Archi.",
-      tone: "ok",
-    });
-    markAssessmentStepComplete("ist");
-    elements.assessmentIstContinueBtn.disabled = false;
-    state.assessment.istPlan = null;
-    elements.assessmentIstPreview.classList.add("hidden");
-    await loadHealth();
-    await loadTools();
-  } catch (err) {
-    setAssessmentStatus(elements.assessmentIstStatus, `Error: ${err.message || String(err)}`, "error");
-  } finally {
-    state.assessment.pending = false;
-    elements.assessmentIstApplyBtn.disabled = false;
-  }
-}
-
-function discardAssessmentIstPlan() {
-  state.assessment.istPlan = null;
-  elements.assessmentIstPreview.classList.add("hidden");
-  setAssessmentStatus(elements.assessmentIstStatus, "Preview discarded. Nothing was written to Archi.", "neutral");
-}
-
-async function loadAssessmentSollPreview() {
-  const file = elements.assessmentSollFile.files && elements.assessmentSollFile.files[0];
-  if (!file) {
-    setAssessmentStatus(elements.assessmentSollStatus, "Select a file first.", "error");
-    return;
-  }
-  if (state.assessment.pending) return;
-  state.assessment.pending = true;
-  elements.assessmentSollBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentSollStatus, `Extracting preview from '${file.name}'...`, "pending");
-  try {
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("view_name", elements.assessmentSollViewName.value.trim() || "To-Be Architecture");
-    const res = await fetch("/api/assessment/soll-architecture/preview", { method: "POST", body: formData });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Preview failed (${res.status})`);
-    state.assessment.sollPlan = data;
-    elements.assessmentSollPreview.classList.remove("hidden");
-    renderAssessmentElementsTable(data, elements.assessmentSollTable.querySelector("tbody"), elements.assessmentSollCounts);
-    setAssessmentStatus(
-      elements.assessmentSollStatus,
-      `Preview ready: ${data.elements.length} elements, ${data.relationships.length} relationships (tagged status=target). Review, then click "Create in Archi".`,
-      "ok"
-    );
-    elements.assessmentSollFile.value = "";
-  } catch (err) {
-    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
-  } finally {
-    state.assessment.pending = false;
-    elements.assessmentSollBtn.disabled = false;
-  }
-}
-
-async function proposeAssessmentSollArchitecture() {
-  if (state.assessment.pending) return;
-  state.assessment.pending = true;
-  elements.assessmentSollProposeBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentSollStatus, "Generating a To-Be Architecture proposal from the As-Is processes...", "pending");
-  try {
-    const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
-    const viewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
     const res = await fetch("/api/assessment/soll-architecture/propose", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ist_view_name: istViewName, view_name: viewName }),
+      body: JSON.stringify({ ist_view_name: pair.istViewName, view_name: pair.sollViewName }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Proposal failed (${res.status})`);
-    state.assessment.sollPlan = data;
-    elements.assessmentSollPreview.classList.remove("hidden");
-    renderAssessmentElementsTable(data, elements.assessmentSollTable.querySelector("tbody"), elements.assessmentSollCounts);
-    setAssessmentStatus(
-      elements.assessmentSollStatus,
+    setPairPlan(pair, "soll", data);
+    setPairStatus(
+      pair,
+      "soll",
       `Proposal ready: ${data.elements.length} processes, ${data.relationships.length} relationships (tagged status=target). Review carefully, then click "Create in Archi".`,
       "ok"
     );
   } catch (err) {
-    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
+    setPairStatus(pair, "soll", `Error: ${err.message || String(err)}`, "error");
   } finally {
     state.assessment.pending = false;
-    elements.assessmentSollProposeBtn.disabled = false;
+    renderAssessmentCaptureList("soll");
   }
 }
 
-async function applyAssessmentSollPlan() {
-  const plan = state.assessment.sollPlan;
+async function applyAssessmentPairPlan(pairId, side) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair) return;
+  const plan = getPairPlan(pair, side);
   if (!plan || state.assessment.pending) return;
   if (!plan.elements.some((el) => el.include)) {
-    setAssessmentStatus(elements.assessmentSollStatus, "Select at least one element before applying.", "error");
+    setPairStatus(pair, side, "Select at least one element before applying.", "error");
+    renderAssessmentCaptureList(side);
     return;
   }
   state.assessment.pending = true;
-  elements.assessmentSollApplyBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentSollStatus, `Creating '${plan.view_name}' in Archi...`, "pending");
+  setPairStatus(pair, side, `Creating '${plan.view_name}' in Archi...`, "pending");
+  renderAssessmentCaptureList(side);
   try {
     const res = await fetch("/api/actions/apply", {
       method: "POST",
@@ -931,31 +1263,53 @@ async function applyAssessmentSollPlan() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Apply failed (${res.status})`);
-    setAssessmentStatus(elements.assessmentSollStatus, data.summary || "Applied to Archi.", "ok");
+    setPairStatus(pair, side, data.summary || "Applied to Archi.", "ok");
     pushActionLogEntry({
-      action: "assessment-soll-upload",
+      action: side === "ist" ? "business-process-upload" : "assessment-soll-upload",
       viewName: data.view_name || plan.view_name,
       summary: data.summary || "Applied to Archi.",
       tone: "ok",
     });
-    markAssessmentStepComplete("soll");
-    elements.assessmentSollContinueBtn.disabled = false;
-    state.assessment.sollPlan = null;
-    elements.assessmentSollPreview.classList.add("hidden");
+    setPairApplied(pair, side, true);
+    setPairPlan(pair, side, null);
+    updateAssessmentCaptureContinueState(side);
     await loadHealth();
     await loadTools();
   } catch (err) {
-    setAssessmentStatus(elements.assessmentSollStatus, `Error: ${err.message || String(err)}`, "error");
+    setPairStatus(pair, side, `Error: ${err.message || String(err)}`, "error");
   } finally {
     state.assessment.pending = false;
-    elements.assessmentSollApplyBtn.disabled = false;
+    renderAssessmentCaptureList(side);
   }
 }
 
-function discardAssessmentSollPlan() {
-  state.assessment.sollPlan = null;
-  elements.assessmentSollPreview.classList.add("hidden");
-  setAssessmentStatus(elements.assessmentSollStatus, "Preview discarded. Nothing was written to Archi.", "neutral");
+async function applyAllAssessmentPairPlans(side) {
+  if (state.assessment.pending) return;
+  for (const pair of state.assessment.pairs) {
+    const plan = getPairPlan(pair, side);
+    if (plan && !getPairApplied(pair, side)) {
+      await applyAssessmentPairPlan(pair.id, side);
+    }
+  }
+}
+
+function discardAssessmentPairPlan(pairId, side) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair) return;
+  setPairPlan(pair, side, null);
+  setPairStatus(pair, side, "Preview discarded. Nothing was written to Archi.", "neutral");
+  renderAssessmentCaptureList(side);
+}
+
+function updateAssessmentCaptureContinueState(side) {
+  const allApplied = state.assessment.pairs.every((p) => getPairApplied(p, side));
+  if (side === "ist") {
+    elements.assessmentIstContinueBtn.disabled = !allApplied;
+    if (allApplied) markAssessmentStepComplete("ist");
+  } else {
+    elements.assessmentSollContinueBtn.disabled = !allApplied;
+    if (allApplied) markAssessmentStepComplete("soll");
+  }
 }
 
 function freshAssessmentViewNameStamp() {
@@ -972,40 +1326,33 @@ function startNewAssessment() {
   // one's data -- mapping is scoped to whatever's actually on the configured As-Is/To-Be views, so
   // a genuinely fresh, non-colliding name is what makes "start new assessment" actually mean it.
   const stamp = freshAssessmentViewNameStamp();
-  elements.assessmentIstViewName.value = `As-Is Business Processes (${stamp})`;
-  elements.assessmentSollViewName.value = `To-Be Architecture (${stamp})`;
-  elements.assessmentMappingViewName.value = `As-Is To-Be Mapping (${stamp})`;
-
-  elements.assessmentIstFile.value = "";
-  elements.assessmentSollFile.value = "";
+  state.assessment = {
+    currentStep: "setup",
+    completedSteps: new Set(),
+    pending: false,
+    pairs: [createAssessmentPair(0, ` (${stamp})`)],
+    summaryResult: null,
+  };
 
   elements.assessmentSetupResult.classList.add("hidden");
   elements.assessmentSetupContinueBtn.disabled = true;
-  elements.assessmentIstStatus.classList.add("hidden");
-  elements.assessmentIstPreview.classList.add("hidden");
   elements.assessmentIstContinueBtn.disabled = true;
-  elements.assessmentSollStatus.classList.add("hidden");
-  elements.assessmentSollPreview.classList.add("hidden");
   elements.assessmentSollContinueBtn.disabled = true;
   elements.assessmentMappingStatus.classList.add("hidden");
-  elements.assessmentMappingResult.classList.add("hidden");
   elements.assessmentMappingContinueBtn.disabled = true;
   elements.assessmentSummaryStatus.classList.add("hidden");
   elements.assessmentSummaryResult.classList.add("hidden");
+  elements.summaryPairBreakdown.classList.add("hidden");
 
   document.querySelectorAll(".assessment-step-btn").forEach((btn) => {
     btn.disabled = btn.dataset.step !== "setup";
   });
 
-  state.assessment = {
-    currentStep: "setup",
-    completedSteps: new Set(),
-    pending: false,
-    istPlan: null,
-    sollPlan: null,
-    mappingResult: null,
-    summaryResult: null,
-  };
+  renderAssessmentPairRows();
+  renderAssessmentCaptureList("ist");
+  renderAssessmentCaptureList("soll");
+  renderAssessmentPairingReview();
+  renderAssessmentMappingPairList();
   setAssessmentStep("setup");
 }
 
@@ -1025,8 +1372,7 @@ const ASSESSMENT_CATEGORY_LABELS = {
   tooling_data_gap: "Tooling / data gap",
 };
 
-function renderAssessmentMappingTable(data) {
-  const tbody = elements.assessmentMappingTable.querySelector("tbody");
+function renderAssessmentMappingTable(data, tbody) {
   tbody.innerHTML = "";
   if (!data.mappings.length) {
     const tr = document.createElement("tr");
@@ -1083,8 +1429,7 @@ function renderAssessmentMappingTable(data) {
   });
 }
 
-function renderAssessmentGapTable(data) {
-  const tbody = elements.assessmentGapTable.querySelector("tbody");
+function renderAssessmentGapTable(data, tbody) {
   tbody.innerHTML = "";
   if (!data.gaps.length) {
     const tr = document.createElement("tr");
@@ -1118,74 +1463,234 @@ function renderAssessmentGapTable(data) {
   });
 }
 
-async function runAssessmentMapping() {
-  if (state.assessment.pending) return;
-  state.assessment.pending = true;
-  elements.assessmentMappingRunBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentMappingStatus, "Running mapping & gap analysis...", "pending");
+function renderAssessmentPairingReview() {
+  const container = elements.assessmentPairingReview;
+  container.innerHTML = "";
+  const heading = document.createElement("strong");
+  heading.textContent = "Confirm As-Is → To-Be pairing";
+  container.appendChild(heading);
+  state.assessment.pairs.forEach((pair) => {
+    const row = document.createElement("div");
+    row.className = "assessment-pairing-review-row";
+
+    const istLabel = document.createElement("span");
+    istLabel.className = "pairing-ist-label";
+    istLabel.textContent = pair.istViewName;
+    row.appendChild(istLabel);
+
+    const arrow = document.createElement("span");
+    arrow.className = "pairing-arrow";
+    arrow.textContent = "→";
+    row.appendChild(arrow);
+
+    const select = document.createElement("select");
+    state.assessment.pairs.forEach((candidate) => {
+      const option = document.createElement("option");
+      option.value = candidate.sollViewName;
+      option.textContent = candidate.sollViewName;
+      if (candidate.sollViewName === pair.mappingSollViewName) option.selected = true;
+      select.appendChild(option);
+    });
+    select.addEventListener("change", () => {
+      pair.mappingSollViewName = select.value;
+    });
+    row.appendChild(select);
+
+    container.appendChild(row);
+  });
+}
+
+async function runAssessmentMappingForPair(pairId) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair) return;
+  pair.mappingStatus = { message: "Running mapping & gap analysis...", tone: "pending" };
+  renderAssessmentMappingPairList();
   try {
-    const istViewName = elements.assessmentIstViewName.value.trim() || "As-Is Business Processes";
-    const sollViewName = elements.assessmentSollViewName.value.trim() || "To-Be Architecture";
     const res = await fetch("/api/assessment/mapping/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ist_view_name: istViewName, soll_view_name: sollViewName }),
+      body: JSON.stringify({ ist_view_name: pair.istViewName, soll_view_name: pair.mappingSollViewName }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Mapping analysis failed (${res.status})`);
-    state.assessment.mappingResult = data;
-    elements.assessmentMappingResult.classList.remove("hidden");
-    renderAssessmentMappingTable(data);
-    renderAssessmentGapTable(data);
+    pair.mappingResult = data;
     const warningText = data.warnings && data.warnings.length ? ` (${data.warnings.join(" ")})` : "";
+    pair.mappingStatus = {
+      message: `Found ${data.mappings.length} mapping(s) and ${data.gaps.length} gap(s).${warningText}`,
+      tone: "ok",
+    };
+  } catch (err) {
+    pair.mappingStatus = { message: `Error: ${err.message || String(err)}`, tone: "error" };
+  }
+  renderAssessmentMappingPairList();
+}
+
+async function runAssessmentMappingAllPairs() {
+  if (state.assessment.pending) return;
+  state.assessment.pending = true;
+  elements.assessmentMappingRunBtn.disabled = true;
+  const pairs = state.assessment.pairs;
+  let failures = 0;
+  for (let i = 0; i < pairs.length; i++) {
     setAssessmentStatus(
       elements.assessmentMappingStatus,
-      `Found ${data.mappings.length} mapping(s) and ${data.gaps.length} gap(s).${warningText}`,
-      "ok"
+      `Running pair ${i + 1} of ${pairs.length}: '${pairs[i].istViewName}' -> '${pairs[i].mappingSollViewName}'...`,
+      "pending"
     );
-  } catch (err) {
-    setAssessmentStatus(elements.assessmentMappingStatus, `Error: ${err.message || String(err)}`, "error");
-  } finally {
-    state.assessment.pending = false;
-    elements.assessmentMappingRunBtn.disabled = false;
+    await runAssessmentMappingForPair(pairs[i].id);
+    if (pairs[i].mappingStatus.tone === "error") failures += 1;
+  }
+  const okCount = pairs.length - failures;
+  setAssessmentStatus(
+    elements.assessmentMappingStatus,
+    failures
+      ? `${okCount} of ${pairs.length} pair(s) completed; ${failures} failed. See each pair's card for details.`
+      : `Mapping & gap analysis complete for all ${pairs.length} pair(s).`,
+    failures ? "error" : "ok"
+  );
+  state.assessment.pending = false;
+  elements.assessmentMappingRunBtn.disabled = false;
+}
+
+function buildAssessmentMappingCard(pair) {
+  const card = document.createElement("div");
+  card.className = "assessment-pair-mapping-card";
+
+  const head = document.createElement("div");
+  head.className = "assessment-pair-card-head";
+  const title = document.createElement("h4");
+  title.textContent = `${pair.istViewName} ↔ ${pair.mappingSollViewName}`;
+  head.appendChild(title);
+  const statusBadge = document.createElement("span");
+  statusBadge.className = "assessment-pair-card-status";
+  statusBadge.textContent = pair.mappingApplied ? "Applied" : pair.mappingResult ? "Ready to apply" : "Not yet run";
+  statusBadge.dataset.state = pair.mappingApplied ? "done" : "pending";
+  head.appendChild(statusBadge);
+  card.appendChild(head);
+
+  const statusEl = document.createElement("div");
+  statusEl.className = "action-status";
+  if (pair.mappingStatus && pair.mappingStatus.message) {
+    statusEl.textContent = pair.mappingStatus.message;
+    statusEl.classList.add(`action-${pair.mappingStatus.tone || "neutral"}`);
+  } else {
+    statusEl.classList.add("hidden");
+  }
+  card.appendChild(statusEl);
+
+  if (pair.mappingResult) {
+    const mapHeading = document.createElement("h4");
+    mapHeading.textContent = "Mappings";
+    card.appendChild(mapHeading);
+    const mapScroll = document.createElement("div");
+    mapScroll.className = "table-scroll";
+    const mapTable = document.createElement("table");
+    mapTable.className = "preview-table";
+    mapTable.innerHTML =
+      "<thead><tr><th class=\"col-check\"></th><th>As-Is process</th><th>Match</th><th>To-Be process</th><th>Rationale</th></tr></thead><tbody></tbody>";
+    mapScroll.appendChild(mapTable);
+    card.appendChild(mapScroll);
+
+    const gapHeading = document.createElement("h4");
+    gapHeading.textContent = "Gap report";
+    card.appendChild(gapHeading);
+    const gapScroll = document.createElement("div");
+    gapScroll.className = "table-scroll";
+    const gapTable = document.createElement("table");
+    gapTable.className = "preview-table";
+    gapTable.innerHTML = "<thead><tr><th>Category</th><th>Criticality</th><th>Description</th></tr></thead><tbody></tbody>";
+    gapScroll.appendChild(gapTable);
+    card.appendChild(gapScroll);
+
+    renderAssessmentMappingTable(pair.mappingResult, mapTable.querySelector("tbody"));
+    renderAssessmentGapTable(pair.mappingResult, gapTable.querySelector("tbody"));
+
+    const viewNameLabel = document.createElement("label");
+    viewNameLabel.className = "assessment-mapping-view-name-label";
+    viewNameLabel.textContent = "Mapping view name";
+    const viewNameInput = document.createElement("input");
+    viewNameInput.type = "text";
+    viewNameInput.maxLength = 120;
+    viewNameInput.value = pair.mappingViewName;
+    viewNameInput.addEventListener("input", () => {
+      pair.mappingViewName = viewNameInput.value;
+    });
+    viewNameLabel.appendChild(viewNameInput);
+    card.appendChild(viewNameLabel);
+
+    const actions = document.createElement("div");
+    actions.className = "preview-actions";
+    const applyBtn = document.createElement("button");
+    applyBtn.type = "button";
+    applyBtn.className = "btn primary";
+    applyBtn.textContent = "Apply mapping to Archi";
+    applyBtn.addEventListener("click", () => applyAssessmentMappingsForPair(pair.id));
+    actions.appendChild(applyBtn);
+    card.appendChild(actions);
+  }
+
+  return card;
+}
+
+function renderAssessmentMappingPairList() {
+  const container = elements.assessmentMappingPairList;
+  container.innerHTML = "";
+  for (const pair of state.assessment.pairs) {
+    container.appendChild(buildAssessmentMappingCard(pair));
   }
 }
 
-async function applyAssessmentMappings() {
-  const result = state.assessment.mappingResult;
-  if (!result || state.assessment.pending) return;
-  const included = result.mappings.filter((m) => m.include && (m.ist_key || m.soll_key));
+async function applyAssessmentMappingsForPair(pairId) {
+  const pair = getAssessmentPair(pairId);
+  if (!pair || !pair.mappingResult || state.assessment.pending) return;
+  const included = pair.mappingResult.mappings.filter((m) => m.include && (m.ist_key || m.soll_key));
   if (!included.length) {
-    setAssessmentStatus(elements.assessmentMappingStatus, "Select at least one mapping to apply.", "error");
+    pair.mappingStatus = { message: "Select at least one mapping to apply.", tone: "error" };
+    renderAssessmentMappingPairList();
     return;
   }
   state.assessment.pending = true;
-  elements.assessmentMappingApplyBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentMappingStatus, "Building the mapping view in Archi...", "pending");
+  pair.mappingStatus = { message: `Building the mapping view for '${pair.istViewName}' in Archi...`, tone: "pending" };
+  renderAssessmentMappingPairList();
   try {
-    const viewName = elements.assessmentMappingViewName.value.trim() || "As-Is To-Be Mapping";
+    const viewName = pair.mappingViewName || `${pair.istViewName} to ${pair.mappingSollViewName} Mapping`;
     const res = await fetch("/api/assessment/mapping/apply", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mappings: result.mappings, view_name: viewName }),
+      body: JSON.stringify({ mappings: pair.mappingResult.mappings, gaps: pair.mappingResult.gaps || [], view_name: viewName }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Applying mappings failed (${res.status})`);
-    setAssessmentStatus(elements.assessmentMappingStatus, data.summary || "Mappings applied.", "ok");
+    pair.mappingStatus = { message: data.summary || "Mappings applied.", tone: "ok" };
     pushActionLogEntry({
       action: "assessment-mapping",
       viewName: data.view_name || viewName,
       summary: data.summary || "Mappings applied.",
       tone: "ok",
     });
-    markAssessmentStepComplete("mapping");
-    elements.assessmentMappingContinueBtn.disabled = false;
+    pair.mappingApplied = true;
+    updateAssessmentMappingContinueState();
   } catch (err) {
-    setAssessmentStatus(elements.assessmentMappingStatus, `Error: ${err.message || String(err)}`, "error");
+    pair.mappingStatus = { message: `Error: ${err.message || String(err)}`, tone: "error" };
   } finally {
     state.assessment.pending = false;
-    elements.assessmentMappingApplyBtn.disabled = false;
+    renderAssessmentMappingPairList();
   }
+}
+
+async function applyAllAssessmentMappings() {
+  if (state.assessment.pending) return;
+  for (const pair of state.assessment.pairs) {
+    if (pair.mappingResult && !pair.mappingApplied) {
+      await applyAssessmentMappingsForPair(pair.id);
+    }
+  }
+}
+
+function updateAssessmentMappingContinueState() {
+  const allApplied = state.assessment.pairs.every((p) => p.mappingApplied);
+  elements.assessmentMappingContinueBtn.disabled = !allApplied;
+  if (allApplied) markAssessmentStepComplete("mapping");
 }
 
 function buildSummaryPlainText(data) {
@@ -1283,25 +1788,82 @@ function renderAssessmentSummary(data) {
   elements.summaryGeneratedAt.textContent = `Generated ${new Date().toLocaleString()}`;
 }
 
+function collectAssessmentSummaryInputs() {
+  const mappings = [];
+  const gaps = [];
+  state.assessment.pairs.forEach((pair, index) => {
+    if (!pair.mappingResult) return;
+    const label = `Pair ${index + 1}`;
+    for (const m of pair.mappingResult.mappings || []) {
+      mappings.push({ ...m, key: `${pair.id}::${m.key}` });
+    }
+    for (const g of pair.mappingResult.gaps || []) {
+      const prefixed = `[${label}] ${g.description || ""}`.slice(0, 400);
+      gaps.push({ ...g, description: prefixed });
+    }
+  });
+  return { mappings, gaps };
+}
+
+function renderSummaryPairBreakdown() {
+  const container = elements.summaryPairBreakdown;
+  container.innerHTML = "";
+  const pairsWithResults = state.assessment.pairs.filter((p) => p.mappingResult);
+  if (!pairsWithResults.length) {
+    container.classList.add("hidden");
+    return;
+  }
+  container.classList.remove("hidden");
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Pair</th><th>As-Is</th><th>To-Be</th><th>Full</th><th>Partial</th><th>Gaps (H/M/L)</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  pairsWithResults.forEach((pair, index) => {
+    const result = pair.mappingResult;
+    const full = result.mappings.filter((m) => m.match_type === "full").length;
+    const partial = result.mappings.filter((m) => m.match_type === "partial").length;
+    const high = result.gaps.filter((g) => g.criticality === "high").length;
+    const medium = result.gaps.filter((g) => g.criticality === "medium").length;
+    const low = result.gaps.filter((g) => g.criticality === "low").length;
+    const tr = document.createElement("tr");
+    const cells = [String(index + 1), pair.istViewName, pair.mappingSollViewName, String(full), String(partial), `${high}/${medium}/${low}`];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
 async function runAssessmentSummary() {
-  const result = state.assessment.mappingResult;
-  if (!result) {
-    setAssessmentStatus(elements.assessmentSummaryStatus, "Run mapping & gap analysis first.", "error");
+  const hasAnyResult = state.assessment.pairs.some((p) => p.mappingResult);
+  if (!hasAnyResult) {
+    setAssessmentStatus(elements.assessmentSummaryStatus, "Run mapping & gap analysis for at least one pair first.", "error");
     return;
   }
   if (state.assessment.pending) return;
   state.assessment.pending = true;
   elements.assessmentSummaryRunBtn.disabled = true;
-  setAssessmentStatus(elements.assessmentSummaryStatus, "Generating summary...", "pending");
+  setAssessmentStatus(
+    elements.assessmentSummaryStatus,
+    "Generating summary... the strongest configured model can take a minute or two for this step.",
+    "pending"
+  );
   try {
+    const { mappings, gaps } = collectAssessmentSummaryInputs();
     const res = await fetch("/api/assessment/summary", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mappings: result.mappings, gaps: result.gaps }),
+      body: JSON.stringify({ mappings, gaps }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Summary generation failed (${res.status})`);
     renderAssessmentSummary(data);
+    renderSummaryPairBreakdown();
     elements.assessmentSummaryResult.classList.remove("hidden");
     setAssessmentStatus(elements.assessmentSummaryStatus, "Summary generated.", "ok");
     markAssessmentStepComplete("summary");
@@ -1321,30 +1883,20 @@ function attachAssessmentEventHandlers() {
     });
   });
 
+  elements.assessmentPairAddBtn.addEventListener("click", addAssessmentPair);
   elements.assessmentSetupBtn.addEventListener("click", runAssessmentSetup);
   elements.assessmentSetupContinueBtn.addEventListener("click", () => setAssessmentStep("ist"));
 
-  elements.assessmentIstForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await loadAssessmentIstPreview();
-  });
-  elements.assessmentIstApplyBtn.addEventListener("click", applyAssessmentIstPlan);
-  elements.assessmentIstDiscardBtn.addEventListener("click", discardAssessmentIstPlan);
+  elements.assessmentIstApplyAllBtn.addEventListener("click", () => applyAllAssessmentPairPlans("ist"));
   elements.assessmentIstBackBtn.addEventListener("click", () => setAssessmentStep("setup"));
   elements.assessmentIstContinueBtn.addEventListener("click", () => setAssessmentStep("soll"));
 
-  elements.assessmentSollForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await loadAssessmentSollPreview();
-  });
-  elements.assessmentSollApplyBtn.addEventListener("click", applyAssessmentSollPlan);
-  elements.assessmentSollProposeBtn.addEventListener("click", proposeAssessmentSollArchitecture);
-  elements.assessmentSollDiscardBtn.addEventListener("click", discardAssessmentSollPlan);
+  elements.assessmentSollApplyAllBtn.addEventListener("click", () => applyAllAssessmentPairPlans("soll"));
   elements.assessmentSollBackBtn.addEventListener("click", () => setAssessmentStep("ist"));
   elements.assessmentSollContinueBtn.addEventListener("click", () => setAssessmentStep("mapping"));
 
-  elements.assessmentMappingRunBtn.addEventListener("click", runAssessmentMapping);
-  elements.assessmentMappingApplyBtn.addEventListener("click", applyAssessmentMappings);
+  elements.assessmentMappingRunBtn.addEventListener("click", runAssessmentMappingAllPairs);
+  elements.assessmentMappingApplyAllBtn.addEventListener("click", applyAllAssessmentMappings);
   elements.assessmentMappingBackBtn.addEventListener("click", () => setAssessmentStep("soll"));
   elements.assessmentMappingContinueBtn.addEventListener("click", () => setAssessmentStep("summary"));
 
@@ -2032,6 +2584,14 @@ function init() {
 
   attachEventHandlers();
   attachAssessmentEventHandlers();
+  if (!state.assessment.pairs.length) {
+    state.assessment.pairs = [createAssessmentPair(0)];
+  }
+  renderAssessmentPairRows();
+  renderAssessmentCaptureList("ist");
+  renderAssessmentCaptureList("soll");
+  renderAssessmentPairingReview();
+  renderAssessmentMappingPairList();
   setAssessmentStep("setup");
   setActiveTab(state.activeTab);
   setChatCollapsed(state.chatCollapsed);

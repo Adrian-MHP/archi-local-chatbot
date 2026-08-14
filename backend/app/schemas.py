@@ -151,7 +151,7 @@ class SollProposalRequest(BaseModel):
 
 class MappingGapRequest(BaseModel):
     ist_view_name: str = Field(default="As-Is Business Processes", max_length=120)
-    soll_view_name: str = Field(default="To-Be Architecture", max_length=120)
+    soll_view_name: str = Field(default="To-Be Business Processes", max_length=120)
 
 
 class MappingGapResponse(BaseModel):
@@ -164,6 +164,7 @@ class MappingGapResponse(BaseModel):
 
 class MappingApplyRequest(BaseModel):
     mappings: List[MappingEntry] = Field(default_factory=list)
+    gaps: List[GapEntry] = Field(default_factory=list)
     view_name: str = Field(default="As-Is To-Be Mapping", max_length=120)
 
 
