@@ -17,6 +17,9 @@ from .config import Settings
 from .mcp_client import McpClient, McpTool
 
 
+_BACKREF_RE = re.compile(r"^\$(\d+)\.id$")
+
+
 _EVIDENCE_STOPWORDS = frozenset(
     {
         "and", "the", "for", "with", "from", "this", "that", "these", "those", "not",
@@ -384,7 +387,106 @@ class ChatService:
 
     @staticmethod
     def _max_automation_ops() -> int:
-        return 200
+        """Per-bulk-mutate-call cap. This must match the Archi MCP server's own limit -- its
+        bulk-mutate tool schema declares "maxItems": 150 on the operations array, so anything
+        over that is rejected by the server itself, not a number we get to pick. (This used to
+        say 200, which is why realistically-sized mappings -- e.g. a few dozen matched process
+        pairs plus their carried-over relationships and gap elements -- would sail past the
+        server's real 150 limit undetected and get rejected by Archi instead of by us.)"""
+        return 150
+
+    @staticmethod
+    def _max_total_automation_ops() -> int:
+        """Overall safety ceiling across ALL chunked bulk-mutate calls for one action, so a truly
+        pathological input fails fast with a clear message instead of silently issuing hundreds
+        of sequential MCP round-trips."""
+        return 3000
+
+    @staticmethod
+    def _approval_wait_attempts() -> int:
+        """How many times to re-check for a just-submitted change before giving up. Only matters
+        when a plan needs more than one bulk-mutate call (see _execute_view_plan_chunked): if
+        Archi's human-approval mode is on, a submitted proposal isn't applied -- and so invisible
+        to reads -- until a human approves it inside Archi, which takes a few seconds for anyone
+        actively watching for it."""
+        return 6
+
+    @staticmethod
+    def _approval_wait_delay_seconds() -> float:
+        return 3.0
+
+    @staticmethod
+    def _offset_backrefs(op: Dict[str, Any], offset: int) -> Dict[str, Any]:
+        """Renumber a group's own-local $N.id back-references (0-based within that group) to
+        their absolute position once the group is packed into a shared bulk-mutate call at
+        `offset`. Only top-level string params are ever back-references in this codebase."""
+        if not offset:
+            return op
+        params = op.get("params") or {}
+        new_params = dict(params)
+        for param_key, value in params.items():
+            if isinstance(value, str):
+                match = _BACKREF_RE.match(value)
+                if match:
+                    new_params[param_key] = f"${int(match.group(1)) + offset}.id"
+        return {"tool": op["tool"], "params": new_params}
+
+    def _run_grouped_bulk_mutate(
+        self,
+        *,
+        groups: List[List[Dict[str, Any]]],
+        action_label: str,
+        source_name: str,
+        used_tools: List[str],
+    ) -> None:
+        """Execute self-contained operation groups via bulk-mutate, packing as many groups as fit
+        into each call while staying under the MCP server's per-call operation limit. A group
+        (e.g. one element's create+place, or one relationship's create+connect) is never split
+        across calls, so its internal back-references stay valid after renumbering to the call's
+        offset -- this is what lets an arbitrarily large mapping/upload succeed via several
+        sequential calls instead of failing outright the moment one call would exceed the limit."""
+        per_call_limit = self._max_automation_ops()
+        total_limit = self._max_total_automation_ops()
+        total_ops = sum(len(g) for g in groups if g)
+        if total_ops > total_limit:
+            raise RuntimeError(
+                f"'{action_label}' would require {total_ops} Archi operations, exceeding the safety "
+                f"limit of {total_limit}. Please reduce the scope (fewer elements/relationships) and "
+                "try again."
+            )
+
+        chunk: List[Dict[str, Any]] = []
+        for group in groups:
+            if not group:
+                continue
+            if len(group) > per_call_limit:
+                raise RuntimeError(
+                    f"A single item in '{action_label}' required {len(group)} operations, exceeding "
+                    f"the MCP bulk limit of {per_call_limit} per call."
+                )
+            if chunk and len(chunk) + len(group) > per_call_limit:
+                self._mcp_call(
+                    "bulk-mutate",
+                    {
+                        "operations": chunk,
+                        "description": f"{action_label} from {source_name}",
+                        "intent": f"Batch of {action_label}",
+                    },
+                    used_tools,
+                )
+                chunk = []
+            offset = len(chunk)
+            chunk.extend(self._offset_backrefs(op, offset) for op in group)
+        if chunk:
+            self._mcp_call(
+                "bulk-mutate",
+                {
+                    "operations": chunk,
+                    "description": f"{action_label} from {source_name}",
+                    "intent": f"Batch of {action_label}",
+                },
+                used_tools,
+            )
 
     def _call_model_for_json(
         self, *, system_prompt: str, user_prompt: str, model_override: str | None = None
@@ -479,11 +581,19 @@ class ChatService:
         view_name: str,
         used_tools: List[str],
     ) -> str | None:
-        views_result = self._mcp_call("get-views", {"name": view_name, "limit": 200}, used_tools)
+        # Archi trims a view's name on creation, so a caller-supplied name with incidental
+        # leading/trailing whitespace (e.g. a stray space typed into a Setup field) would never
+        # match the stored (trimmed) name -- reporting "no such view" even though it genuinely
+        # exists. Worse, the MCP server's own get-views name filter appears to require the query
+        # to be a substring of the stored name, so a trailing space on the query alone is enough
+        # to make the real view never even come back as a candidate -- it must be stripped before
+        # the search, not just before the comparison below.
+        normalized_view_name = view_name.strip().lower()
+        views_result = self._mcp_call("get-views", {"name": view_name.strip(), "limit": 200}, used_tools)
         views = self._result_list(views_result, "views")
         for view in views:
             existing_name = str(view.get("name", "")).strip()
-            if existing_name.lower() == view_name.lower():
+            if existing_name.lower() == normalized_view_name:
                 view_id = str(view.get("id", view.get("viewId", ""))).strip()
                 if view_id:
                     return view_id
@@ -601,6 +711,13 @@ class ChatService:
         relationships: List[Dict[str, str]],
         layout_positions: Dict[str, Dict[str, int]] | None = None,
     ) -> Dict[str, Any]:
+        """Builds a flat, single-bulk-mutate-call plan (exactly the original, proven approach --
+        one proposal, resolved entirely server-side) whenever it fits in one call. Archi's
+        optional human-approval mode treats one bulk-mutate call as one all-or-nothing proposal
+        that a person approves inside Archi; the client never needs to know real ids while that's
+        pending, since back-references resolve server-side as part of applying that one proposal.
+        Only a plan too large for one call falls back to _execute_view_plan_chunked, which must
+        peek at real ids between calls and therefore has to tolerate an approval-mode delay."""
         used_tools: List[str] = []
         existing_view_id = self._find_existing_view_id(view_name=view_name, used_tools=used_tools)
         existing_elements = self._collect_existing_elements(used_tools)
@@ -610,6 +727,66 @@ class ChatService:
         else:
             view_objects, existing_visual_relationships = {}, set()
 
+        operations, counts = self._build_flat_view_operations(
+            view_name=view_name,
+            existing_view_id=existing_view_id,
+            elements_by_key=elements_by_key,
+            relationships=relationships,
+            layout_positions=layout_positions,
+            existing_elements=existing_elements,
+            existing_relationships=existing_relationships,
+            view_objects=view_objects,
+            existing_visual_relationships=existing_visual_relationships,
+        )
+
+        if len(operations) <= self._max_automation_ops():
+            if operations:
+                self._mcp_call(
+                    "bulk-mutate",
+                    {
+                        "operations": operations,
+                        "description": f"{action_label} from {source_name}",
+                        "intent": f"One-shot {action_label} model build",
+                    },
+                    used_tools,
+                )
+            return {
+                "view_name": view_name,
+                "view_id": existing_view_id,
+                **counts,
+                "used_tools": used_tools,
+            }
+
+        return self._execute_view_plan_chunked(
+            action_label=action_label,
+            source_name=source_name,
+            view_name=view_name,
+            elements_by_key=elements_by_key,
+            relationships=relationships,
+            layout_positions=layout_positions,
+            used_tools=used_tools,
+            existing_view_id=existing_view_id,
+            existing_elements=existing_elements,
+            existing_relationships=existing_relationships,
+            view_objects=view_objects,
+            existing_visual_relationships=existing_visual_relationships,
+        )
+
+    def _build_flat_view_operations(
+        self,
+        *,
+        view_name: str,
+        existing_view_id: str | None,
+        elements_by_key: Dict[str, Dict[str, str]],
+        relationships: List[Dict[str, str]],
+        layout_positions: Dict[str, Dict[str, int]] | None,
+        existing_elements: Dict[tuple[str, str], str],
+        existing_relationships: Dict[tuple[str, str, str], str],
+        view_objects: Dict[str, str],
+        existing_visual_relationships: set[str],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Original single-call plan builder: one flat operations list using $N.id
+        back-references throughout, meant to be sent as one bulk-mutate call."""
         operations: List[Dict[str, Any]] = []
         view_ref = existing_view_id
         if not view_ref:
@@ -671,7 +848,6 @@ class ChatService:
             added_to_view += 1
 
         if layout_positions:
-            existing_positions: List[Dict[str, int | str]] = []
             for key, pos in layout_positions.items():
                 existing_id = existing_element_id_for_key.get(key)
                 if not existing_id:
@@ -679,22 +855,18 @@ class ChatService:
                 view_object_id = view_objects.get(existing_id)
                 if not view_object_id:
                     continue
-                existing_positions.append(
-                    {
-                        "viewObjectId": view_object_id,
-                        "x": int(pos.get("x", 0)),
-                        "y": int(pos.get("y", 0)),
-                        "width": int(pos.get("width", 180)),
-                        "height": int(pos.get("height", 70)),
-                    }
-                )
-            if existing_positions:
+                # There is no bulk "apply many positions in one op" tool -- update-view-object
+                # repositions exactly one view object per call, so this is genuinely one
+                # operation per pre-existing element being repositioned.
                 operations.append(
                     {
-                        "tool": "apply-positions",
+                        "tool": "update-view-object",
                         "params": {
-                            "viewId": view_ref,
-                            "positions": existing_positions,
+                            "viewObjectId": view_object_id,
+                            "x": int(pos.get("x", 0)),
+                            "y": int(pos.get("y", 0)),
+                            "width": int(pos.get("width", 180)),
+                            "height": int(pos.get("height", 70)),
                         },
                     }
                 )
@@ -751,26 +923,277 @@ class ChatService:
             )
             added_connections += 1
 
-        if len(operations) > self._max_automation_ops():
-            raise RuntimeError(
-                f"Automation plan generated {len(operations)} operations, exceeding the MCP bulk limit of "
-                f"{self._max_automation_ops()}. Please reduce the scope of the uploaded document."
+        counts = {
+            "created_elements": created_elements,
+            "created_relationships": created_relationships,
+            "added_to_view": added_to_view,
+            "added_connections": added_connections,
+        }
+        return operations, counts
+
+    def _execute_view_plan_chunked(
+        self,
+        *,
+        action_label: str,
+        source_name: str,
+        view_name: str,
+        elements_by_key: Dict[str, Dict[str, str]],
+        relationships: List[Dict[str, str]],
+        layout_positions: Dict[str, Dict[str, int]] | None,
+        used_tools: List[str],
+        existing_view_id: str | None,
+        existing_elements: Dict[tuple[str, str], str],
+        existing_relationships: Dict[tuple[str, str, str], str],
+        view_objects: Dict[str, str],
+        existing_visual_relationships: set[str],
+    ) -> Dict[str, Any]:
+        """Fallback for plans too large for one bulk-mutate call (see _execute_view_plan): builds
+        elements, then relationships, as separate chunked rounds via _run_grouped_bulk_mutate,
+        resolving real ids between rounds since bulk-mutate back-references cannot cross calls.
+        If Archi's human-approval mode is on, each round's proposal must actually be approved
+        before the next round's lookups can see it -- so real-id resolution here polls briefly
+        rather than checking once, and fails with an actionable message (not a generic error) if
+        nothing was approved in time. A failure partway through leaves earlier rounds applied;
+        re-running the same plan is safe and resumes from there, since every step below looks up
+        "does this already exist" before creating anything."""
+        created_elements = 0
+        created_relationships = 0
+        added_to_view = 0
+        added_connections = 0
+        attempts = self._approval_wait_attempts()
+        delay = self._approval_wait_delay_seconds()
+
+        # --- Phase 1: the view itself must be a real id before anything below can reference it,
+        # since it may end up in a different bulk-mutate call than whatever places elements on it. ---
+        view_id = existing_view_id
+        if not view_id:
+            self._run_grouped_bulk_mutate(
+                groups=[[{"tool": "create-view", "params": {"name": view_name}}]],
+                action_label=action_label,
+                source_name=source_name,
+                used_tools=used_tools,
+            )
+            for attempt in range(attempts):
+                view_id = self._find_existing_view_id(view_name=view_name, used_tools=used_tools)
+                if view_id:
+                    break
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+            if not view_id:
+                raise RuntimeError(
+                    f"Archi hasn't confirmed the new view '{view_name}' yet. If Archi's human-approval "
+                    f"mode is on, switch to Archi, approve the pending '{action_label}' change, then "
+                    "try again -- it will safely continue from here."
+                )
+
+        # --- Phase 2: create every missing element and place every element on the view. Each
+        # element is its own self-contained group (create + place, local back-reference), so
+        # groups can be freely packed into calls of up to the MCP bulk limit regardless of how
+        # many elements there are in total. ---
+        existing_element_id_for_key: Dict[str, str] = {}
+        created_this_run: set[str] = set()
+        element_groups: List[List[Dict[str, Any]]] = []
+
+        for key, item in elements_by_key.items():
+            element_type = item["type"]
+            element_name = item["name"]
+            found_id = existing_elements.get((self._norm_key(element_type), self._norm_key(element_name)))
+            pos = (layout_positions or {}).get(key, {})
+            if found_id:
+                existing_element_id_for_key[key] = found_id
+                if found_id in view_objects:
+                    continue
+                element_groups.append(
+                    [
+                        {
+                            "tool": "add-to-view",
+                            "params": {
+                                "viewId": view_id,
+                                "elementId": found_id,
+                                "x": int(pos.get("x", 0)),
+                                "y": int(pos.get("y", 0)),
+                                "width": int(pos.get("width", 180)),
+                                "height": int(pos.get("height", 70)),
+                                "autoSize": True,
+                            },
+                        }
+                    ]
+                )
+                added_to_view += 1
+                continue
+
+            created_this_run.add(key)
+            create_params: Dict[str, Any] = {
+                "type": element_type,
+                "name": element_name,
+                "documentation": item.get("documentation", ""),
+            }
+            properties = item.get("properties")
+            if properties:
+                create_params["properties"] = properties
+            element_groups.append(
+                [
+                    {"tool": "create-element", "params": create_params},
+                    {
+                        "tool": "add-to-view",
+                        "params": {
+                            "viewId": view_id,
+                            "elementId": "$0.id",
+                            "x": int(pos.get("x", 0)),
+                            "y": int(pos.get("y", 0)),
+                            "width": int(pos.get("width", 180)),
+                            "height": int(pos.get("height", 70)),
+                            "autoSize": True,
+                        },
+                    },
+                ]
+            )
+            created_elements += 1
+            added_to_view += 1
+
+        # Repositioning for elements that were already on the view before this run -- uses the
+        # pre-run view_objects snapshot deliberately, since it's only concerned with objects that
+        # predate anything this run just placed.
+        if layout_positions:
+            for key, pos in layout_positions.items():
+                existing_id = existing_element_id_for_key.get(key)
+                if not existing_id:
+                    continue
+                view_object_id = view_objects.get(existing_id)
+                if not view_object_id:
+                    continue
+                # There is no bulk "apply many positions in one op" tool -- update-view-object
+                # repositions exactly one view object per call, so each pre-existing element
+                # being repositioned is its own independent (backref-free) group.
+                element_groups.append(
+                    [
+                        {
+                            "tool": "update-view-object",
+                            "params": {
+                                "viewObjectId": view_object_id,
+                                "x": int(pos.get("x", 0)),
+                                "y": int(pos.get("y", 0)),
+                                "width": int(pos.get("width", 180)),
+                                "height": int(pos.get("height", 70)),
+                            },
+                        }
+                    ]
+                )
+
+        if element_groups:
+            self._run_grouped_bulk_mutate(
+                groups=element_groups,
+                action_label=action_label,
+                source_name=source_name,
+                used_tools=used_tools,
             )
 
-        if operations:
-            self._mcp_call(
-                "bulk-mutate",
-                {
-                    "operations": operations,
-                    "description": f"{action_label} from {source_name}",
-                    "intent": f"One-shot {action_label} model build",
-                },
-                used_tools,
+        # --- Phase 3: re-read real ids, now that every element (including ones created just
+        # above) should exist and be placed -- so relationships can reference them directly
+        # instead of needing cross-call back-references, which bulk-mutate cannot resolve. Poll
+        # briefly for approval-mode; this step is best-effort -- any key that still doesn't
+        # resolve just means relationships touching it get skipped below, same as this function
+        # has always done for any reference it can't resolve. ---
+        if created_this_run:
+            for attempt in range(attempts):
+                existing_elements = self._collect_existing_elements(used_tools)
+                still_missing = False
+                for key in created_this_run:
+                    if key in existing_element_id_for_key:
+                        continue
+                    item = elements_by_key[key]
+                    found_id = existing_elements.get((self._norm_key(item["type"]), self._norm_key(item["name"])))
+                    if found_id:
+                        existing_element_id_for_key[key] = found_id
+                    else:
+                        still_missing = True
+                if not still_missing:
+                    break
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+        if element_groups:
+            view_objects, existing_visual_relationships = self._collect_view_state(view_id=view_id, used_tools=used_tools)
+
+        # --- Phase 4: create every missing relationship and connect every relationship on the
+        # view. Each relationship is its own self-contained group (create + connect, local
+        # back-reference), same packing story as phase 2. ---
+        relationship_groups: List[List[Dict[str, Any]]] = []
+        for rel in relationships:
+            rel_type = rel["type"]
+            source_key = rel["source_key"]
+            target_key = rel["target_key"]
+
+            source_ref = existing_element_id_for_key.get(source_key)
+            target_ref = existing_element_id_for_key.get(target_key)
+            if not source_ref or not target_ref:
+                continue
+
+            existing_rel_id = None
+            if source_key not in created_this_run and target_key not in created_this_run:
+                existing_rel_id = existing_relationships.get((self._norm_key(rel_type), str(source_ref), str(target_ref)))
+
+            source_view_ref = view_objects.get(source_ref)
+            target_view_ref = view_objects.get(target_ref)
+            if not source_view_ref or not target_view_ref:
+                continue
+
+            if existing_rel_id:
+                if existing_rel_id in existing_visual_relationships:
+                    continue
+                relationship_groups.append(
+                    [
+                        {
+                            "tool": "add-connection-to-view",
+                            "params": {
+                                "viewId": view_id,
+                                "relationshipId": existing_rel_id,
+                                "sourceViewObjectId": source_view_ref,
+                                "targetViewObjectId": target_view_ref,
+                            },
+                        }
+                    ]
+                )
+                added_connections += 1
+            else:
+                params: Dict[str, Any] = {
+                    "type": rel_type,
+                    "sourceId": source_ref,
+                    "targetId": target_ref,
+                }
+                rel_name = rel.get("name")
+                if rel_name:
+                    params["name"] = rel_name
+                access_type = rel.get("accessType")
+                if access_type and rel_type == "AccessRelationship":
+                    params["accessType"] = access_type
+                relationship_groups.append(
+                    [
+                        {"tool": "create-relationship", "params": params},
+                        {
+                            "tool": "add-connection-to-view",
+                            "params": {
+                                "viewId": view_id,
+                                "relationshipId": "$0.id",
+                                "sourceViewObjectId": source_view_ref,
+                                "targetViewObjectId": target_view_ref,
+                            },
+                        },
+                    ]
+                )
+                created_relationships += 1
+                added_connections += 1
+
+        if relationship_groups:
+            self._run_grouped_bulk_mutate(
+                groups=relationship_groups,
+                action_label=action_label,
+                source_name=source_name,
+                used_tools=used_tools,
             )
 
         return {
             "view_name": view_name,
-            "view_id": existing_view_id,
+            "view_id": view_id,
             "created_elements": created_elements,
             "created_relationships": created_relationships,
             "added_to_view": added_to_view,

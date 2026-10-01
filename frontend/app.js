@@ -20,7 +20,7 @@ const state = {
   pendingAction: null,
   actionLog: [],
   activeTab: "assessmentTab",
-  chatCollapsed: false,
+  chatCollapsed: true,
   metaModel: null,
   assessment: {
     currentStep: "setup",
@@ -76,10 +76,13 @@ const elements = {
   assessmentSetupBtn: document.getElementById("assessmentSetupBtn"),
   assessmentSetupResult: document.getElementById("assessmentSetupResult"),
   assessmentSetupContinueBtn: document.getElementById("assessmentSetupContinueBtn"),
+  assessmentIstPreviewAllBtn: document.getElementById("assessmentIstPreviewAllBtn"),
   assessmentIstApplyAllBtn: document.getElementById("assessmentIstApplyAllBtn"),
   assessmentIstPairList: document.getElementById("assessmentIstPairList"),
   assessmentIstBackBtn: document.getElementById("assessmentIstBackBtn"),
   assessmentIstContinueBtn: document.getElementById("assessmentIstContinueBtn"),
+  assessmentSollPreviewAllBtn: document.getElementById("assessmentSollPreviewAllBtn"),
+  assessmentSollProposeAllBtn: document.getElementById("assessmentSollProposeAllBtn"),
   assessmentSollApplyAllBtn: document.getElementById("assessmentSollApplyAllBtn"),
   assessmentSollPairList: document.getElementById("assessmentSollPairList"),
   assessmentSollBackBtn: document.getElementById("assessmentSollBackBtn"),
@@ -194,9 +197,10 @@ function loadPersistedState() {
   }
 
   try {
-    state.chatCollapsed = localStorage.getItem(CHAT_COLLAPSED_KEY) === "1";
+    const stored = localStorage.getItem(CHAT_COLLAPSED_KEY);
+    if (stored !== null) state.chatCollapsed = stored === "1";
   } catch (err) {
-    state.chatCollapsed = false;
+    // leave the default (collapsed) in place
   }
 }
 
@@ -688,15 +692,33 @@ function createAssessmentPair(index, suffix = "") {
     sollPlan: null,
     sollApplied: false,
     sollStatus: { message: "", tone: "neutral" },
-    // mappingSollViewName is the human-in-the-loop-corrected pairing for step 4; starts equal to
-    // sollViewName but is independently editable so correcting it there doesn't silently rewrite
-    // what was typed in Setup.
+    // mappingSollViewName is the human-in-the-loop-corrected pairing for step 4; it tracks
+    // sollViewName automatically (so renaming a pair's To-Be field in Setup flows through) until
+    // the user explicitly re-pairs it via the step-4 dropdown, at which point it's "manually set"
+    // and Setup edits no longer silently overwrite that deliberate correction.
     mappingSollViewName: sollViewName,
+    mappingSollViewNameManuallySet: false,
     mappingViewName: `${istViewName} to ${sollViewName} Mapping`,
+    mappingViewNameManuallySet: false,
     mappingResult: null,
     mappingApplied: false,
     mappingStatus: { message: "", tone: "neutral" },
   };
+}
+
+// Keeps the step-4 derived fields (the suggested To-Be pairing and mapping view name) following
+// istViewName/sollViewName as the user edits them in Setup -- but only for whichever of the two
+// fields the user hasn't explicitly overridden themselves (dropdown re-pairing, or hand-editing
+// the mapping view name). Without this, renaming a pair in Setup left mappingSollViewName frozen
+// at its original "To-Be Business Process Source N" placeholder, which the step-4 dropdown would
+// then silently mis-render as if it still matched (see the two bugs this fixes).
+function syncAssessmentPairDerivedNames(pair) {
+  if (!pair.mappingSollViewNameManuallySet) {
+    pair.mappingSollViewName = pair.sollViewName;
+  }
+  if (!pair.mappingViewNameManuallySet) {
+    pair.mappingViewName = `${pair.istViewName} to ${pair.mappingSollViewName} Mapping`;
+  }
 }
 
 function getAssessmentPair(pairId) {
@@ -753,6 +775,19 @@ function renderAssessmentPairRows() {
     istInput.value = pair.istViewName;
     istInput.addEventListener("input", () => {
       pair.istViewName = istInput.value;
+      syncAssessmentPairDerivedNames(pair);
+    });
+    istInput.addEventListener("blur", () => {
+      // Trim only once typing is done (not on every keystroke, or a trailing space would vanish
+      // before a multi-word name could be finished). A stray leading/trailing space here doesn't
+      // survive into Archi -- it trims view names on creation -- so leaving it in our own stored
+      // name causes later lookups against that same view to fail even though it genuinely exists.
+      const trimmed = istInput.value.trim();
+      if (trimmed !== istInput.value) {
+        istInput.value = trimmed;
+        pair.istViewName = trimmed;
+        syncAssessmentPairDerivedNames(pair);
+      }
     });
     istLabel.appendChild(istInput);
     fieldRow.appendChild(istLabel);
@@ -765,6 +800,15 @@ function renderAssessmentPairRows() {
     sollInput.value = pair.sollViewName;
     sollInput.addEventListener("input", () => {
       pair.sollViewName = sollInput.value;
+      syncAssessmentPairDerivedNames(pair);
+    });
+    sollInput.addEventListener("blur", () => {
+      const trimmed = sollInput.value.trim();
+      if (trimmed !== sollInput.value) {
+        sollInput.value = trimmed;
+        pair.sollViewName = trimmed;
+        syncAssessmentPairDerivedNames(pair);
+      }
     });
     sollLabel.appendChild(sollInput);
     fieldRow.appendChild(sollLabel);
@@ -1242,6 +1286,15 @@ async function proposeAssessmentPairSollArchitecture(pairId) {
   }
 }
 
+async function proposeAllAssessmentPairSollArchitecture() {
+  if (state.assessment.pending) return;
+  for (const pair of state.assessment.pairs) {
+    if (!getPairApplied(pair, "soll")) {
+      await proposeAssessmentPairSollArchitecture(pair.id);
+    }
+  }
+}
+
 async function applyAssessmentPairPlan(pairId, side) {
   const pair = getAssessmentPair(pairId);
   if (!pair) return;
@@ -1280,6 +1333,17 @@ async function applyAssessmentPairPlan(pairId, side) {
   } finally {
     state.assessment.pending = false;
     renderAssessmentCaptureList(side);
+  }
+}
+
+async function previewAllAssessmentPairPlans(side) {
+  if (state.assessment.pending) return;
+  for (const pair of state.assessment.pairs) {
+    // loadAssessmentPairPreview clears a pair's files on success, so a pair with none queued
+    // either has nothing to preview yet or was already just previewed -- either way, skip it.
+    if (getPairFiles(pair, side).length) {
+      await loadAssessmentPairPreview(pair.id, side);
+    }
   }
 }
 
@@ -1484,15 +1548,32 @@ function renderAssessmentPairingReview() {
     row.appendChild(arrow);
 
     const select = document.createElement("select");
+    let matchedCurrentPairing = false;
     state.assessment.pairs.forEach((candidate) => {
       const option = document.createElement("option");
       option.value = candidate.sollViewName;
       option.textContent = candidate.sollViewName;
-      if (candidate.sollViewName === pair.mappingSollViewName) option.selected = true;
+      if (candidate.sollViewName === pair.mappingSollViewName) {
+        option.selected = true;
+        matchedCurrentPairing = true;
+      }
       select.appendChild(option);
     });
+    if (!matchedCurrentPairing && pair.mappingSollViewName) {
+      // The stored pairing doesn't match any current pair's To-Be name (e.g. it was renamed
+      // after this was set). Show the actual stored value instead of letting the browser
+      // silently default to the first option -- that default looking plausible is exactly what
+      // hid this bug the first two times.
+      const orphan = document.createElement("option");
+      orphan.value = pair.mappingSollViewName;
+      orphan.textContent = `${pair.mappingSollViewName} (not a current pair -- please re-select)`;
+      orphan.selected = true;
+      select.insertBefore(orphan, select.firstChild);
+    }
     select.addEventListener("change", () => {
       pair.mappingSollViewName = select.value;
+      pair.mappingSollViewNameManuallySet = true;
+      syncAssessmentPairDerivedNames(pair);
     });
     row.appendChild(select);
 
@@ -1614,6 +1695,7 @@ function buildAssessmentMappingCard(pair) {
     viewNameInput.value = pair.mappingViewName;
     viewNameInput.addEventListener("input", () => {
       pair.mappingViewName = viewNameInput.value;
+      pair.mappingViewNameManuallySet = true;
     });
     viewNameLabel.appendChild(viewNameInput);
     card.appendChild(viewNameLabel);
@@ -1887,10 +1969,13 @@ function attachAssessmentEventHandlers() {
   elements.assessmentSetupBtn.addEventListener("click", runAssessmentSetup);
   elements.assessmentSetupContinueBtn.addEventListener("click", () => setAssessmentStep("ist"));
 
+  elements.assessmentIstPreviewAllBtn.addEventListener("click", () => previewAllAssessmentPairPlans("ist"));
   elements.assessmentIstApplyAllBtn.addEventListener("click", () => applyAllAssessmentPairPlans("ist"));
   elements.assessmentIstBackBtn.addEventListener("click", () => setAssessmentStep("setup"));
   elements.assessmentIstContinueBtn.addEventListener("click", () => setAssessmentStep("soll"));
 
+  elements.assessmentSollPreviewAllBtn.addEventListener("click", () => previewAllAssessmentPairPlans("soll"));
+  elements.assessmentSollProposeAllBtn.addEventListener("click", proposeAllAssessmentPairSollArchitecture);
   elements.assessmentSollApplyAllBtn.addEventListener("click", () => applyAllAssessmentPairPlans("soll"));
   elements.assessmentSollBackBtn.addEventListener("click", () => setAssessmentStep("ist"));
   elements.assessmentSollContinueBtn.addEventListener("click", () => setAssessmentStep("mapping"));
@@ -2515,20 +2600,6 @@ function attachEventHandlers() {
     const turnIndex = Number(button.dataset.turnIndex);
     if (!Number.isInteger(turnIndex)) return;
     await copyMessage(turnIndex, button);
-  });
-
-  const quickPrompts = document.querySelectorAll(".quick-prompt");
-  quickPrompts.forEach((button) => {
-    button.addEventListener("click", () => {
-      const prompt = button.dataset.prompt || "";
-      elements.messageInput.value = prompt;
-      setActiveConversationDraft(prompt);
-      schedulePersist();
-      autoResizeTextarea(elements.messageInput);
-      updateMessageCounter();
-      updateSendButtonState();
-      elements.messageInput.focus();
-    });
   });
 
   document.querySelectorAll(".tab-btn").forEach((button) => {

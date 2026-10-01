@@ -109,26 +109,17 @@ button {
 .brand-mark {
   width: 42px;
   height: 42px;
-  border-radius: 12px;
-  display: grid;
-  place-items: center;
-  background: linear-gradient(130deg, var(--accent), #2d8c93);
-  color: #fff;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+  display: block;
+  flex-shrink: 0;
 }
 
 .brand h1 {
   margin: 0;
   font-size: 1.1rem;
   line-height: 1.2;
-}
-
-.brand p {
-  margin: 3px 0 0;
-  color: var(--ink-muted);
-  font-size: 0.92rem;
 }
 
 .topbar-status {
@@ -786,32 +777,6 @@ button {
   color: #7d2419;
   border-color: #d9b4ad;
   background: #fff4f2;
-}
-
-.quick-prompts-details {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 6px 10px 10px;
-}
-
-.quick-prompts-details summary {
-  cursor: pointer;
-  color: var(--ink-muted);
-  font-size: 0.8rem;
-  padding: 3px 0;
-}
-
-.quick-prompts {
-  display: grid;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.quick-prompts .btn {
-  font-size: 0.76rem;
-  padding: 6px 9px;
-  text-align: left;
 }
 
 .chat-window {
@@ -1676,11 +1641,29 @@ body.modal-open {
 
 .summary-slide-head {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
   padding-bottom: 16px;
   margin-bottom: 18px;
   border-bottom: 2px solid var(--accent-soft);
+}
+
+.summary-slide-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.summary-slide-logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+  flex-shrink: 0;
 }
 
 .summary-slide-kicker {
