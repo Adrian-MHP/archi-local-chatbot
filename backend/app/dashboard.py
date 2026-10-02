@@ -1,13 +1,23 @@
 """Transformation dashboard metrics, computed from the active Archi model read live via MCP.
 
-Every number here is derived from model elements, their properties and their relationships at
-request time -- nothing is cached or entered elsewhere. The property schema the metrics read is
-documented in docs/transformation-dashboard.md. Property keys and enumeration values are matched
-loosely (case, spaces, '-', '_' are ignored), so "End of Life", "endOfLife" and "end_of_life" all
-resolve to the same key; real-world models rarely follow one spelling.
+Every number is derived at request time from elements, their properties and the relationships the
+governance meta-model declares (meta_model.py) -- nothing is cached, entered elsewhere or assumed:
 
-The module is split into fetching (fetch_snapshot) and pure computation (compute_dashboard), so
-the metrics can be tested against a saved snapshot without Archi running.
+    Outcome --realizes--> Goal               Capability --realizes--> Outcome
+    BusinessProcess --realizes--> Capability BusinessRole --assigned to--> BusinessProcess
+    ApplicationService --serves--> BusinessProcess
+    ApplicationComponent --realizes--> ApplicationService
+    WorkPackage --realizes--> Plateau        Plateau --realizes--> Capability
+    Plateau --associated with--> Gap         Gap --affects (association)--> BusinessProcess
+    BusinessProcess (To-Be) --association "realizes"--> BusinessProcess (As-Is)
+
+Cost, budget and project-progress figures are deliberately out of scope: they live in finance and
+portfolio tools, not in the architecture model. The property schema is documented in
+docs/transformation-dashboard.md. Property keys and enumeration values are matched loosely (case,
+spaces, '-' and '_' ignored), because real-world models rarely follow one spelling.
+
+The module separates fetching (fetch_snapshot) from pure computation (compute_dashboard), so the
+metrics can be tested against a saved snapshot without Archi running.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from statistics import mean
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .mcp_client import McpClient
 
@@ -35,54 +45,40 @@ _LIFECYCLE_ALIASES = {
     "phaseout": "phase-out", "sunset": "phase-out", "sunsetting": "phase-out", "decommissioning": "phase-out",
     "endoflife": "end-of-life", "eol": "end-of-life", "retired": "end-of-life", "decommissioned": "end-of-life",
 }
-
 TIME_CLASSES = ["invest", "tolerate", "migrate", "eliminate"]
 TIME_LABELS = {"invest": "Invest", "tolerate": "Tolerate", "migrate": "Migrate", "eliminate": "Eliminate"}
-
-CRITICALITY_LEVELS = ["mission-critical", "business-critical", "business-operational", "administrative"]
-CRITICALITY_LABELS = {
-    "mission-critical": "Mission critical", "business-critical": "Business critical",
-    "business-operational": "Business operational", "administrative": "Administrative service",
-}
 _CRITICALITY_ALIASES = {
     "missioncritical": "mission-critical", "businesscritical": "business-critical",
     "businessoperational": "business-operational", "administrative": "administrative",
     "administrativeservice": "administrative",
 }
-
-RADAR_RINGS = ["adopt", "trial", "assess", "hold"]
-IMPORTANCE_LEVELS = ["high", "medium", "low"]
 _IMPORTANCE_ALIASES = {"high": "high", "critical": "high", "differentiating": "high", "medium": "medium",
                        "moderate": "medium", "low": "low", "commodity": "low"}
 IMPORTANCE_WEIGHT = {"high": 3, "medium": 2, "low": 1}
 AUTOMATION_LEVELS = ["manual", "partial", "automated"]
 _AUTOMATION_ALIASES = {"manual": "manual", "partial": "partial", "partiallyautomated": "partial",
                        "semiautomated": "partial", "automated": "automated", "fullyautomated": "automated"}
-RAG_LEVELS = ["green", "amber", "red"]
-_RAG_ALIASES = {"green": "green", "amber": "amber", "yellow": "amber", "orange": "amber", "red": "red"}
+WORK_STATUSES = ["planned", "in-progress", "completed", "on-hold"]
+_WORK_STATUS_ALIASES = {
+    "planned": "planned", "notstarted": "planned", "open": "planned", "new": "planned",
+    "inprogress": "in-progress", "active": "in-progress", "running": "in-progress", "ongoing": "in-progress",
+    "completed": "completed", "done": "completed", "closed": "completed", "finished": "completed",
+    "onhold": "on-hold", "paused": "on-hold", "blocked": "on-hold",
+}
 _DIRECTION_ALIASES = {"higher": "higher", "higherisbetter": "higher", "up": "higher", "increase": "higher",
                       "lower": "lower", "lowerisbetter": "lower", "down": "lower", "decrease": "lower"}
-
-TECHNOLOGY_TYPES = {
-    "Node", "Device", "SystemSoftware", "TechnologyService", "TechnologyInterface", "TechnologyFunction",
-    "TechnologyProcess", "TechnologyInteraction", "TechnologyEvent", "TechnologyCollaboration",
-    "CommunicationNetwork", "Path", "Equipment", "Facility", "DistributionNetwork",
-}
-# Technology element types whose support status can put the applications they serve at risk.
-TECHNOLOGY_PLATFORM_TYPES = {"Node", "Device", "SystemSoftware", "TechnologyService", "Equipment"}
 
 RISK_ORDER = ["ok", "warning", "serious", "critical"]
 
 # Expected properties per element type -- the basis of the data-completeness panel.
 EXPECTED_PROPERTIES: List[Tuple[str, str, str, List[str]]] = [
-    ("Strategy", "Capability", "Capabilities (leaf)", ["maturity", "targetMaturity", "strategicImportance"]),
-    ("Business", "BusinessProcess", "Business processes", ["maturity", "automationLevel", "mediaBreaks", "valueStreamStage"]),
+    ("Motivation", "Outcome", "Outcomes", ["kpi", "baseline", "current", "target", "baselineDate", "targetDate"]),
+    ("Strategy", "Capability", "Capabilities", ["maturity", "targetMaturity", "strategicImportance"]),
+    ("Business", "BusinessProcess", "Business processes", ["maturity", "automationLevel", "mediaBreaks"]),
     ("Application", "ApplicationComponent", "Application components",
-     ["lifecycle", "timeClassification", "functionalFit", "technicalFit", "businessCriticality", "annualCostEUR"]),
-    ("Technology", "*technology", "Technology platforms", ["lifecycle", "vendorSupportEnd", "techRadar"]),
-    ("Motivation", "Outcome", "Outcomes", ["kpi", "baseline", "current", "target", "direction", "baselineDate", "targetDate"]),
-    ("Implementation & Migration", "WorkPackage", "Work packages",
-     ["startDate", "endDate", "progress", "budgetEUR", "actualCostEUR", "plateau"]),
+     ["lifecycle", "timeClassification", "functionalFit", "technicalFit", "businessCriticality"]),
+    ("Implementation & Migration", "Plateau", "Plateaus", ["targetDate"]),
+    ("Implementation & Migration", "WorkPackage", "Work packages", ["startDate", "endDate", "status"]),
 ]
 
 
@@ -128,7 +124,7 @@ def _date(value: Optional[str]) -> Optional[date]:
         except ValueError:
             continue
     # Partial dates mean "until the end of that period".
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})", s) or None
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})", s)
     if m:
         year, month = int(m.group(1)), int(m.group(2))
     else:
@@ -174,6 +170,10 @@ def _worst_risk(levels: Iterable[str]) -> str:
     return worst
 
 
+def _iso(value: Optional[date]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
 # ---------------------------------------------------------------------------------------------
 # Model snapshot
 # ---------------------------------------------------------------------------------------------
@@ -185,7 +185,6 @@ class Element:
     type: str
     layer: str
     props: Dict[str, str]          # normalised key -> value
-    raw_props: Dict[str, str]      # original key -> value
 
     def prop(self, key: str) -> Optional[str]:
         value = self.props.get(_key(key))
@@ -225,6 +224,11 @@ class Model:
         rel_types, source_types = set(rel_types), set(source_types) if source_types else None
         found = [self.elements[s] for r, s in self.incoming.get(element_id, []) if r in rel_types]
         return _unique(e for e in found if source_types is None or e.type in source_types)
+
+    def associated(self, element_id: str, other_types: Iterable[str]) -> List[Element]:
+        """Associations are undirected in the meta-model, so follow them both ways."""
+        return _unique(self.targets(element_id, ["AssociationRelationship"], other_types)
+                       + self.sources(element_id, ["AssociationRelationship"], other_types))
 
 
 def _unique(elements: Iterable[Element]) -> List[Element]:
@@ -284,298 +288,254 @@ def fetch_snapshot(mcp: McpClient) -> Dict[str, Any]:
 def _build_model(snapshot: Dict[str, Any]) -> Model:
     elements: Dict[str, Element] = {}
     for item in snapshot.get("elements", []):
-        raw_props: Dict[str, str] = {}
+        props: Dict[str, str] = {}
         properties = item.get("properties") or []
         if isinstance(properties, dict):
             properties = [{"key": k, "value": v} for k, v in properties.items()]
         for p in properties:
             key, value = str(p.get("key") or "").strip(), p.get("value")
             if key:
-                raw_props[key] = "" if value is None else str(value).strip()
+                props[_key(key)] = "" if value is None else str(value).strip()
         elements[item["id"]] = Element(
-            id=item["id"],
-            name=str(item.get("name") or "(unnamed)"),
-            type=str(item.get("type") or ""),
-            layer=str(item.get("layer") or ""),
-            props={_key(k): v for k, v in raw_props.items()},
-            raw_props=raw_props,
+            id=item["id"], name=str(item.get("name") or "(unnamed)"), type=str(item.get("type") or ""),
+            layer=str(item.get("layer") or ""), props=props,
         )
     return Model(info=snapshot.get("info") or {}, elements=elements, relationships=snapshot.get("relationships") or [])
 
 
 # ---------------------------------------------------------------------------------------------
-# Shared derivations
+# Shared derivations along the meta-model's relationship chains
 # ---------------------------------------------------------------------------------------------
 
 @dataclass
 class Context:
     model: Model
     today: date
-    app_risk: Dict[str, Dict[str, Any]] = field(default_factory=dict)        # app id -> risk record
-    tech_support: Dict[str, Dict[str, Any]] = field(default_factory=dict)    # tech id -> support record
-    capability_apps: Dict[str, List[Element]] = field(default_factory=dict)  # capability id -> supporting apps
-    capability_wps: Dict[str, List[Element]] = field(default_factory=dict)  # capability id -> work packages
-    wp_capability_budget: Dict[str, float] = field(default_factory=dict)     # capability id -> allocated budget
+    app_risk: Dict[str, Dict[str, Any]] = field(default_factory=dict)          # app id -> risk record
+    process_services: Dict[str, List[Element]] = field(default_factory=dict)   # process id -> serving services
+    service_apps: Dict[str, List[Element]] = field(default_factory=dict)       # service id -> realizing apps
+    capability_processes: Dict[str, List[Element]] = field(default_factory=dict)
+    capability_plateaus: Dict[str, List[Element]] = field(default_factory=dict)
+    plateau_packages: Dict[str, List[Element]] = field(default_factory=dict)  # plateau id -> work packages
+    wp_status: Dict[str, Optional[str]] = field(default_factory=dict)
+
+    def process_apps(self, process_id: str) -> List[Element]:
+        return _unique(a for s in self.process_services.get(process_id, []) for a in self.service_apps.get(s.id, []))
+
+    def capability_apps(self, capability_id: str) -> List[Element]:
+        return _unique(a for p in self.capability_processes.get(capability_id, []) for a in self.process_apps(p.id))
 
 
-def _support_record(e: Element, today: date) -> Dict[str, Any]:
-    end = _date(e.prop("vendorSupportEnd"))
-    lifecycle = _enum(e.prop("lifecycle"), _LIFECYCLE_ALIASES)
-    months = _months_between(today, end) if end else None
-    if end is not None:
-        if end < today:
-            status = "out"
-        elif _within_months(today, end, 12):
-            status = "expiring-12"
-        elif _within_months(today, end, 24):
-            status = "expiring-24"
-        else:
-            status = "supported"
-    elif lifecycle == "end-of-life":
-        status = "out"
-    else:
-        status = "unknown"
-    return {"vendorSupportEnd": end.isoformat() if end else None, "monthsOfSupport": months, "status": status,
-            "lifecycle": lifecycle}
-
-
-def _app_risk(app: Element, ctx: Context) -> Dict[str, Any]:
+def _app_risk(app: Element, today: date) -> Dict[str, Any]:
     reasons: List[Tuple[str, str]] = []  # (level, text)
     eol = _date(app.prop("endOfLife"))
     lifecycle = _enum(app.prop("lifecycle"), _LIFECYCLE_ALIASES)
     time_class = _enum(app.prop("timeClassification"), {t: t for t in TIME_CLASSES})
     if eol is not None:
-        if eol < ctx.today:
+        if eol < today:
             reasons.append(("critical", f"Past end of life ({eol.isoformat()})"))
-        elif _within_months(ctx.today, eol, 12):
+        elif _within_months(today, eol, 12):
             reasons.append(("serious", f"End of life within 12 months ({eol.isoformat()})"))
-        elif _within_months(ctx.today, eol, 24):
+        elif _within_months(today, eol, 24):
             reasons.append(("warning", f"End of life within 24 months ({eol.isoformat()})"))
     elif lifecycle == "end-of-life":
         reasons.append(("critical", "Lifecycle is end of life"))
     if time_class in ("eliminate", "migrate"):
         reasons.append(("warning", f"TIME classification: {TIME_LABELS[time_class]}"))
-    for tech in ctx.model.sources(app.id, ["ServingRelationship", "RealizationRelationship"], TECHNOLOGY_PLATFORM_TYPES):
-        support = ctx.tech_support.get(tech.id)
-        if support and support["status"] == "out":
-            reasons.append(("critical", f"Runs on out-of-support technology: {tech.name}"))
-        elif support and support["status"] == "expiring-12":
-            reasons.append(("serious", f"Technology support ends within 12 months: {tech.name}"))
     return {"level": _worst_risk(level for level, _ in reasons), "reasons": [text for _, text in reasons]}
 
 
 def _prepare(model: Model, today: date) -> Context:
     ctx = Context(model=model, today=today)
-    for tech in model.elements.values():
-        if tech.type in TECHNOLOGY_TYPES:
-            ctx.tech_support[tech.id] = _support_record(tech, today)
     for app in model.of_type("ApplicationComponent"):
-        ctx.app_risk[app.id] = _app_risk(app, ctx)
-
-    # Applications support a capability directly (app realizes capability). Only when a model has
-    # no direct mapping for a capability do we fall back to the processes realising it (app serves
-    # process, process realizes capability) -- mixing both would credit every tool a process touches
-    # to every capability that process realises, which floods the heat map with false risk.
+        ctx.app_risk[app.id] = _app_risk(app, today)
+    for service in model.of_type("ApplicationService"):
+        ctx.service_apps[service.id] = model.sources(service.id, ["RealizationRelationship"], ["ApplicationComponent"])
+    for proc in model.of_type("BusinessProcess"):
+        ctx.process_services[proc.id] = model.sources(proc.id, ["ServingRelationship"], ["ApplicationService"])
     for cap in model.of_type("Capability"):
-        direct = model.sources(cap.id, ["RealizationRelationship"], ["ApplicationComponent"])
-        if direct:
-            ctx.capability_apps[cap.id] = direct
-            continue
-        via_processes: List[Element] = []
-        for proc in model.sources(cap.id, ["RealizationRelationship"], ["BusinessProcess", "BusinessFunction"]):
-            via_processes.extend(model.sources(proc.id, ["ServingRelationship"], ["ApplicationComponent"]))
-        ctx.capability_apps[cap.id] = _unique(via_processes)
-
-    # Work packages change capabilities through a (directed) association or a realization chain
-    # work package -> deliverable -> capability. Budget is split evenly over the capabilities.
+        ctx.capability_processes[cap.id] = model.sources(cap.id, ["RealizationRelationship"], ["BusinessProcess"])
+        ctx.capability_plateaus[cap.id] = sorted(
+            model.sources(cap.id, ["RealizationRelationship"], ["Plateau"]),
+            key=lambda p: (_date(p.prop("targetDate")) or date.max, p.name.lower()))
+    for plateau in model.of_type("Plateau"):
+        ctx.plateau_packages[plateau.id] = model.sources(plateau.id, ["RealizationRelationship"], ["WorkPackage"])
     for wp in model.of_type("WorkPackage"):
-        caps = model.targets(wp.id, ["AssociationRelationship", "RealizationRelationship", "InfluenceRelationship"], ["Capability"])
-        for deliverable in model.targets(wp.id, ["RealizationRelationship"], ["Deliverable"]):
-            caps += model.targets(deliverable.id, ["RealizationRelationship", "AssociationRelationship"], ["Capability"])
-        caps = _unique(caps)
-        budget = _num(wp.prop("budgetEUR"))
-        for cap in caps:
-            ctx.capability_wps.setdefault(cap.id, []).append(wp)
-            if budget:
-                ctx.wp_capability_budget[cap.id] = ctx.wp_capability_budget.get(cap.id, 0.0) + budget / len(caps)
+        ctx.wp_status[wp.id] = _enum(wp.prop("status"), _WORK_STATUS_ALIASES)
     return ctx
 
 
 # ---------------------------------------------------------------------------------------------
-# Strategy layer: capability maturity heat map
+# Strategy: capability maturity heat map and roadmap status per capability
 # ---------------------------------------------------------------------------------------------
 
-def _capability_tree(model: Model) -> Tuple[List[Element], Dict[str, List[Element]], Dict[str, str]]:
+def _capability_groups(model: Model) -> List[Tuple[str, List[Element]]]:
+    """Group capabilities by the capabilityDomain property; where a model uses composition between
+    capabilities instead, the composing (parent) capability names the group."""
     caps = model.of_type("Capability")
-    by_name = {c.name.lower(): c for c in caps}
-    children: Dict[str, List[Element]] = {}
-    parent_of: Dict[str, str] = {}
+    parent_of: Dict[str, Element] = {}
     for cap in caps:
         for child in model.targets(cap.id, ["CompositionRelationship", "AggregationRelationship"], ["Capability"]):
-            if child.id not in parent_of and child.id != cap.id:
-                parent_of[child.id] = cap.id
-    for cap in caps:  # property fallback for models without composition relationships
-        parent = by_name.get((cap.prop("parentCapability") or "").lower())
-        if cap.id not in parent_of and parent and parent.id != cap.id:
-            parent_of[cap.id] = parent.id
-    for child_id, parent_id in parent_of.items():
-        children.setdefault(parent_id, []).append(model.elements[child_id])
-
-    def root(cap_id: str) -> str:
-        seen = set()
-        while cap_id in parent_of and cap_id not in seen:
-            seen.add(cap_id)
-            cap_id = parent_of[cap_id]
-        return cap_id
-
-    roots = sorted({root(c.id) for c in caps}, key=lambda cid: model.elements[cid].name.lower())
-    return [model.elements[r] for r in roots], children, parent_of
+            if child.id != cap.id and child.id not in parent_of:
+                parent_of[child.id] = cap
+    parents = {p.id for p in parent_of.values()}
+    groups: Dict[str, List[Element]] = {}
+    for cap in caps:
+        if cap.id in parents and not cap.prop("maturity"):
+            continue  # a pure grouping capability: its children carry the ratings
+        domain = cap.prop("capabilityDomain") or (parent_of[cap.id].name if cap.id in parent_of else None)
+        groups.setdefault(domain or "Ungrouped capabilities", []).append(cap)
+    return sorted(groups.items(), key=lambda kv: (kv[0] == "Ungrouped capabilities", kv[0].lower()))
 
 
-def _leaves_under(cap: Element, children: Dict[str, List[Element]], seen: Optional[set] = None) -> List[Element]:
-    seen = set() if seen is None else seen
-    if cap.id in seen:  # composition cycle in the model -- stop instead of recursing forever
-        return []
-    seen.add(cap.id)
-    kids = [k for k in children.get(cap.id, []) if k.id not in seen]
-    if not kids:
-        return [cap]
-    out: List[Element] = []
-    for kid in kids:
-        out.extend(_leaves_under(kid, children, seen))
-    return out
+def _roadmap_status(gap: Optional[float], plateaus: List[Element], ctx: Context) -> str:
+    if gap is None:
+        return "not-rated"
+    if gap <= 0:
+        return "at-target"
+    if not plateaus:
+        return "unplanned"
+    statuses = [ctx.wp_status.get(wp.id) for wp in ctx.plateau_packages.get(plateaus[0].id, [])]
+    if statuses and all(s == "completed" for s in statuses):
+        return "delivered"
+    if any(s in ("in-progress", "completed") for s in statuses):
+        return "in-delivery"
+    return "planned"
 
 
-def _capability_record(cap: Element, group: Element, ctx: Context) -> Dict[str, Any]:
+def _capability_record(cap: Element, group: str, ctx: Context) -> Dict[str, Any]:
     maturity = _num(cap.prop("maturity"))
     target = _num(cap.prop("targetMaturity"))
     importance = _enum(cap.prop("strategicImportance"), _IMPORTANCE_ALIASES)
     gap = round(target - maturity, 2) if maturity is not None and target is not None else None
-    apps = ctx.capability_apps.get(cap.id, [])
-    app_records = [{**a.ref(), "risk": ctx.app_risk[a.id]["level"],
-                    "lifecycle": _enum(a.prop("lifecycle"), _LIFECYCLE_ALIASES)} for a in apps]
-    wps = _unique(ctx.capability_wps.get(cap.id, []) + ctx.capability_wps.get(group.id, []))
+    apps = ctx.capability_apps(cap.id)
+    app_records = [{**a.ref(), "risk": ctx.app_risk[a.id]["level"]} for a in apps]
+    plateaus = ctx.capability_plateaus.get(cap.id, [])
+    first = plateaus[0] if plateaus else None
+    packages = ctx.plateau_packages.get(first.id, []) if first else []
     return {
         **cap.ref(),
-        "group": group.name,
+        "group": group,
         "maturity": maturity,
         "targetMaturity": target,
         "gap": gap,
+        # TOGAF Business Capabilities guide heat-map convention: at target / one level / two or more.
+        "gapBand": None if gap is None else "at-target" if gap <= 0 else "one-level" if gap < 2 else "two-plus",
         "importance": importance,
         "priorityScore": round(gap * IMPORTANCE_WEIGHT[importance], 2) if gap is not None and gap > 0 and importance else None,
         "isPriorityGap": bool(gap is not None and gap >= 2 and importance == "high"),
-        # TOGAF Business Capabilities guide heat-map convention: at target / one level / two or more.
-        "gapBand": None if gap is None else "at-target" if gap <= 0 else "one-level" if gap < 2 else "two-plus",
+        "processes": [p.name for p in ctx.capability_processes.get(cap.id, [])],
         "applications": app_records,
         "appRisk": _worst_risk(a["risk"] for a in app_records),
-        "workPackages": [w.name for w in wps],
-        "investmentEUR": round(ctx.wp_capability_budget.get(cap.id, 0.0)) or None,
+        "plateaus": [{"name": p.name, "targetDate": _iso(_date(p.prop("targetDate")))} for p in plateaus],
+        "workPackages": [{"name": w.name, "status": ctx.wp_status.get(w.id)} for w in packages],
+        "roadmapStatus": _roadmap_status(gap, plateaus, ctx),
         "owner": cap.prop("owner"),
     }
 
 
 def strategy_section(ctx: Context) -> Dict[str, Any]:
-    roots, children, _parents = _capability_tree(ctx.model)
     groups, leaves = [], []
-    for root in roots:
-        root_leaves = _leaves_under(root, children)
-        group_name = root.name if children.get(root.id) else "Ungrouped capabilities"
-        records = [_capability_record(leaf, root, ctx) for leaf in root_leaves]
+    for name, caps in _capability_groups(ctx.model):
+        records = [_capability_record(c, name, ctx) for c in caps]
         leaves.extend(records)
-        groups.append({
-            **root.ref(), "name": group_name, "isGroup": bool(children.get(root.id)),
-            "maturity": _avg(r["maturity"] for r in records),
-            "targetMaturity": _avg(r["targetMaturity"] for r in records),
-            "capabilities": records,
-        })
-    # Merge single-capability "ungrouped" roots into one group so the heat map stays readable.
-    grouped = [g for g in groups if g["isGroup"]]
-    loose = [c for g in groups if not g["isGroup"] for c in g["capabilities"]]
-    if loose:
-        grouped.append({"id": "ungrouped", "name": "Ungrouped capabilities", "type": "Capability", "isGroup": False,
-                        "maturity": _avg(c["maturity"] for c in loose),
-                        "targetMaturity": _avg(c["targetMaturity"] for c in loose), "capabilities": loose})
+        groups.append({"name": name, "maturity": _avg(r["maturity"] for r in records),
+                       "targetMaturity": _avg(r["targetMaturity"] for r in records), "capabilities": records})
     rated = [c for c in leaves if c["maturity"] is not None]
     with_target = [c for c in rated if c["targetMaturity"] is not None]
-    supported = [c for c in leaves if c["applications"]]
     priority = [c for c in leaves if c["isPriorityGap"]]
-
-    value_stream = []
-    stages = [vs for vs in ctx.model.of_type("ValueStream") if _num(vs.prop("stageOrder")) is not None]
-    for stage in sorted(stages, key=lambda s: _num(s.prop("stageOrder")) or 0):
-        serving = ctx.model.sources(stage.id, ["ServingRelationship", "RealizationRelationship"], ["Capability"])
-        stage_leaves = [r for cap in serving for r in leaves
-                        if r["id"] == cap.id or r["group"] == cap.name]
-        value_stream.append({**stage.ref(), "order": _num(stage.prop("stageOrder")),
-                             "maturity": _avg(r["maturity"] for r in stage_leaves),
-                             "targetMaturity": _avg(r["targetMaturity"] for r in stage_leaves),
-                             "capabilities": [c.name for c in serving]})
     return {
-        "groups": grouped,
-        "valueStream": value_stream,
+        "groups": groups,
         "kpis": {
             "capabilityCount": len(leaves),
             "ratedCount": len(rated),
             "avgMaturity": _avg(c["maturity"] for c in rated),
             "avgTargetMaturity": _avg(c["targetMaturity"] for c in with_target),
-            "avgGap": _avg(c["gap"] for c in with_target),
             "priorityGapCount": len(priority),
-            "coverageShare": round(len(supported) / len(leaves), 3) if leaves else None,
-            "unsupportedCapabilities": [c["name"] for c in leaves if not c["applications"]],
+            "processCoverage": round(sum(1 for c in leaves if c["processes"]) / len(leaves), 3) if leaves else None,
+            "applicationCoverage": round(sum(1 for c in leaves if c["applications"]) / len(leaves), 3) if leaves else None,
+            "withoutProcess": [c["name"] for c in leaves if not c["processes"]],
+            "withoutApplication": [c["name"] for c in leaves if c["processes"] and not c["applications"]],
+        },
+    }
+
+
+def roadmap_coverage_section(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    gaps = [c for g in strategy["groups"] for c in g["capabilities"] if c["gap"] is not None and c["gap"] > 0]
+    gaps.sort(key=lambda c: (-(c["priorityScore"] or 0), -(c["gap"] or 0), c["name"]))
+    priority = [c for c in gaps if c["isPriorityGap"]]
+    keys = ("id", "name", "group", "maturity", "targetMaturity", "gap", "importance", "priorityScore", "isPriorityGap",
+            "plateaus", "workPackages", "roadmapStatus", "appRisk")
+    return {
+        "capabilityGaps": [{k: c[k] for k in keys} for c in gaps],
+        "kpis": {
+            "capabilitiesWithGap": len(gaps),
+            "unplannedGaps": sum(1 for c in gaps if c["roadmapStatus"] == "unplanned"),
+            "priorityGaps": len(priority),
+            "priorityGapsPlanned": sum(1 for c in priority if c["roadmapStatus"] != "unplanned"),
+            "priorityGapsUnplanned": [c["name"] for c in priority if c["roadmapStatus"] == "unplanned"],
         },
     }
 
 
 # ---------------------------------------------------------------------------------------------
-# Business layer: process maturity, automation, media breaks along the value stream
+# Business: As-Is / To-Be processes from the assessment, process ratings
 # ---------------------------------------------------------------------------------------------
 
-BUSINESS_KEYS = ["maturity", "automationLevel", "mediaBreaks", "valueStreamStage"]
+BUSINESS_KEYS = ["maturity", "automationLevel", "mediaBreaks"]
 
 
 def business_section(ctx: Context) -> Dict[str, Any]:
     model = ctx.model
     processes = model.of_type("BusinessProcess")
-    rated = [p for p in processes if p.has_any(BUSINESS_KEYS)]
-    stage_order = {vs.name: _num(vs.prop("stageOrder")) for vs in model.of_type("ValueStream") if vs.prop("stageOrder")}
-    stages: Dict[str, Dict[str, Any]] = {}
-    for proc in rated:
-        stage_name = proc.prop("valueStreamStage") or "Unassigned"
-        stage = stages.setdefault(stage_name, {"name": stage_name, "order": stage_order.get(stage_name), "processes": []})
-        apps = model.sources(proc.id, ["ServingRelationship"], ["ApplicationComponent"])
-        stage["processes"].append({
+    is_target = {p.id: _key(p.prop("status") or "") in ("target", "tobe", "future") for p in processes}
+    records = []
+    for proc in processes:
+        mapped = model.associated(proc.id, ["BusinessProcess"])
+        records.append({
             **proc.ref(),
+            "state": "to-be" if is_target[proc.id] else "as-is",
+            "phase": proc.prop("processPhase"),
             "maturity": _num(proc.prop("maturity")),
             "automation": _enum(proc.prop("automationLevel"), _AUTOMATION_ALIASES),
             "mediaBreaks": _num(proc.prop("mediaBreaks")),
-            "applications": [a.name for a in apps],
-            "roles": [r.name for r in model.sources(proc.id, ["AssignmentRelationship"], ["BusinessRole", "BusinessActor"])],
+            "rated": proc.has_any(BUSINESS_KEYS),
+            "services": [s.name for s in ctx.process_services.get(proc.id, [])],
+            "capabilities": [c.name for c in model.targets(proc.id, ["RealizationRelationship"], ["Capability"])],
+            "mappedTo": [m.name for m in mapped if is_target[m.id] != is_target[proc.id]],
+            "gaps": [g.name for g in model.associated(proc.id, ["Gap"])],
         })
-    ordered = sorted(stages.values(), key=lambda s: (s["order"] is None, s["order"] or 0, s["name"]))
-    for stage in ordered:
-        procs = stage["processes"]
-        stage["avgMaturity"] = _avg(p["maturity"] for p in procs)
-        stage["mediaBreaks"] = sum(p["mediaBreaks"] or 0 for p in procs)
-        stage["automation"] = {level: sum(1 for p in procs if p["automation"] == level) for level in AUTOMATION_LEVELS}
-        stage["automation"]["unknown"] = sum(1 for p in procs if p["automation"] is None)
-    all_procs = [p for s in ordered for p in s["processes"]]
-    with_automation = [p for p in all_procs if p["automation"]]
+    rated = [r for r in records if r["rated"]]
+    phases: Dict[str, Dict[str, Any]] = {}
+    for r in rated:
+        phase = phases.setdefault(r["phase"] or "No phase", {"name": r["phase"] or "No phase", "processes": [], "mediaBreaks": 0.0})
+        phase["processes"].append(r["name"])
+        phase["mediaBreaks"] += r["mediaBreaks"] or 0
+    as_is = [r for r in records if r["state"] == "as-is"]
+    to_be = [r for r in records if r["state"] == "to-be"]
+    with_automation = [r for r in rated if r["automation"]]
     return {
-        "stages": ordered,
+        "processes": records,
+        "phases": list(phases.values()),
         "kpis": {
-            "processCount": len(processes),
+            "processCount": len(records),
+            "asIsCount": len(as_is),
+            "toBeCount": len(to_be),
+            "toBeTraced": sum(1 for r in to_be if r["mappedTo"]),
+            "asIsCovered": sum(1 for r in as_is if r["mappedTo"]),
+            "processesWithGaps": sum(1 for r in records if r["gaps"]),
             "ratedCount": len(rated),
-            "avgMaturity": _avg(p["maturity"] for p in all_procs),
-            "mediaBreaks": sum(p["mediaBreaks"] or 0 for p in all_procs),
-            "manualShare": round(sum(1 for p in with_automation if p["automation"] == "manual") / len(with_automation), 3)
+            "avgMaturity": _avg(r["maturity"] for r in rated),
+            "mediaBreaks": sum(r["mediaBreaks"] or 0 for r in rated),
+            "manualShare": round(sum(1 for r in with_automation if r["automation"] == "manual") / len(with_automation), 3)
             if with_automation else None,
-            "unsupportedProcesses": [p["name"] for p in all_procs if not p["applications"]],
+            "ratedWithoutService": [r["name"] for r in rated if not r["services"]],
         },
     }
 
 
 # ---------------------------------------------------------------------------------------------
-# Application layer: lifecycle, end of life, TIME portfolio, cost, redundancy
+# Application: lifecycle, end of life, TIME portfolio, business use
 # ---------------------------------------------------------------------------------------------
 
 def fit_quadrant(functional: Optional[float], technical: Optional[float]) -> Optional[str]:
@@ -585,9 +545,9 @@ def fit_quadrant(functional: Optional[float], technical: Optional[float]) -> Opt
     high_f, high_t = functional >= 3, technical >= 3
     if high_f and high_t:
         return "invest"
-    if high_f and not high_t:
+    if high_f:
         return "migrate"
-    if not high_f and high_t:
+    if high_t:
         return "tolerate"
     return "eliminate"
 
@@ -598,128 +558,48 @@ def application_section(ctx: Context) -> Dict[str, Any]:
     for app in model.of_type("ApplicationComponent"):
         eol = _date(app.prop("endOfLife"))
         functional, technical = _num(app.prop("functionalFit")), _num(app.prop("technicalFit"))
-        caps = model.targets(app.id, ["RealizationRelationship"], ["Capability"])
-        techs = model.sources(app.id, ["ServingRelationship", "RealizationRelationship"], TECHNOLOGY_PLATFORM_TYPES)
+        services = model.targets(app.id, ["RealizationRelationship"], ["ApplicationService"])
+        processes = _unique(p for s in services for p in model.targets(s.id, ["ServingRelationship"], ["BusinessProcess"]))
         apps.append({
             **app.ref(),
             "category": app.prop("applicationCategory") or app.prop("category"),
             "vendor": app.prop("vendor"),
             "lifecycle": _enum(app.prop("lifecycle"), _LIFECYCLE_ALIASES),
-            "endOfLife": eol.isoformat() if eol else None,
+            "endOfLife": _iso(eol),
             "monthsToEndOfLife": _months_between(today, eol) if eol else None,
             "timeClassification": _enum(app.prop("timeClassification"), {t: t for t in TIME_CLASSES}),
             "functionalFit": functional,
             "technicalFit": technical,
             "fitQuadrant": fit_quadrant(functional, technical),
             "criticality": _enum(app.prop("businessCriticality"), _CRITICALITY_ALIASES),
-            "annualCostEUR": _num(app.prop("annualCostEUR")),
-            "users": _num(app.prop("users")),
-            "hosting": app.prop("hosting"),
             "risk": ctx.app_risk[app.id],
-            "capabilities": [c.name for c in caps],
-            "technology": [{"name": t.name, "supportStatus": ctx.tech_support.get(t.id, {}).get("status", "unknown")} for t in techs],
+            "services": [s.name for s in services],
+            "processes": [p.name for p in processes],
         })
-    in_portfolio = [a for a in apps if a["lifecycle"] != "end-of-life" or (a["endOfLife"] and a["endOfLife"] >= today.isoformat())]
-
-    lifecycle = [{"phase": p, "label": LIFECYCLE_LABELS[p],
-                  "count": sum(1 for a in apps if a["lifecycle"] == p),
-                  "annualCostEUR": sum(a["annualCostEUR"] or 0 for a in apps if a["lifecycle"] == p)}
-                 for p in LIFECYCLE_PHASES]
-    unknown_lifecycle = sum(1 for a in apps if a["lifecycle"] is None)
-    time_classes = [{"time": t, "label": TIME_LABELS[t],
-                     "count": sum(1 for a in apps if a["timeClassification"] == t),
-                     "annualCostEUR": sum(a["annualCostEUR"] or 0 for a in apps if a["timeClassification"] == t)}
-                    for t in TIME_CLASSES]
-    total_cost = sum(a["annualCostEUR"] or 0 for a in apps)
-    at_risk_cost = sum(t["annualCostEUR"] for t in time_classes if t["time"] in ("migrate", "eliminate"))
-
     eol_apps = sorted((a for a in apps if a["endOfLife"]), key=lambda a: a["endOfLife"])
     past = [a for a in eol_apps if date.fromisoformat(a["endOfLife"]) < today]
     within_24 = [a for a in eol_apps if _within_months(today, date.fromisoformat(a["endOfLife"]), 24)]
-
-    # Redundancy: a leaf capability realised directly by two or more live applications.
-    redundancy = []
-    _roots, children, _parents = _capability_tree(model)
-    for cap in model.of_type("Capability"):
-        if children.get(cap.id):
-            continue
-        live = [a for a in model.sources(cap.id, ["RealizationRelationship"], ["ApplicationComponent"])
-                if _enum(a.prop("lifecycle"), _LIFECYCLE_ALIASES) in ("phase-in", "active", "phase-out")]
-        if len(live) >= 2:
-            redundancy.append({**cap.ref(), "applications": [a.name for a in live]})
     return {
         "applications": apps,
-        "lifecycle": lifecycle,
-        "unknownLifecycle": unknown_lifecycle,
-        "timeClasses": time_classes,
+        "lifecycle": [{"phase": p, "label": LIFECYCLE_LABELS[p], "count": sum(1 for a in apps if a["lifecycle"] == p)}
+                      for p in LIFECYCLE_PHASES],
+        "unknownLifecycle": sum(1 for a in apps if a["lifecycle"] is None),
         "endOfLife": [{k: a[k] for k in ("id", "name", "endOfLife", "monthsToEndOfLife", "lifecycle", "criticality",
                                           "timeClassification", "risk")} for a in eol_apps],
-        "redundancy": sorted(redundancy, key=lambda r: (-len(r["applications"]), r["name"])),
         "kpis": {
             "applicationCount": len(apps),
-            "inPortfolio": len(in_portfolio),
             "pastEndOfLife": len(past),
             "endOfLifeWithin24Months": len(within_24),
-            "annualCostEUR": total_cost,
-            "migrateEliminateCostEUR": at_risk_cost,
-            "migrateEliminateCostShare": round(at_risk_cost / total_cost, 3) if total_cost else None,
-            "redundantCapabilities": len(redundancy),
+            "migrateOrEliminate": sum(1 for a in apps if a["timeClassification"] in ("migrate", "eliminate")),
             "criticalAppsAtRisk": sum(1 for a in apps if a["criticality"] in ("mission-critical", "business-critical")
                                       and a["risk"]["level"] in ("serious", "critical")),
+            "withoutBusinessUse": [a["name"] for a in apps if not a["processes"]],
         },
     }
 
 
 # ---------------------------------------------------------------------------------------------
-# Technology layer: vendor support runway, technology radar, risk propagation to applications
-# ---------------------------------------------------------------------------------------------
-
-def technology_section(ctx: Context) -> Dict[str, Any]:
-    model = ctx.model
-    components = []
-    for tech in model.of_type(*sorted(TECHNOLOGY_TYPES)):
-        support = ctx.tech_support[tech.id]
-        served = model.targets(tech.id, ["ServingRelationship", "RealizationRelationship"], ["ApplicationComponent"])
-        components.append({
-            **tech.ref(),
-            "category": tech.prop("technologyCategory") or tech.prop("category"),
-            "vendor": tech.prop("vendor"),
-            "version": tech.prop("version"),
-            "lifecycle": support["lifecycle"],
-            "vendorSupportEnd": support["vendorSupportEnd"],
-            "monthsOfSupport": support["monthsOfSupport"],
-            "supportStatus": support["status"],
-            "radar": _enum(tech.prop("techRadar"), {r: r for r in RADAR_RINGS}),
-            "hosting": tech.prop("hosting"),
-            "applications": [{"name": a.name, "criticality": _enum(a.prop("businessCriticality"), _CRITICALITY_ALIASES)}
-                             for a in served],
-        })
-    platforms = [c for c in components if c["type"] in TECHNOLOGY_PLATFORM_TYPES]
-    known = [c for c in platforms if c["supportStatus"] != "unknown"]
-    out = [c for c in platforms if c["supportStatus"] == "out"]
-    apps_on_out = sorted({a["name"] for c in out for a in c["applications"]})
-    critical_on_out = sorted({a["name"] for c in out for a in c["applications"]
-                              if a["criticality"] in ("mission-critical", "business-critical")})
-    buckets = ["out", "expiring-12", "expiring-24", "supported", "unknown"]
-    return {
-        "components": components,
-        "supportBuckets": [{"status": b, "count": sum(1 for c in platforms if c["supportStatus"] == b)} for b in buckets],
-        "radar": [{"ring": r, "count": sum(1 for c in components if c["radar"] == r)} for r in RADAR_RINGS],
-        "kpis": {
-            "componentCount": len(components),
-            "platformCount": len(platforms),
-            "withSupportDate": len(known),
-            "outOfSupport": len(out),
-            "outOfSupportShare": round(len(out) / len(known), 3) if known else None,
-            "expiringWithin12Months": sum(1 for c in platforms if c["supportStatus"] == "expiring-12"),
-            "applicationsOnUnsupported": apps_on_out,
-            "criticalApplicationsOnUnsupported": critical_on_out,
-        },
-    }
-
-
-# ---------------------------------------------------------------------------------------------
-# Motivation layer: outcome KPIs against baseline and target
+# Motivation: outcome KPIs against baseline and target
 # ---------------------------------------------------------------------------------------------
 
 def _outcome_status(progress: Optional[float], expected: Optional[float]) -> str:
@@ -763,14 +643,14 @@ def motivation_section(ctx: Context) -> Dict[str, Any]:
             "kpi": o.prop("kpi") or o.name,
             "unit": o.prop("unit"),
             "baseline": baseline, "current": current, "target": target, "direction": direction,
-            "baselineDate": baseline_date.isoformat() if baseline_date else None,
-            "targetDate": target_date.isoformat() if target_date else None,
+            "baselineDate": _iso(baseline_date),
+            "targetDate": _iso(target_date),
             "measuredAt": measured.isoformat() if o.prop("measuredAt") else None,
             "progress": _round(progress, 3),
             "expectedProgress": _round(expected, 3),
             "status": status,
-            "goals": [g.name for g in model.targets(o.id, ["RealizationRelationship", "InfluenceRelationship"], ["Goal"])],
-            "capabilities": [c.name for c in model.sources(o.id, ["RealizationRelationship", "InfluenceRelationship"], ["Capability"])],
+            "goals": [g.name for g in model.targets(o.id, ["RealizationRelationship"], ["Goal"])],
+            "capabilities": [c.name for c in model.sources(o.id, ["RealizationRelationship"], ["Capability"])],
         })
     by_goal: Dict[str, List[Dict[str, Any]]] = {}
     for o in outcomes:
@@ -779,127 +659,81 @@ def motivation_section(ctx: Context) -> Dict[str, Any]:
     goals = []
     for g in model.of_type("Goal"):
         linked = by_goal.get(g.name, [])
-        goals.append({**g.ref(), "targetDate": g.prop("targetDate"),
+        goals.append({**g.ref(), "targetDate": _iso(_date(g.prop("targetDate"))),
                       "progress": _avg(min(max(o["progress"], 0), 1) for o in linked if o["progress"] is not None),
-                      "outcomes": [o["name"] for o in linked],
-                      "drivers": [d.name for d in model.sources(g.id, ["InfluenceRelationship", "AssociationRelationship"], ["Driver"])]})
+                      "outcomes": [o["name"] for o in linked]})
     tracked = [o for o in outcomes if o["progress"] is not None]
     counts = {s: sum(1 for o in tracked if o["status"] == s) for s in ("achieved", "on-track", "at-risk", "off-track", "missed", "tracking")}
     return {
         "outcomes": outcomes,
         "goals": goals,
-        "drivers": [{**d.ref(), "goals": [g.name for g in model.targets(d.id, ["InfluenceRelationship", "AssociationRelationship"], ["Goal"])]}
-                    for d in model.of_type("Driver")],
         "kpis": {
             "outcomeCount": len(outcomes),
             "trackedCount": len(tracked),
             **{s.replace("-", "_"): n for s, n in counts.items()},
             "onTrackOrAchieved": counts["achieved"] + counts["on-track"],
-            "avgProgress": _avg(min(max(o["progress"], 0), 1) for o in tracked),
+            "goalsWithoutOutcome": [g["name"] for g in goals if not g["outcomes"]],
         },
     }
 
 
 # ---------------------------------------------------------------------------------------------
-# Implementation & Migration: roadmap, schedule and cost performance (earned-value lite)
+# Implementation & Migration: plateaus, work packages, gaps
 # ---------------------------------------------------------------------------------------------
 
 def implementation_section(ctx: Context) -> Dict[str, Any]:
     model, today = ctx.model, ctx.today
-    plateau_dates = {p.name: _date(p.prop("targetDate")) for p in model.of_type("Plateau")}
+    plateau_dates = {p.id: _date(p.prop("targetDate")) for p in model.of_type("Plateau")}
     packages = []
     for wp in model.of_type("WorkPackage"):
         start, end = _date(wp.prop("startDate")), _date(wp.prop("endDate"))
-        progress = _num(wp.prop("progress"))
-        progress = None if progress is None else min(max(progress, 0.0), 100.0) / 100.0
-        budget, actual = _num(wp.prop("budgetEUR")), _num(wp.prop("actualCostEUR"))
-        planned = None
-        if start and end and end > start:
-            planned = min(max((today - start).days / (end - start).days, 0.0), 1.0)
-        earned = budget * progress if budget is not None and progress is not None else None
-        spi = progress / planned if progress is not None and planned else None
-        cpi = earned / actual if earned is not None and actual else None
-        overdue = bool(end and end < today and (progress is None or progress < 1))
-        rag = _enum(wp.prop("rag"), _RAG_ALIASES)
-        computed = "green"
-        if overdue or (spi is not None and spi < 0.8) or (cpi is not None and cpi < 0.8):
-            computed = "red"
-        elif (spi is not None and spi < 0.95) or (cpi is not None and cpi < 0.95):
-            computed = "amber"
-        targets = model.targets(wp.id, ["AssociationRelationship", "RealizationRelationship", "InfluenceRelationship"])
+        status = ctx.wp_status.get(wp.id)
+        plateaus = sorted(model.targets(wp.id, ["RealizationRelationship"], ["Plateau"]),
+                          key=lambda p: (plateau_dates.get(p.id) or date.max, p.name.lower()))
+        first_date = plateau_dates.get(plateaus[0].id) if plateaus else None
         packages.append({
             **wp.ref(),
-            "plateau": wp.prop("plateau"),
             "owner": wp.prop("owner"),
-            "startDate": start.isoformat() if start else None,
-            "endDate": end.isoformat() if end else None,
-            "progress": _round(progress, 3),
-            "plannedProgress": _round(planned, 3),
-            "spi": _round(spi),
-            "budgetEUR": budget,
-            "actualCostEUR": actual,
-            "earnedValueEUR": _round(earned, 0),
-            "cpi": _round(cpi),
-            "estimateAtCompletionEUR": _round(budget / cpi, 0) if budget is not None and cpi else None,
-            "burn": _round(actual / budget, 3) if budget and actual is not None else None,
-            "overdue": overdue,
-            "rag": rag,
-            "computedHealth": computed if progress is not None or start else None,
-            "capabilities": [t.name for t in targets if t.type == "Capability"],
-            "changes": [t.name for t in targets if t.type != "Capability"],
+            "status": status,
+            "startDate": _iso(start),
+            "endDate": _iso(end),
+            "plateaus": [p.name for p in plateaus],
+            "overdue": bool(end and end < today and status != "completed"),
+            "lateStart": bool(start and start < today and status == "planned"),
+            "endsAfterPlateau": bool(end and first_date and end > first_date and status != "completed"),
         })
-    order = {name: i for i, (name, _d) in enumerate(sorted(plateau_dates.items(), key=lambda kv: (kv[1] is None, kv[1] or date.max)))}
-    packages.sort(key=lambda w: (order.get(w["plateau"] or "", len(order)), w["startDate"] or "9999", w["name"]))
-    plateaus = [{"name": name, "targetDate": d.isoformat() if d else None,
-                 "workPackages": [w["id"] for w in packages if w["plateau"] == name]}
-                for name, d in sorted(plateau_dates.items(), key=lambda kv: (kv[1] is None, kv[1] or date.max))]
+    plateaus = []
+    for p in sorted(model.of_type("Plateau"), key=lambda p: (plateau_dates.get(p.id) or date.max, p.name.lower())):
+        wps = [w for w in packages if p.name in w["plateaus"]]
+        plateaus.append({
+            **p.ref(),
+            "targetDate": _iso(plateau_dates.get(p.id)),
+            "workPackages": [w["id"] for w in wps],
+            "completed": sum(1 for w in wps if w["status"] == "completed"),
+            "capabilities": [c.name for c in model.targets(p.id, ["RealizationRelationship"], ["Capability"])],
+            "gaps": [g.name for g in model.associated(p.id, ["Gap"])],
+        })
+    gaps = []
+    for g in model.of_type("Gap"):
+        assigned = model.associated(g.id, ["Plateau"])
+        gaps.append({**g.ref(), "plateaus": [p.name for p in assigned],
+                     "processes": [p.name for p in model.associated(g.id, ["BusinessProcess"])]})
     scheduled = [w for w in packages if w["startDate"] and w["endDate"]]
-    budget_total = sum(w["budgetEUR"] or 0 for w in packages)
-    actual_total = sum(w["actualCostEUR"] or 0 for w in packages)
-    earned_total = sum(w["earnedValueEUR"] or 0 for w in packages)
-    planned_value = sum((w["budgetEUR"] or 0) * (w["plannedProgress"] or 0) for w in packages)
     return {
         "workPackages": packages,
         "plateaus": plateaus,
+        "gaps": sorted(gaps, key=lambda g: (bool(g["plateaus"]), g["name"].lower())),
         "timeline": {"start": min((w["startDate"] for w in scheduled), default=None),
-                     "end": max((w["endDate"] for w in scheduled), default=None),
-                     "today": today.isoformat()},
+                     "end": max((w["endDate"] for w in scheduled), default=None), "today": today.isoformat()},
         "kpis": {
             "workPackageCount": len(packages),
-            "budgetEUR": budget_total,
-            "actualCostEUR": actual_total,
-            "earnedValueEUR": round(earned_total),
-            "plannedValueEUR": round(planned_value),
-            "burn": round(actual_total / budget_total, 3) if budget_total else None,
-            "progress": round(earned_total / budget_total, 3) if budget_total else None,
-            "plannedProgress": round(planned_value / budget_total, 3) if budget_total else None,
-            "spi": round(earned_total / planned_value, 2) if planned_value else None,
-            "cpi": round(earned_total / actual_total, 2) if actual_total else None,
+            **{s.replace("-", "_"): sum(1 for w in packages if w["status"] == s) for s in WORK_STATUSES},
             "overdue": sum(1 for w in packages if w["overdue"]),
-            **{f"rag_{r}": sum(1 for w in packages if w["rag"] == r) for r in RAG_LEVELS},
-        },
-    }
-
-
-# ---------------------------------------------------------------------------------------------
-# Cross-layer: are the capability gaps that matter being invested in?
-# ---------------------------------------------------------------------------------------------
-
-def cross_layer_section(strategy: Dict[str, Any]) -> Dict[str, Any]:
-    gaps = [c for g in strategy["groups"] for c in g["capabilities"] if c["gap"] is not None and c["gap"] > 0]
-    gaps.sort(key=lambda c: (-(c["priorityScore"] or 0), -(c["gap"] or 0), c["name"]))
-    priority = [c for c in gaps if c["isPriorityGap"]]
-    return {
-        "gapCoverage": [{k: c[k] for k in ("id", "name", "group", "maturity", "targetMaturity", "gap", "importance",
-                                           "priorityScore", "isPriorityGap", "investmentEUR", "workPackages", "appRisk")}
-                        for c in gaps],
-        "kpis": {
-            "capabilitiesWithGap": len(gaps),
-            "priorityGaps": len(priority),
-            "priorityGapsAddressed": sum(1 for c in priority if c["workPackages"]),
-            "priorityGapsUnaddressed": [c["name"] for c in priority if not c["workPackages"]],
-            "investedCapabilitiesWithoutGap": [c["name"] for g in strategy["groups"] for c in g["capabilities"]
-                                               if c["workPackages"] and c["gap"] is not None and c["gap"] <= 0],
+            "lateStart": sum(1 for w in packages if w["lateStart"]),
+            "endsAfterPlateau": sum(1 for w in packages if w["endsAfterPlateau"]),
+            "withoutPlateau": [w["name"] for w in packages if not w["plateaus"]],
+            "gapCount": len(gaps),
+            "gapsWithoutPlateau": sum(1 for g in gaps if not g["plateaus"]),
         },
     }
 
@@ -909,16 +743,9 @@ def cross_layer_section(strategy: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------------------------
 
 def data_quality_section(ctx: Context) -> List[Dict[str, Any]]:
-    model = ctx.model
-    _roots, children, _parents = _capability_tree(model)
     rows = []
     for layer, element_type, label, keys in EXPECTED_PROPERTIES:
-        if element_type == "*technology":
-            elements = [e for e in model.elements.values() if e.type in TECHNOLOGY_PLATFORM_TYPES]
-        elif element_type == "Capability":
-            elements = [c for c in model.of_type("Capability") if not children.get(c.id)]
-        else:
-            elements = model.of_type(element_type)
+        elements = ctx.model.of_type(element_type)
         rows.append({
             "layer": layer, "elementType": element_type, "label": label, "total": len(elements),
             "complete": sum(1 for e in elements if all(e.prop(k) is not None for k in keys)),
@@ -931,31 +758,25 @@ def data_quality_section(ctx: Context) -> List[Dict[str, Any]]:
 # Assembly
 # ---------------------------------------------------------------------------------------------
 
-def _headline(strategy, business, application, technology, motivation, implementation, cross) -> List[Dict[str, Any]]:
-    s, b, a, t, m, i, x = (strategy["kpis"], business["kpis"], application["kpis"], technology["kpis"],
-                           motivation["kpis"], implementation["kpis"], cross["kpis"])
+def _headline(strategy, coverage, business, application, motivation, implementation) -> List[Dict[str, Any]]:
+    s, c, b, a, m, i = (strategy["kpis"], coverage["kpis"], business["kpis"], application["kpis"],
+                        motivation["kpis"], implementation["kpis"])
     return [
-        {"id": "strategy", "layer": "Strategy", "label": "Average capability maturity",
-         "value": s["avgMaturity"], "format": "decimal", "target": s["avgTargetMaturity"], "targetLabel": "target",
-         "detail": f"{x['priorityGaps']} priority gaps · {s['ratedCount']} of {s['capabilityCount']} capabilities rated"},
-        {"id": "business", "layer": "Business", "label": "Media breaks in the engineering process chain",
-         "value": b["mediaBreaks"] if b["ratedCount"] else None, "format": "integer",
-         "detail": f"{b['ratedCount']} of {b['processCount']} processes rated"
-                   + (f" · {round(b['manualShare'] * 100)}% manual" if b["manualShare"] is not None else "")},
-        {"id": "application", "layer": "Application", "label": "Applications reaching end of life within 24 months",
-         "value": a["endOfLifeWithin24Months"] if a["applicationCount"] else None, "format": "integer",
-         "detail": f"{a['pastEndOfLife']} already past end of life · {a['applicationCount']} applications"},
-        {"id": "technology", "layer": "Technology", "label": "Technology out of vendor support",
-         "value": t["outOfSupportShare"], "format": "percent",
-         "detail": f"{t['outOfSupport']} of {t['withSupportDate']} platforms · "
-                   f"{len(t['criticalApplicationsOnUnsupported'])} critical apps affected"},
         {"id": "motivation", "layer": "Motivation", "label": "Outcome KPIs on track",
          "value": m["onTrackOrAchieved"] if m["trackedCount"] else None, "format": "integer", "of": m["trackedCount"],
          "detail": f"{m['at_risk']} at risk · {m['off_track'] + m['missed']} off track"},
-        {"id": "implementation", "layer": "Implementation & Migration", "label": "Roadmap progress (earned value)",
-         "value": i["progress"], "format": "percent", "target": i["plannedProgress"], "targetLabel": "planned",
-         "detail": f"{i['overdue']} overdue · {i['rag_red']} red · budget burn "
-                   + (f"{round(i['burn'] * 100)}%" if i["burn"] is not None else "n/a")},
+        {"id": "strategy", "layer": "Strategy", "label": "Average capability maturity",
+         "value": s["avgMaturity"], "format": "decimal", "target": s["avgTargetMaturity"], "targetLabel": "target",
+         "detail": f"{c['priorityGaps']} priority gaps · {len(c['priorityGapsUnplanned'])} not planned in any plateau"},
+        {"id": "business", "layer": "Business", "label": "To-Be processes traced to the As-Is",
+         "value": b["toBeTraced"] if b["toBeCount"] else None, "format": "integer", "of": b["toBeCount"],
+         "detail": f"{b['asIsCount']} As-Is processes · {b['processesWithGaps']} affected by gaps"},
+        {"id": "application", "layer": "Application", "label": "Applications reaching end of life within 24 months",
+         "value": a["endOfLifeWithin24Months"] if a["applicationCount"] else None, "format": "integer",
+         "detail": f"{a['pastEndOfLife']} already past end of life · {a['applicationCount']} applications"},
+        {"id": "implementation", "layer": "Implementation & Migration", "label": "Work packages completed",
+         "value": i["completed"] if i["workPackageCount"] else None, "format": "integer", "of": i["workPackageCount"],
+         "detail": f"{i['in_progress']} in progress · {i['overdue']} overdue · {i['gapsWithoutPlateau']} gaps without plateau"},
     ]
 
 
@@ -963,12 +784,11 @@ def compute_dashboard(snapshot: Dict[str, Any], today: date) -> Dict[str, Any]:
     model = _build_model(snapshot)
     ctx = _prepare(model, today)
     strategy = strategy_section(ctx)
+    coverage = roadmap_coverage_section(strategy)
     business = business_section(ctx)
     application = application_section(ctx)
-    technology = technology_section(ctx)
     motivation = motivation_section(ctx)
     implementation = implementation_section(ctx)
-    cross = cross_layer_section(strategy)
     info = model.info
     return {
         "model": {
@@ -980,14 +800,13 @@ def compute_dashboard(snapshot: Dict[str, Any], today: date) -> Dict[str, Any]:
         },
         "asOf": today.isoformat(),
         "fetchedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "headline": _headline(strategy, business, application, technology, motivation, implementation, cross),
+        "headline": _headline(strategy, coverage, business, application, motivation, implementation),
+        "motivation": motivation,
         "strategy": strategy,
+        "roadmapCoverage": coverage,
         "business": business,
         "application": application,
-        "technology": technology,
-        "motivation": motivation,
         "implementation": implementation,
-        "crossLayer": cross,
         "dataQuality": data_quality_section(ctx),
     }
 
