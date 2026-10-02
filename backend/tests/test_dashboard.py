@@ -7,6 +7,7 @@ Run:  docker run --rm -v "$PWD/backend:/app" -w /app archi-local-chatbot-backend
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import date
 
@@ -187,6 +188,14 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual((kpis["pastEndOfLife"], kpis["endOfLifeWithin24Months"]), (1, 0))
         self.assertEqual(kpis["withoutBusinessUse"], ["Unused app"])
 
+    def test_end_of_life_tile_needs_dated_applications(self):
+        tile = next(t for t in self.result["headline"] if t["id"] == "application")
+        self.assertEqual(tile["value"], 0)                     # dated applications, none due within 24 months
+        undated = d.compute_dashboard({"info": {}, "elements": [el("x", "App", "ApplicationComponent", "Application")],
+                                       "relationships": []}, TODAY)
+        tile = next(t for t in undated["headline"] if t["id"] == "application")
+        self.assertIsNone(tile["value"])                      # no endOfLife anywhere: "no data", not 0
+
     def test_outcome_progress_lower_is_better(self):
         outcomes = {o["name"]: o for o in self.result["motivation"]["outcomes"]}
         lead_time = outcomes["Shorter change lead time"]
@@ -228,6 +237,36 @@ class DashboardTests(unittest.TestCase):
         groups = {g["name"]: [c["name"] for c in g["capabilities"]] for g in d.compute_dashboard(snap, TODAY)["strategy"]["groups"]}
         self.assertEqual(groups["Parent"], ["Child"])
         self.assertIn("Cycle A", [n for names in groups.values() for n in names])
+
+
+class PagingMcp:
+    """search-relationships as the Archi plugin pages it: 500 items per page, and every page's
+    arguments are validated ('query' is required on the follow-up pages too)."""
+
+    def __init__(self, total):
+        self.items = [{"id": f"r{i}", "type": "AssociationRelationship", "sourceId": "a", "targetId": "b"} for i in range(total)]
+        self.calls = []
+
+    def call_tool(self, tool, args):
+        self.calls.append(dict(args))
+        if not isinstance(args.get("query"), str):
+            payload = {"error": {"message": "The 'query' parameter is required and must be a string"}}
+        else:
+            start = int(args.get("cursor") or 0)
+            page = self.items[start:start + args["limit"]]
+            end = start + len(page)
+            meta = {"cursor": str(end)} if end < len(self.items) else {}
+            payload = {"result": page, "_meta": meta}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+
+class PagingTests(unittest.TestCase):
+    def test_every_page_is_read_with_the_full_arguments(self):
+        mcp = PagingMcp(total=1234)
+        items = d._fetch_all(mcp, "search-relationships", {"query": "", "exclude": ["documentation"]})
+        self.assertEqual(len(items), 1234)
+        self.assertEqual(len(mcp.calls), 3)
+        self.assertTrue(all(c["query"] == "" and c["exclude"] == ["documentation"] for c in mcp.calls))
 
 
 if __name__ == "__main__":

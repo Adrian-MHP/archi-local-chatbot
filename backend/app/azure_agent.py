@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+import functools
 import json
 import math
 import re
+import threading
 import time
 from typing import Any, Dict, List, Tuple
 
 import httpx
 from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
 
-from . import meta_model
+from . import dashboard, meta_model, steering
 from . import pdf_diagram
 from . import pdf_table
 from .config import Settings
@@ -18,6 +21,21 @@ from .mcp_client import McpClient, McpTool
 
 
 _BACKREF_RE = re.compile(r"^\$(\d+)\.id$")
+
+
+def _tracks_proposals(method):
+    """Record the approval proposals Archi creates while a write operation runs, and return them as
+    result["proposals"] -- the only reliable signal that Archi's approval mode is on for this write."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._collect_proposals() as proposals:
+            result = method(self, *args, **kwargs)
+            if isinstance(result, dict):
+                result.setdefault("proposals", list(proposals))
+        return result
+
+    return wrapper
 
 
 _EVIDENCE_STOPWORDS = frozenset(
@@ -38,6 +56,7 @@ _EVIDENCE_STOPWORDS = frozenset(
 class ChatService:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._proposal_local = threading.local()
         self.mcp = McpClient(
             server_url=settings.mcp_server_url,
             bearer_token=settings.mcp_bearer_token,
@@ -270,8 +289,10 @@ class ChatService:
         text = (raw or "").strip()
         if not text:
             raise RuntimeError("Model returned an empty payload while JSON was expected.")
+        # strict=False tolerates raw line breaks inside string values, which models occasionally emit
+        # in long free-text fields (rationales) even when asked for strict JSON.
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(text, strict=False)
             if isinstance(parsed, dict):
                 return parsed
         except Exception:
@@ -282,7 +303,7 @@ class ChatService:
         if start < 0 or end < 0 or end <= start:
             raise RuntimeError("Could not parse JSON object from model output.")
         try:
-            parsed = json.loads(text[start : end + 1])
+            parsed = json.loads(text[start : end + 1], strict=False)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Could not decode JSON model output: {exc}") from exc
         if not isinstance(parsed, dict):
@@ -574,7 +595,40 @@ class ChatService:
         if isinstance(unwrapped, dict) and unwrapped.get("allSucceeded") is False:
             raise RuntimeError(f"{tool_name} did not fully succeed: {json.dumps(unwrapped)[:500]}")
 
+        if tool_name == "bulk-mutate" and isinstance(unwrapped, dict):
+            proposal = unwrapped.get("proposal")
+            sink = getattr(self._proposal_local, "ids", None)
+            if isinstance(proposal, dict) and proposal.get("proposalId") and sink is not None:
+                sink.append(str(proposal["proposalId"]))
+
         return unwrapped
+
+    @contextmanager
+    def _collect_proposals(self):
+        """Collect approval-proposal ids of this request's bulk-mutate calls; nested write operations
+        share the outermost collector."""
+        existing = getattr(self._proposal_local, "ids", None)
+        if existing is not None:
+            yield existing
+            return
+        self._proposal_local.ids = []
+        try:
+            yield self._proposal_local.ids
+        finally:
+            self._proposal_local.ids = None
+
+    def _current_proposals(self) -> List[str]:
+        return list(getattr(self._proposal_local, "ids", None) or [])
+
+    @staticmethod
+    def approval_note(proposals: List[str] | None) -> str:
+        """Only when Archi actually queued the change: approval mode is on for this write."""
+        if not proposals:
+            return ""
+        return (
+            f" Archi approval mode is on: the change is waiting as proposal {', '.join(proposals)}. "
+            "Approve it in Archi (MCP Server > Pending approvals) to apply it."
+        )
 
     def _find_existing_view_id(
         self,
@@ -600,9 +654,14 @@ class ChatService:
                     return view_id
         return None
 
+    def _list_all(self, tool_name: str, args: Dict[str, Any], used_tools: List[str]) -> List[Dict[str, Any]]:
+        """Every item of a paginated search tool. The plugin pages at 500 items: reading only the first
+        page misses existing elements/relationships in larger models, which are then created twice."""
+        used_tools.append(tool_name)
+        return [item for item in dashboard._fetch_all(self.mcp, tool_name, args) if isinstance(item, dict)]
+
     def _collect_existing_elements(self, used_tools: List[str]) -> Dict[tuple[str, str], str]:
-        result = self._mcp_call("search-elements", {"query": "", "limit": 500}, used_tools)
-        elements = self._result_list(result, "elements")
+        elements = self._list_all("search-elements", {"query": "", "exclude": ["documentation"]}, used_tools)
         out: Dict[tuple[str, str], str] = {}
         for item in elements:
             element_id = str(item.get("id", item.get("elementId", ""))).strip()
@@ -614,8 +673,7 @@ class ChatService:
         return out
 
     def _collect_existing_relationships(self, used_tools: List[str]) -> Dict[tuple[str, str, str], str]:
-        result = self._mcp_call("search-relationships", {"query": "", "limit": 500}, used_tools)
-        relationships = self._result_list(result, "relationships")
+        relationships = self._list_all("search-relationships", {"query": "", "exclude": ["documentation"]}, used_tools)
         out: Dict[tuple[str, str, str], str] = {}
         for item in relationships:
             rel_id = str(item.get("id", item.get("relationshipId", ""))).strip()
@@ -926,6 +984,7 @@ class ChatService:
 
         counts = {
             "created_elements": created_elements,
+            "reused_elements": len(existing_element_id_for_key),
             "created_relationships": created_relationships,
             "added_to_view": added_to_view,
             "added_connections": added_connections,
@@ -1196,6 +1255,7 @@ class ChatService:
             "view_name": view_name,
             "view_id": view_id,
             "created_elements": created_elements,
+            "reused_elements": len(existing_element_id_for_key),
             "created_relationships": created_relationships,
             "added_to_view": added_to_view,
             "added_connections": added_connections,
@@ -1282,6 +1342,7 @@ class ChatService:
             "warnings": extracted.get("warnings", []),
         }
 
+    @_tracks_proposals
     def apply_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         action = str(plan.get("action", ""))
         view_name = self._normalize_name(plan.get("view_name", ""), fallback="Automation View")
@@ -2229,6 +2290,7 @@ class ChatService:
             action="business-process-upload", source_name=combined_source_name, extracted=merged
         )
 
+    @_tracks_proposals
     def run_business_process_automation(
         self,
         *,
@@ -2429,6 +2491,7 @@ class ChatService:
         )
         return self._format_plan_response(action="requirements-upload", source_name=source_name, extracted=extracted)
 
+    @_tracks_proposals
     def run_requirements_automation(
         self,
         *,
@@ -2460,8 +2523,9 @@ class ChatService:
         used_tools: List[str] = []
         ist_view_id = self._find_existing_view_id(view_name=ist_view_name, used_tools=used_tools)
         soll_view_id = self._find_existing_view_id(view_name=soll_view_name, used_tools=used_tools)
-        result = self._mcp_call("search-elements", {"query": "", "layer": "Business", "limit": 500}, used_tools)
-        business_elements = self._result_list(result, "elements")
+        business_elements = self._list_all(
+            "search-elements", {"query": "", "layer": "Business", "exclude": ["documentation"]}, used_tools
+        )
 
         notes: List[str] = []
         notes.append(
@@ -2843,6 +2907,7 @@ class ChatService:
             "used_tools": used_tools,
         }
 
+    @_tracks_proposals
     def apply_mapping_relationships(
         self,
         *,
@@ -2988,12 +3053,21 @@ class ChatService:
             gap_name = self._normalize_name(candidate_name, fallback=f"Gap {index + 1}")
 
             gap_key = f"gap::{index}"
+            gap_properties = {
+                key: value
+                for key, value in (
+                    ("criticality", meta_model.normalize_property_value("Gap", "criticality", gap.get("criticality"))[0]),
+                    ("gapCategory", meta_model.normalize_property_value("Gap", "gapCategory", category)[0]),
+                )
+                if value
+            }
             elements_by_key[gap_key] = {
                 "type": "Gap",
                 "name": gap_name,
                 "documentation": self._normalize_name(
                     f"[{gap.get('criticality', 'medium')}] {gap.get('description', '')}", fallback="", max_len=400
                 ),
+                "properties": gap_properties,
             }
             layout_positions[gap_key] = {"x": start_x + index * col_gap, "y": gap_y, "width": box_w, "height": box_h}
 
@@ -3026,8 +3100,8 @@ class ChatService:
             f"Created mapping view '{resolved_view_name}': {len(matched)} matched pair(s) connected, "
             f"{len(ist_only)} As-Is-only (legacy, no To-Be equivalent), {len(soll_only)} To-Be-only (new, no As-Is "
             f"equivalent) shown standalone, {len(gap_list)} gap element(s) linked to affected processes. "
-            f"{execution.get('created_relationships', 0)} new relationship(s) created. "
-            "If Archi approval mode is enabled, approve the proposal to apply changes."
+            f"{execution.get('created_relationships', 0)} new relationship(s) created."
+            + self.approval_note(self._current_proposals())
         )
         return {
             "summary": summary,
@@ -3036,6 +3110,140 @@ class ChatService:
             "created_relationships": int(execution.get("created_relationships", 0)),
             "used_tools": used_tools + list(execution.get("used_tools", [])),
         }
+
+    # ---- Assessment step 5: Ratings & Roadmap -------------------------------------------------
+
+    def _steering_scope(
+        self, *, ist_view_names: List[str], soll_view_names: List[str], used_tools: List[str]
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """Process ids on the assessment's As-Is and To-Be views (the step's process scope)."""
+        warnings: List[str] = []
+        scoped: Dict[str, List[str]] = {"ist": [], "soll": []}
+        for side, names in (("ist", ist_view_names), ("soll", soll_view_names)):
+            for name in dict.fromkeys(n.strip() for n in names if n and n.strip()):
+                view_id = self._find_existing_view_id(view_name=name, used_tools=used_tools)
+                if not view_id:
+                    warnings.append(f"View '{name}' was not found in the model; its processes are not listed.")
+                    continue
+                scoped[side] += [p["id"] for p in self._collect_view_business_processes(view_id=view_id, used_tools=used_tools)]
+        return scoped["ist"], scoped["soll"], warnings
+
+    def steering_load(self, *, ist_view_names: List[str], soll_view_names: List[str]) -> Dict[str, Any]:
+        used_tools: List[str] = []
+        as_is, to_be, warnings = self._steering_scope(
+            ist_view_names=ist_view_names, soll_view_names=soll_view_names, used_tools=used_tools
+        )
+        state = steering.current_state(dashboard.fetch_snapshot(self.mcp), as_is_process_ids=as_is, to_be_process_ids=to_be)
+        state["warnings"] = warnings + state["warnings"]
+        state["schema"] = meta_model.PROPERTIES
+        return state
+
+    def steering_propose(
+        self, *, ist_view_names: List[str], soll_view_names: List[str], state: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        """AI proposal merged into the (possibly already edited) tables; nothing is written."""
+        if not state or not isinstance(state.get("capabilities"), list):
+            state = self.steering_load(ist_view_names=ist_view_names, soll_view_names=soll_view_names)
+        snapshot = dashboard.fetch_snapshot(self.mcp)
+        process_keys = {r["key"] for r in state.get("processes") or []}
+        to_be = {r["key"] for r in state.get("processes") or [] if r.get("status") == "target"}
+        mappings = [
+            (rel["sourceId"], rel["targetId"])
+            for rel in snapshot.get("relationships") or []
+            if rel.get("type") == "AssociationRelationship" and rel.get("sourceId") in to_be
+            and rel.get("targetId") in process_keys and rel.get("targetId") not in to_be
+        ]
+        prompt = steering.proposal_prompt(state, mappings=mappings, today=date.today())
+        proposal = self._call_model_for_json(
+            system_prompt=(
+                "You are an enterprise architecture assessment engine preparing capability-based planning data. "
+                "Output strict JSON only."
+            ),
+            user_prompt=prompt,
+        )
+        merged = steering.merge_proposal(state, proposal)
+        merged["schema"] = meta_model.PROPERTIES
+        return merged
+
+    @_tracks_proposals
+    def steering_apply(self, *, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Write the reviewed tables to Archi: new elements and the relationships that reference them in
+        one bulk-mutate call (named back-references), everything else in further calls."""
+        used_tools: List[str] = []
+        plan = steering.plan_changes(dashboard.fetch_snapshot(self.mcp), state)
+        if plan["errors"]:
+            shown = "; ".join(plan["errors"][:8])
+            more = f" (+{len(plan['errors']) - 8} more)" if len(plan["errors"]) > 8 else ""
+            raise RuntimeError(f"Nothing was written. Please fix: {shown}{more}")
+        per_call = self._max_automation_ops()
+        first = plan["create"] + plan["linked"]
+        if len(first) > per_call:
+            raise RuntimeError(
+                f"Nothing was written: the new elements and their links need {len(first)} operations, more than the "
+                f"{per_call} Archi accepts in one call. Untick some new rows and apply in two rounds."
+            )
+        batches = ([first] if first else []) + [
+            plan["independent"][i : i + per_call] for i in range(0, len(plan["independent"]), per_call)
+        ]
+        proposals: List[str] = []
+        for batch in batches:
+            result = self._mcp_call(
+                "bulk-mutate",
+                {
+                    "operations": batch,
+                    "description": "Assessment: ratings & roadmap",
+                    "intent": "Write the reviewed steering data of the assessment",
+                },
+                used_tools,
+            )
+            proposal = result.get("proposal") if isinstance(result, dict) else None
+            if isinstance(proposal, dict) and proposal.get("proposalId"):
+                proposals.append(str(proposal["proposalId"]))
+        counts = plan["counts"]
+        if not batches:
+            summary = "No changes: the model already matches the tables."
+        else:
+            summary = (
+                f"{counts['created']} element(s) created, {counts['updated']} updated, {counts['relationships']} "
+                f"relationship(s) added, {counts['removedRelationships']} replaced link(s) removed."
+            )
+            if proposals:
+                summary += f" Archi approval mode is on: approve proposal(s) {', '.join(proposals)} in Archi to apply them."
+        return {"summary": summary, "counts": counts, "proposals": proposals, "used_tools": used_tools}
+
+    def _steering_context(self) -> str:
+        """Steering data from the model (via the dashboard metrics) for the executive summary."""
+        try:
+            data = dashboard.build_dashboard(self.mcp, date.today())
+        except Exception:  # noqa: BLE001 -- the summary must not fail because the model can't be read
+            return ""
+        s, rc = data["strategy"]["kpis"], data["roadmapCoverage"]["kpis"]
+        impl, m, a = data["implementation"], data["motivation"]["kpis"], data["application"]["kpis"]
+        lines: List[str] = []
+        if s["ratedCount"]:
+            unplanned = rc["priorityGapsUnplanned"]
+            lines.append(
+                f"- Capabilities rated: {s['ratedCount']} of {s['capabilityCount']}; average maturity {s['avgMaturity']} "
+                f"against a target of {s['avgTargetMaturity']}; {rc['priorityGaps']} priority gaps (2+ levels on high-importance "
+                f"capabilities), {len(unplanned)} not planned in any plateau" + (f": {', '.join(unplanned[:6])}" if unplanned else "")
+            )
+        if impl["plateaus"]:
+            lines.append("- Plateaus: " + "; ".join(
+                f"{p['name']} (target {p['targetDate'] or 'n/a'}, {p['completed']} of {len(p['workPackages'])} work packages completed)"
+                for p in impl["plateaus"]))
+        k = impl["kpis"]
+        if k["workPackageCount"]:
+            lines.append(
+                f"- Work packages: {k['completed']} completed, {k['in_progress']} in progress, {k['planned']} planned, "
+                f"{k['overdue']} overdue; {k['gapsWithoutPlateau']} of {k['gapCount']} gaps not assigned to a plateau"
+            )
+        if m["trackedCount"]:
+            lines.append(f"- Outcome KPIs: {m['onTrackOrAchieved']} of {m['trackedCount']} on track, {m['at_risk']} at risk, "
+                         f"{m['off_track'] + m['missed']} off track")
+        if a["applicationCount"]:
+            lines.append(f"- Applications: {a['pastEndOfLife']} past end of life, {a['endOfLifeWithin24Months']} reach end of "
+                         f"life within 24 months")
+        return "\n".join(lines)
 
     def generate_assessment_summary(
         self, *, mappings: List[Dict[str, Any]], gaps: List[Dict[str, Any]]
@@ -3076,6 +3284,7 @@ class ChatService:
             f"- [{g.get('criticality', 'medium')}] {g.get('category', 'gap')}: {g.get('description', '')}"
             for g in sorted_gaps[:20]
         ) or "- (no gaps identified)"
+        steering_context = self._steering_context()
 
         summary_prompt = (
             "You are preparing the executive summary slide for a steering committee (steerco) readout of an "
@@ -3092,7 +3301,9 @@ class ChatService:
             f"Average mapping confidence/similarity: {average_similarity:.0f}%. "
             f"Overall maturity score: {maturity_score:.0f}% ({readiness_label}).\n\n"
             f"Gap list (highest criticality first):\n{gap_lines}\n\n"
-            "Return strict JSON only with this schema:\n"
+            + (f"Steering data maintained in the information model (Ratings & Roadmap step):\n{steering_context}\n\n"
+               if steering_context else "")
+            + "Return strict JSON only with this schema:\n"
             "{\n"
             '  "headline": "one punchy sentence, the verdict a steerco member would remember -- state the '
             'maturity/readiness posture and the single biggest thing needing a decision",\n'
@@ -3112,6 +3323,8 @@ class ChatService:
             "rather than using vague language like \"several\" or \"significant\".\n"
             "- If there are zero high-criticality gaps, top_risks should say so explicitly rather than "
             "padding with lower-severity items dressed up as risks.\n"
+            "- Where steering data is given, the recommendation and next_steps must build on it (for example "
+            "priority gaps not yet planned in any plateau, or the next plateau and its open work packages).\n"
             "- No explanation text outside the JSON object."
         )
         summary_system_prompt = (

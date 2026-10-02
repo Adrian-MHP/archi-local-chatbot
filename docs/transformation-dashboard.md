@@ -1,9 +1,11 @@
 # Transformation Dashboard
 
-The dashboard (`/dashboard.html`, opened from the **Dashboard** button in the app's top bar) is the
+The dashboard (the **Transformation Dashboard** tab of the app, also opened with the **Dashboard** button
+in the top bar; the assessment keeps its state while you switch) is the
 steering view of the assessment approach: the assessment (Setup → As-Is → To-Be → Mapping & Gap
-Analysis → Summary) builds the information model in Archi, and the dashboard reads that same model to
-show where the transformation stands.
+Analysis → Ratings & Roadmap → Summary) builds the information model in Archi, and the dashboard reads
+that same model to show where the transformation stands. Step 5, **Ratings & Roadmap**, is where the
+steering data is maintained (see [below](#assessment-step-5-ratings--roadmap)).
 
 Two rules hold for every figure:
 
@@ -21,8 +23,9 @@ systems that own them (see [Out of scope](#out-of-scope-and-where-it-belongs)).
 - Backend: `GET /api/dashboard?asOf=YYYY-MM-DD` → [backend/app/dashboard.py](../backend/app/dashboard.py)
   (`asOf` defaults to today and drives the time-based checks: end of life, overdue work packages,
   outcome expectations).
-- Frontend: [frontend/dashboard.html](../frontend/dashboard.html), [dashboard.js](../frontend/dashboard.js),
-  [dashboard.css](../frontend/dashboard.css). Every chart has a **Table** view.
+- Frontend: the `dashboardTab` section of [frontend/index.html](../frontend/index.html),
+  [dashboard.js](../frontend/dashboard.js) and [dashboard.css](../frontend/dashboard.css) (styles scoped
+  under `.dash-root`). Every chart has a **Table** view.
 - Tests: `docker run --rm -v "$PWD/backend:/app" -w /app archi-local-chatbot-backend python -m unittest discover -s tests`
   (the test fixture is itself checked against the meta-model).
 
@@ -43,7 +46,12 @@ All pairs are declared in the meta-model.
 
 ## Property schema
 
-Property keys are matched loosely: case, spaces, `-` and `_` are ignored, so `endOfLife`,
+The schema is part of the meta-model: `PROPERTIES` in [backend/app/meta_model.py](../backend/app/meta_model.py)
+defines every key, its type, allowed values or range, and whether a dashboard metric needs it (`core`).
+The assessment's step 5, the AI prompts, the seed script, the data-completeness view and the
+**Meta model** viewer in the app all read it from there. The table below mirrors it.
+
+The dashboard reads leniently: property keys are matched loosely: case, spaces, `-` and `_` are ignored, so `endOfLife`,
 `End of Life` and `end_of_life` are the same key. Enumeration values are matched the same way
 (`Phase Out` = `phase-out`, `In progress` = `in-progress`). Numbers accept `1.250.000`, `3,5` and leading
 numbers such as `3 - Defined`; dates accept `YYYY-MM-DD`, `DD.MM.YYYY`, `YYYY-MM`, `MM/YYYY` and `YYYY`
@@ -77,7 +85,48 @@ metric that needs it — the **Data completeness** section shows what is missing
 | WorkPackage | `startDate`, `endDate` | date | Planned span |
 | WorkPackage | `status` | `planned`, `in-progress`, `completed`, `on-hold` | Delivery status as recorded in the architecture roadmap |
 | WorkPackage | `owner` | text | Accountable role |
+| Gap | `criticality` | `high`, `medium`, `low` | Business criticality (set by the Mapping & Gap Analysis) |
+| Gap | `gapCategory` | `missing_process`, `redundancy`, `structural_difference`, `tooling_data_gap` | Kind of gap (set by the Mapping & Gap Analysis) |
 | Gap | documentation | text | Description of the gap |
+
+Writing is strict: step 5 accepts only schema values (for example dates as `YYYY-MM-DD`) and reports
+anything else before writing. Values already in the model that do not match the schema are shown and
+left alone unless you change them.
+
+## Assessment step 5: Ratings & Roadmap
+
+Backend [backend/app/steering.py](../backend/app/steering.py), endpoints `POST /api/assessment/steering/load`,
+`/propose` and `/apply`.
+
+1. **Load** reads the steering data of the active model into editable tables: capabilities, processes on
+   the assessment's As-Is and To-Be views (each also gets `status` current/target from its view),
+   plateaus, work packages, gaps, goals, outcomes and application components.
+2. **Propose with AI** sends the tables, the As-Is → To-Be mapping and the gaps to the extraction model.
+   The AI reuses existing capabilities where they fit and proposes new ones for uncovered processes
+   (each realised by a process), rates the As-Is processes, proposes plateaus if none exist, work
+   packages that close the gaps, a plateau and criticality for each unplanned gap, and goals/outcomes
+   where the material supports them. Its values **only fill empty fields and add rows**; existing values
+   are never overwritten. Suggestions are highlighted until you edit or confirm them. Application
+   attributes are maintained by hand only.
+3. **Apply to Archi** writes the reviewed tables: new elements and the relationships that point to them
+   in one bulk-mutate call, then updates and further links. Every element type, relationship pair and
+   property value is checked against the meta-model first; on any error nothing is written. With
+   Archi's approval mode on, the changes arrive as proposals to approve in Archi, and **Apply** stays
+   locked until you approve or reject them there and click **Reload from model** (a second apply
+   would propose the new rows again).
+
+Apply writes only what was edited in the tables since they were loaded, so an older table (kept in
+the browser session, or shown while a proposal waits) never reverts changes made in Archi. If a value
+or link you edited was also changed in Archi in the meantime, the apply stops with "changed in Archi …
+reload the step" instead of overwriting it. A new row may not repeat the name of an existing element
+of the same type.
+
+Single-valued links in the tables — a capability's, work package's or gap's plateau, an outcome's goal
+and realising capability — are managed: changing one replaces the previous relationship of that kind.
+Process → capability realisations are only added, never removed.
+
+`/?step=steering` opens the step directly, e.g. to re-rate capabilities in a later assessment cycle.
+The executive summary (step 6) also receives these steering figures from the model.
 
 ## Metrics
 
@@ -99,6 +148,7 @@ metric that needs it — the **Data completeness** section shows what is missing
 | Implementation & Migration | Work-package flags | Overdue: `endDate` passed and not completed. Ends after its plateau: `endDate` later than the plateau's `targetDate`. Not started yet: `startDate` passed and still planned |
 | Implementation & Migration | Plateau completion | Completed work packages ÷ work packages realising the plateau |
 | Implementation & Migration | Gap register | Gaps with their affected processes and plateau; gaps without a plateau are not yet planned |
+| Data completeness | Per element type | Elements carrying every `core` property of the meta-model's schema |
 
 The thresholds above (importance weights, the 2-level priority rule, 12/24-month windows, on-track
 tolerances) are method parameters defined in code, not model data.

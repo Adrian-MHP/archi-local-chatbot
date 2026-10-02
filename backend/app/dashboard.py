@@ -30,6 +30,7 @@ from datetime import date, datetime, timezone
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from . import meta_model
 from .mcp_client import McpClient
 
 # ---------------------------------------------------------------------------------------------
@@ -70,15 +71,11 @@ _DIRECTION_ALIASES = {"higher": "higher", "higherisbetter": "higher", "up": "hig
 
 RISK_ORDER = ["ok", "warning", "serious", "critical"]
 
-# Expected properties per element type -- the basis of the data-completeness panel.
+# Expected properties per element type -- the basis of the data-completeness panel: the "core"
+# properties of the meta-model's property schema (the ones a dashboard metric needs).
 EXPECTED_PROPERTIES: List[Tuple[str, str, str, List[str]]] = [
-    ("Motivation", "Outcome", "Outcomes", ["kpi", "baseline", "current", "target", "baselineDate", "targetDate"]),
-    ("Strategy", "Capability", "Capabilities", ["maturity", "targetMaturity", "strategicImportance"]),
-    ("Business", "BusinessProcess", "Business processes", ["maturity", "automationLevel", "mediaBreaks"]),
-    ("Application", "ApplicationComponent", "Application components",
-     ["lifecycle", "timeClassification", "functionalFit", "technicalFit", "businessCriticality"]),
-    ("Implementation & Migration", "Plateau", "Plateaus", ["targetDate"]),
-    ("Implementation & Migration", "WorkPackage", "Work packages", ["startDate", "endDate", "status"]),
+    (meta_model.layer_label(t), t, meta_model.ELEMENT_LABELS[t], meta_model.core_property_keys(t))
+    for t in ("Outcome", "Capability", "BusinessProcess", "ApplicationComponent", "Plateau", "WorkPackage", "Gap")
 ]
 
 
@@ -269,7 +266,8 @@ def _fetch_all(mcp: McpClient, tool: str, args: Dict[str, Any]) -> List[Dict[str
         cursor = (data.get("_meta") or {}).get("cursor")
         if not cursor:
             return items
-        page_args = {"cursor": cursor, "limit": 500}
+        # The plugin validates every page's arguments ('query' is required), not only the first one's.
+        page_args = {**args, "cursor": cursor, "limit": 500}
     raise RuntimeError(f"{tool} kept returning pages; aborted after {len(items)} items.")
 
 
@@ -588,6 +586,7 @@ def application_section(ctx: Context) -> Dict[str, Any]:
                                           "timeClassification", "risk")} for a in eol_apps],
         "kpis": {
             "applicationCount": len(apps),
+            "withEndOfLife": len(eol_apps),
             "pastEndOfLife": len(past),
             "endOfLifeWithin24Months": len(within_24),
             "migrateOrEliminate": sum(1 for a in apps if a["timeClassification"] in ("migrate", "eliminate")),
@@ -772,8 +771,9 @@ def _headline(strategy, coverage, business, application, motivation, implementat
          "value": b["toBeTraced"] if b["toBeCount"] else None, "format": "integer", "of": b["toBeCount"],
          "detail": f"{b['asIsCount']} As-Is processes · {b['processesWithGaps']} affected by gaps"},
         {"id": "application", "layer": "Application", "label": "Applications reaching end of life within 24 months",
-         "value": a["endOfLifeWithin24Months"] if a["applicationCount"] else None, "format": "integer",
-         "detail": f"{a['pastEndOfLife']} already past end of life · {a['applicationCount']} applications"},
+         # Without any endOfLife date a 0 would read as "nothing at risk": show "no data" instead.
+         "value": a["endOfLifeWithin24Months"] if a["withEndOfLife"] else None, "format": "integer",
+         "detail": f"{a['pastEndOfLife']} already past end of life · {a['withEndOfLife']} of {a['applicationCount']} applications dated"},
         {"id": "implementation", "layer": "Implementation & Migration", "label": "Work packages completed",
          "value": i["completed"] if i["workPackageCount"] else None, "format": "integer", "of": i["workPackageCount"],
          "detail": f"{i['in_progress']} in progress · {i['overdue']} overdue · {i['gapsWithoutPlateau']} gaps without plateau"},

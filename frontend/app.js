@@ -28,10 +28,11 @@ const state = {
     pending: false,
     pairs: [],
     summaryResult: null,
+    steering: { data: null, tab: "capabilities", loading: false, awaitingApproval: false },
   },
 };
 
-const ASSESSMENT_STEPS = ["setup", "ist", "soll", "mapping", "summary"];
+const ASSESSMENT_STEPS = ["setup", "ist", "soll", "mapping", "steering", "summary"];
 
 const elements = {
   appGrid: document.getElementById("appGrid"),
@@ -60,6 +61,9 @@ const elements = {
   healthServer: document.getElementById("healthServer"),
   connectionBadge: document.getElementById("connectionBadge"),
   modelBadge: document.getElementById("modelBadge"),
+  approvalBadge: document.getElementById("approvalBadge"),
+  dashboardBtn: document.getElementById("dashboardBtn"),
+  steeringDashboardBtn: document.getElementById("steeringDashboardBtn"),
   toolList: document.getElementById("toolList"),
   toolSearchInput: document.getElementById("toolSearchInput"),
   toolCountBadge: document.getElementById("toolCountBadge"),
@@ -109,7 +113,16 @@ const elements = {
   summaryNextStepsList: document.getElementById("summaryNextStepsList"),
   summaryGeneratedAt: document.getElementById("summaryGeneratedAt"),
   assessmentSummaryBackBtn: document.getElementById("assessmentSummaryBackBtn"),
+  steeringLoadBtn: document.getElementById("steeringLoadBtn"),
+  steeringProposeBtn: document.getElementById("steeringProposeBtn"),
+  steeringApplyBtn: document.getElementById("steeringApplyBtn"),
+  steeringStatus: document.getElementById("steeringStatus"),
+  steeringTabs: document.getElementById("steeringTabs"),
+  steeringTable: document.getElementById("steeringTable"),
+  assessmentSteeringBackBtn: document.getElementById("assessmentSteeringBackBtn"),
+  assessmentSteeringContinueBtn: document.getElementById("assessmentSteeringContinueBtn"),
   assessmentStartNewBtn: document.getElementById("assessmentStartNewBtn"),
+  assessmentResetBtn: document.getElementById("assessmentResetBtn"),
 };
 
 function validateRequiredElements() {
@@ -482,6 +495,21 @@ function renderHealth() {
   elements.healthText.textContent = JSON.stringify(health, null, 2);
 
   elements.modelBadge.textContent = `Model: ${model}`;
+  // Approval mode as reported by Archi's MCP plugin -- when on, writes wait in Archi for approval.
+  const approval = health.archi_approval_mode;
+  const pending = Number.isFinite(health.archi_pending_approvals) ? health.archi_pending_approvals : 0;
+  elements.approvalBadge.className = "badge";
+  if (approval === true) {
+    elements.approvalBadge.classList.add("status", "status-warn");
+    elements.approvalBadge.textContent = pending ? `Approval mode on · ${pending} pending` : "Approval mode on";
+    elements.approvalBadge.title = "Changes from this app wait in Archi under MCP Server > Pending approvals until you approve them.";
+  } else if (approval === false) {
+    elements.approvalBadge.textContent = "Approval mode off";
+    elements.approvalBadge.title = "Changes from this app are applied in Archi immediately.";
+  } else {
+    elements.approvalBadge.textContent = "Approval: unknown";
+    elements.approvalBadge.title = "The approval mode could not be read from Archi.";
+  }
   elements.connectionBadge.className = "badge status";
   if (mcpStatus === "ok") {
     elements.connectionBadge.classList.add("status-ok");
@@ -639,12 +667,14 @@ const ASSESSMENT_PANEL_ID_BY_STEP = {
   ist: "assessmentStepIst",
   soll: "assessmentStepSoll",
   mapping: "assessmentStepMapping",
+  steering: "assessmentStepSteering",
   summary: "assessmentStepSummary",
 };
 
 function setAssessmentStep(step) {
   if (!ASSESSMENT_STEPS.includes(step)) return;
   state.assessment.currentStep = step;
+  setTimeout(persistAssessmentSession, 0);
   Object.entries(ASSESSMENT_PANEL_ID_BY_STEP).forEach(([key, id]) => {
     const panel = document.getElementById(id);
     if (panel) panel.classList.toggle("hidden", key !== step);
@@ -658,6 +688,11 @@ function setAssessmentStep(step) {
   if (step === "mapping") {
     renderAssessmentPairingReview();
     renderAssessmentMappingPairList();
+  }
+  if (step === "steering") {
+    if (!state.assessment.steering.data && !state.assessment.steering.loading) loadSteering();
+    else renderSteering();
+    if (state.assessment.steering.awaitingApproval) setAssessmentStatus(elements.steeringStatus, STEERING_AWAITING_APPROVAL, "warn");
   }
 }
 
@@ -828,6 +863,25 @@ function renderAssessmentPairRows() {
   });
 }
 
+function renderAssessmentSetupResult() {
+  const box = elements.assessmentSetupResult;
+  box.innerHTML = "";
+  box.classList.remove("hidden");
+  state.assessment.pairs.forEach((pair, index) => {
+    const group = document.createElement("div");
+    group.className = "assessment-result-pair-group";
+    const heading = document.createElement("strong");
+    heading.textContent = `Pair ${index + 1}: ${pair.istViewName} / ${pair.sollViewName}`;
+    group.appendChild(heading);
+    for (const note of pair.setupNotes || []) {
+      const p = document.createElement("p");
+      p.textContent = note;
+      group.appendChild(p);
+    }
+    box.appendChild(group);
+  });
+}
+
 async function runAssessmentSetup() {
   const box = elements.assessmentSetupResult;
   const duplicates = findDuplicateAssessmentViewNames();
@@ -852,21 +906,7 @@ async function runAssessmentSetup() {
       pair.setupNotes = data.notes || [];
       pair.setupChecked = true;
     }
-    box.innerHTML = "";
-    box.classList.remove("hidden");
-    state.assessment.pairs.forEach((pair, index) => {
-      const group = document.createElement("div");
-      group.className = "assessment-result-pair-group";
-      const heading = document.createElement("strong");
-      heading.textContent = `Pair ${index + 1}: ${pair.istViewName} / ${pair.sollViewName}`;
-      group.appendChild(heading);
-      for (const note of pair.setupNotes) {
-        const p = document.createElement("p");
-        p.textContent = note;
-        group.appendChild(p);
-      }
-      box.appendChild(group);
-    });
+    renderAssessmentSetupResult();
     elements.assessmentSetupContinueBtn.disabled = false;
     markAssessmentStepComplete("setup");
   } catch (err) {
@@ -1112,6 +1152,14 @@ function buildAssessmentCaptureCard(pair, side) {
     "Multiple files selected. Drag to arrange them in the order their processes connect -- the last step of each file will be chained to the first step of the next.";
   orderHint.classList.toggle("hidden", files.length < 2);
   card.appendChild(orderHint);
+
+  const earlierFiles = side === "ist" ? pair.istFileNames : pair.sollFileNames;
+  if (!files.length && Array.isArray(earlierFiles) && earlierFiles.length) {
+    const earlier = document.createElement("p");
+    earlier.className = "file-order-hint";
+    earlier.textContent = `Used earlier in this session: ${earlierFiles.join(", ")}. Select the file(s) again only if you want to re-run the extraction.`;
+    card.appendChild(earlier);
+  }
 
   const fileListEl = document.createElement("ul");
   fileListEl.className = "file-order-list";
@@ -1385,6 +1433,546 @@ function freshAssessmentViewNameStamp() {
   });
 }
 
+/* ---------------- Assessment session (survives reloads within this browser tab) ---------------- */
+
+// The wizard's progress lives in sessionStorage: it survives reloads and switching to the dashboard,
+// and is scoped to this browser tab. Uploaded File objects cannot be stored -- their names are kept
+// so the cards can say what was used; plans, mappings, ratings and the summary are kept completely.
+const ASSESSMENT_SESSION_KEY = "archi-assessment-session-v1";
+let lastAssessmentSessionSnapshot = "";
+
+function assessmentSessionSnapshot() {
+  const a = state.assessment;
+  const names = (files, earlier) => (files && files.length ? files.map((f) => f.name) : earlier || []);
+  return JSON.stringify({
+    version: 1,
+    activeTab: state.activeTab,
+    currentStep: a.currentStep,
+    completedSteps: [...a.completedSteps],
+    pairs: a.pairs.map((p) => ({
+      ...p,
+      istFiles: [],
+      sollFiles: [],
+      istFileNames: names(p.istFiles, p.istFileNames),
+      sollFileNames: names(p.sollFiles, p.sollFileNames),
+    })),
+    summaryResult: a.summaryResult,
+    steering: { data: a.steering.data, tab: a.steering.tab, awaitingApproval: a.steering.awaitingApproval },
+  });
+}
+
+function persistAssessmentSession() {
+  try {
+    const snapshot = assessmentSessionSnapshot();
+    if (snapshot === lastAssessmentSessionSnapshot) return;
+    sessionStorage.setItem(ASSESSMENT_SESSION_KEY, snapshot);
+    lastAssessmentSessionSnapshot = snapshot;
+  } catch (err) {
+    console.warn("Unable to keep the assessment for this session:", err);
+  }
+}
+
+function restoreAssessmentSession() {
+  let saved = null;
+  try {
+    saved = JSON.parse(sessionStorage.getItem(ASSESSMENT_SESSION_KEY) || "null");
+  } catch (err) {
+    saved = null;
+  }
+  if (!saved || saved.version !== 1 || !Array.isArray(saved.pairs) || !saved.pairs.length) return false;
+  state.assessment = {
+    currentStep: ASSESSMENT_STEPS.includes(saved.currentStep) ? saved.currentStep : "setup",
+    completedSteps: new Set((saved.completedSteps || []).filter((s) => ASSESSMENT_STEPS.includes(s))),
+    pending: false,
+    pairs: saved.pairs.map((p, index) => ({ ...createAssessmentPair(index), ...p, istFiles: [], sollFiles: [] })),
+    summaryResult: saved.summaryResult || null,
+    steering: {
+      data: (saved.steering && saved.steering.data) || null,
+      tab: (saved.steering && saved.steering.tab) || "capabilities",
+      loading: false,
+      awaitingApproval: Boolean(saved.steering && saved.steering.awaitingApproval),
+    },
+  };
+  if (["assessmentTab", "dashboardTab", "healthTab", "toolsTab"].includes(saved.activeTab)) state.activeTab = saved.activeTab;
+  lastAssessmentSessionSnapshot = "";
+  return true;
+}
+
+function applyRestoredAssessmentUi() {
+  const a = state.assessment;
+  document.querySelectorAll(".assessment-step-btn").forEach((btn) => {
+    const step = btn.dataset.step;
+    const previous = ASSESSMENT_STEPS[ASSESSMENT_STEPS.indexOf(step) - 1];
+    btn.disabled = !(step === "setup" || step === a.currentStep || a.completedSteps.has(step) || (previous && a.completedSteps.has(previous)));
+  });
+  if (a.pairs.some((p) => p.setupChecked)) renderAssessmentSetupResult();
+  elements.assessmentSetupContinueBtn.disabled = !a.completedSteps.has("setup");
+  updateAssessmentCaptureContinueState("ist");
+  updateAssessmentCaptureContinueState("soll");
+  updateAssessmentMappingContinueState();
+  if (a.summaryResult) {
+    renderAssessmentSummary(a.summaryResult);
+    renderSummaryPairBreakdown();
+    elements.assessmentSummaryResult.classList.remove("hidden");
+  }
+  refreshAssessmentStepperClasses();
+}
+
+/* ---------------- Ratings & Roadmap (step 5) ---------------- */
+
+// One editable table per element type. "prop" columns are rendered from the meta-model's property
+// schema (sent by the backend with the data), so enum options and value ranges are never duplicated here.
+const STEERING_TABLES = [
+  {
+    key: "capabilities", label: "Capabilities", singular: "capability", type: "Capability", addable: true,
+    hint: "Current and target maturity drive the dashboard's heat map; the plateau says when the gap is closed.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Capability", kind: "name" },
+      { field: "capabilityDomain", kind: "prop" },
+      { field: "maturity", kind: "prop" },
+      { field: "targetMaturity", kind: "prop" },
+      { field: "strategicImportance", kind: "prop" },
+      { field: "plateau", label: "Plateau", kind: "ref", table: "plateaus" },
+      { field: "processes", label: "Realised by", kind: "processList" },
+    ],
+  },
+  {
+    key: "processes", label: "Process ratings", singular: "process", type: "BusinessProcess", addable: false,
+    hint: "Processes on the assessment's As-Is and To-Be views. Ratings matter for the As-Is side.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Process", kind: "readonly" },
+      { field: "status", kind: "prop" },
+      { field: "processPhase", kind: "prop" },
+      { field: "maturity", kind: "prop" },
+      { field: "automationLevel", kind: "prop" },
+      { field: "mediaBreaks", kind: "prop" },
+      { field: "capabilities", label: "Realises", kind: "list" },
+    ],
+  },
+  {
+    key: "plateaus", label: "Plateaus", singular: "plateau", type: "Plateau", addable: true,
+    hint: "Transition and target states of the roadmap.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Plateau", kind: "name" },
+      { field: "targetDate", kind: "prop" },
+    ],
+  },
+  {
+    key: "workPackages", label: "Work packages", singular: "work package", type: "WorkPackage", addable: true,
+    hint: "Each work package realises the plateau it delivers into.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Work package", kind: "name" },
+      { field: "startDate", kind: "prop" },
+      { field: "endDate", kind: "prop" },
+      { field: "status", kind: "prop" },
+      { field: "plateau", label: "Plateau", kind: "ref", table: "plateaus" },
+      { field: "owner", kind: "prop" },
+    ],
+  },
+  {
+    key: "gaps", label: "Gaps", singular: "gap", type: "Gap", addable: false,
+    hint: "Gaps from the Mapping & Gap Analysis: assign each to the plateau that closes it.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Gap", kind: "readonly" },
+      { field: "processes", label: "Affected processes", kind: "list" },
+      { field: "criticality", kind: "prop" },
+      { field: "gapCategory", kind: "prop" },
+      { field: "plateau", label: "Plateau", kind: "ref", table: "plateaus" },
+    ],
+  },
+  {
+    key: "goals", label: "Goals", singular: "goal", type: "Goal", addable: true,
+    hint: "What the transformation is for.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Goal", kind: "name" },
+      { field: "targetDate", kind: "prop" },
+    ],
+  },
+  {
+    key: "outcomes", label: "Outcomes & KPIs", singular: "outcome", type: "Outcome", addable: true,
+    hint: "Measurable outcomes: baseline, current and target values with their dates.",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Outcome", kind: "name" },
+      { field: "kpi", kind: "prop" },
+      { field: "unit", kind: "prop" },
+      { field: "baseline", kind: "prop" },
+      { field: "current", kind: "prop" },
+      { field: "target", kind: "prop" },
+      { field: "direction", kind: "prop" },
+      { field: "baselineDate", kind: "prop" },
+      { field: "targetDate", kind: "prop" },
+      { field: "goal", label: "Goal", kind: "ref", table: "goals" },
+      { field: "capability", label: "Realised by capability", kind: "ref", table: "capabilities" },
+    ],
+  },
+  {
+    key: "applications", label: "Applications", singular: "application", type: "ApplicationComponent", addable: false,
+    hint: "Portfolio attributes of the application components in the model (maintained manually; the AI does not guess them).",
+    columns: [
+      { field: "include", kind: "include" },
+      { field: "name", label: "Application", kind: "readonly" },
+      { field: "lifecycle", kind: "prop" },
+      { field: "endOfLife", kind: "prop" },
+      { field: "timeClassification", kind: "prop" },
+      { field: "functionalFit", kind: "prop" },
+      { field: "technicalFit", kind: "prop" },
+      { field: "businessCriticality", kind: "prop" },
+      { field: "applicationCategory", kind: "prop" },
+      { field: "vendor", kind: "prop" },
+    ],
+  },
+];
+
+function steeringViewNames() {
+  const pairs = state.assessment.pairs || [];
+  return {
+    ist_view_names: pairs.map((p) => p.istViewName).filter(Boolean),
+    soll_view_names: pairs.map((p) => p.mappingSollViewName || p.sollViewName).filter(Boolean),
+  };
+}
+
+function steeringSchemaProp(type, field) {
+  const schema = (state.assessment.steering.data && state.assessment.steering.data.schema) || {};
+  return (schema[type] || []).find((p) => p.key === field) || null;
+}
+
+function steeringAiCounts(data) {
+  let rows = 0;
+  let fields = 0;
+  for (const spec of STEERING_TABLES) {
+    for (const row of data[spec.key] || []) {
+      if (row.origin === "ai") rows += 1;
+      else fields += (row.aiFields || []).length;
+    }
+  }
+  return { rows, fields };
+}
+
+const STEERING_AWAITING_APPROVAL =
+  'The last apply is waiting for approval in Archi (MCP Server > Pending approvals). Approve or reject it there, then click "Reload from model" before applying again.';
+
+function setSteeringButtons() {
+  const st = state.assessment.steering;
+  elements.steeringLoadBtn.disabled = st.loading;
+  elements.steeringProposeBtn.disabled = st.loading;
+  // A second apply before the first one is approved would propose the new rows a second time.
+  elements.steeringApplyBtn.disabled = st.loading || !st.data || st.awaitingApproval;
+  elements.steeringApplyBtn.title = st.awaitingApproval ? STEERING_AWAITING_APPROVAL : "";
+}
+
+async function steeringRequest(path, body, pendingMessage) {
+  const st = state.assessment.steering;
+  st.loading = true;
+  setSteeringButtons();
+  setAssessmentStatus(elements.steeringStatus, pendingMessage, "pending");
+  try {
+    const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+    return data;
+  } finally {
+    st.loading = false;
+    setSteeringButtons();
+  }
+}
+
+function steeringWarnings(data) {
+  const warnings = (data && data.warnings) || [];
+  return warnings.length ? ` Notes: ${warnings.slice(0, 3).join(" ")}${warnings.length > 3 ? ` (+${warnings.length - 3} more)` : ""}` : "";
+}
+
+async function loadSteering() {
+  try {
+    const data = await steeringRequest("/api/assessment/steering/load", steeringViewNames(), "Reading the steering data from the active Archi model...");
+    state.assessment.steering.data = data;
+    state.assessment.steering.awaitingApproval = false;
+    renderSteering();
+    const summary = STEERING_TABLES.map((spec) => `${(data[spec.key] || []).length} ${spec.label.toLowerCase()}`).join(", ");
+    setAssessmentStatus(elements.steeringStatus, `Loaded from the model: ${summary}.${steeringWarnings(data)}`, "ok");
+  } catch (err) {
+    setAssessmentStatus(elements.steeringStatus, `Loading failed: ${err.message || String(err)}`, "error");
+  }
+}
+
+async function proposeSteering() {
+  const st = state.assessment.steering;
+  try {
+    const data = await steeringRequest(
+      "/api/assessment/steering/propose",
+      { ...steeringViewNames(), state: st.data },
+      "The AI is preparing proposals from the processes, mapping and gaps... this can take a minute.",
+    );
+    // Bring suggestions to the top once, right after the proposal (new rows first, then rows with
+    // filled fields); later edits never reorder, so nothing jumps while the user reviews.
+    const rank = (row) => (row.origin === "ai" ? 0 : (row.aiFields || []).length ? 1 : 2);
+    for (const spec of STEERING_TABLES) {
+      if (Array.isArray(data[spec.key])) data[spec.key] = [...data[spec.key]].sort((a, b) => rank(a) - rank(b));
+    }
+    st.data = data;
+    renderSteering();
+    const counts = steeringAiCounts(data);
+    setAssessmentStatus(
+      elements.steeringStatus,
+      `AI proposal ready: ${counts.rows} new row(s) and ${counts.fields} filled field(s), highlighted in the tables. ` +
+        `Review them, untick what you don't want, then apply.${steeringWarnings(data)}`,
+      "ok",
+    );
+  } catch (err) {
+    setAssessmentStatus(elements.steeringStatus, `AI proposal failed: ${err.message || String(err)}`, "error");
+  }
+}
+
+async function applySteering() {
+  const st = state.assessment.steering;
+  if (!st.data) return;
+  try {
+    const result = await steeringRequest("/api/assessment/steering/apply", { state: st.data }, "Writing the steering data to Archi...");
+    const pendingApproval = (result.proposals || []).length > 0;
+    pushActionLogEntry({ action: "assessment-steering", viewName: "Ratings & Roadmap", summary: result.summary, tone: pendingApproval ? "warn" : "ok" });
+    markAssessmentStepComplete("steering");
+    if (pendingApproval) {
+      st.awaitingApproval = true;
+      setSteeringButtons();
+      setAssessmentStatus(elements.steeringStatus, `${result.summary} Then click "Reload from model".`, "warn");
+    } else {
+      await loadSteering(); // fresh ids for the rows just created
+      setAssessmentStatus(elements.steeringStatus, `${result.summary} The dashboard now shows the updated data.`, "ok");
+    }
+  } catch (err) {
+    setAssessmentStatus(elements.steeringStatus, err.message || String(err), "error");
+  }
+}
+
+function renderSteering() {
+  renderSteeringTabs();
+  renderSteeringTable();
+  setSteeringButtons();
+}
+
+function renderSteeringTabs() {
+  const st = state.assessment.steering;
+  const container = elements.steeringTabs;
+  container.replaceChildren();
+  if (!st.data) return;
+  for (const spec of STEERING_TABLES) {
+    const rows = st.data[spec.key] || [];
+    const suggestions = rows.filter((r) => r.origin === "ai" || (r.aiFields || []).length).length;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `steering-tab${st.tab === spec.key ? " active" : ""}`;
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", String(st.tab === spec.key));
+    btn.textContent = `${spec.label} (${rows.length})`;
+    if (suggestions) {
+      const badge = document.createElement("span");
+      badge.className = "steering-ai-badge";
+      badge.textContent = `${suggestions} AI`;
+      btn.appendChild(badge);
+    }
+    btn.addEventListener("click", () => {
+      st.tab = spec.key;
+      renderSteering();
+    });
+    container.appendChild(btn);
+  }
+}
+
+function renderSteeringTable() {
+  const st = state.assessment.steering;
+  const container = elements.steeringTable;
+  container.replaceChildren();
+  if (!st.data) return;
+  const spec = STEERING_TABLES.find((t) => t.key === st.tab) || STEERING_TABLES[0];
+  const rows = st.data[spec.key] || [];
+
+  const hint = document.createElement("p");
+  hint.className = "steering-hint";
+  hint.textContent = `${spec.hint} Highlighted cells and rows are AI suggestions; editing a cell confirms it.`;
+  container.appendChild(hint);
+
+  if (!rows.length) {
+    const emptyState = document.createElement("p");
+    emptyState.className = "steering-empty";
+    emptyState.textContent = `No ${spec.label.toLowerCase()} in the model yet.${spec.addable ? " Add one below or let the AI propose." : ""}`;
+    container.appendChild(emptyState);
+  } else {
+    const scroll = document.createElement("div");
+    scroll.className = "table-scroll steering-scroll";
+    const table = document.createElement("table");
+    table.className = "preview-table steering-grid";
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const col of spec.columns) {
+      const th = document.createElement("th");
+      th.textContent = col.kind === "include" ? "" : col.label || (steeringSchemaProp(spec.type, col.field) || {}).label || col.field;
+      if (col.kind === "include") th.className = "col-check";
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    const tbody = document.createElement("tbody");
+    rows.forEach((row) => tbody.appendChild(renderSteeringRow(spec, row)));
+    table.append(thead, tbody);
+    scroll.appendChild(table);
+    container.appendChild(scroll);
+  }
+
+  if (spec.addable) {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn ghost small steering-add";
+    add.textContent = `+ Add ${spec.singular}`;
+    add.addEventListener("click", () => addSteeringRow(spec));
+    container.appendChild(add);
+  }
+}
+
+function renderSteeringRow(spec, row) {
+  const tr = document.createElement("tr");
+  if (row.origin === "ai") tr.classList.add("steering-row-ai");
+  if (row.include === false) tr.classList.add("row-excluded");
+  if (row.rationale) tr.title = `AI rationale: ${row.rationale}`;
+  for (const col of spec.columns) tr.appendChild(renderSteeringCell(spec, row, col, tr));
+  return tr;
+}
+
+function confirmSteeringField(row, field) {
+  if (row.aiFields) row.aiFields = row.aiFields.filter((f) => f !== field);
+}
+
+function renderSteeringCell(spec, row, col, tr) {
+  const td = document.createElement("td");
+  if ((row.aiFields || []).includes(col.field)) {
+    td.classList.add("steering-cell-ai");
+    td.title = "AI suggestion";
+  }
+  const st = state.assessment.steering;
+  switch (col.kind) {
+    case "include": {
+      td.className = "col-check";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = row.include !== false;
+      box.title = row.id ? "Untick to leave this element unchanged" : "Untick to not create this element";
+      box.addEventListener("change", () => {
+        row.include = box.checked;
+        tr.classList.toggle("row-excluded", !box.checked);
+      });
+      td.appendChild(box);
+      break;
+    }
+    case "name": {
+      const wrap = document.createElement("div");
+      wrap.className = "steering-name";
+      if (!row.id) {
+        const badge = document.createElement("span");
+        badge.className = `steering-origin steering-origin-${row.origin === "ai" ? "ai" : "new"}`;
+        badge.textContent = row.origin === "ai" ? "AI" : "New";
+        badge.title = row.origin === "ai" ? "Proposed by the AI -- created when you apply" : "Added by you -- created when you apply";
+        wrap.appendChild(badge);
+      }
+      const input = document.createElement("input");
+      input.className = "cell-name-input";
+      input.value = row.name || "";
+      input.addEventListener("change", () => {
+        row.name = input.value;
+      });
+      wrap.appendChild(input);
+      td.appendChild(wrap);
+      break;
+    }
+    case "readonly":
+      td.textContent = row[col.field] || "—";
+      break;
+    case "list":
+      td.textContent = (row[col.field] || []).join(", ") || "—";
+      td.className = `${td.className} steering-list`.trim();
+      break;
+    case "processList": {
+      const names = new Map(Object.entries(st.data.processNames || {}));
+      (st.data.processes || []).forEach((p) => names.set(p.key, p.name));
+      td.textContent = (row[col.field] || []).map((k) => names.get(k) || "(unknown process)").join(", ") || "—";
+      td.className = `${td.className} steering-list`.trim();
+      break;
+    }
+    case "ref": {
+      const select = document.createElement("select");
+      select.className = "steering-input";
+      select.appendChild(new Option("—", ""));
+      for (const target of st.data[col.table] || []) {
+        if (target.include === false) continue;
+        select.appendChild(new Option(target.name || "(unnamed)", target.key));
+      }
+      select.value = row[col.field] || "";
+      select.addEventListener("change", () => {
+        row[col.field] = select.value || null;
+        confirmSteeringField(row, col.field);
+        td.classList.remove("steering-cell-ai");
+      });
+      td.appendChild(select);
+      break;
+    }
+    default: {
+      const input = steeringPropInput(spec.type, col.field, row[col.field]);
+      input.addEventListener("change", () => {
+        row[col.field] = input.value === "" ? null : input.value;
+        confirmSteeringField(row, col.field);
+        td.classList.remove("steering-cell-ai");
+      });
+      td.appendChild(input);
+    }
+  }
+  return td;
+}
+
+function steeringPropInput(type, field, value) {
+  const def = steeringSchemaProp(type, field);
+  const current = value === null || value === undefined ? "" : String(value);
+  if (def && (def.type === "enum" || (def.type === "integer" && def.levels))) {
+    const select = document.createElement("select");
+    select.className = "steering-input";
+    select.appendChild(new Option("—", ""));
+    const options = def.type === "enum"
+      ? def.values.map((v) => [v.value, v.label])
+      : Object.entries(def.levels).map(([level, label]) => [level, `${level} · ${label}`]);
+    for (const [optionValue, label] of options) select.appendChild(new Option(label, optionValue));
+    if (current && !options.some(([optionValue]) => optionValue === current)) {
+      select.appendChild(new Option(`${current} (not in the schema)`, current)); // keep legacy values visible
+    }
+    select.value = current;
+    select.title = def.description || "";
+    return select;
+  }
+  const input = document.createElement("input");
+  input.className = "steering-input";
+  input.value = current;
+  if (def && def.type === "date") input.type = "date";
+  if (def && (def.type === "integer" || def.type === "number")) {
+    input.type = "number";
+    input.step = def.type === "integer" ? "1" : "any";
+    if (def.min !== undefined) input.min = String(def.min);
+    if (def.max !== undefined) input.max = String(def.max);
+  }
+  if (def) input.title = def.description || "";
+  return input;
+}
+
+function addSteeringRow(spec) {
+  const st = state.assessment.steering;
+  const row = { key: `new:${spec.key}:${createId()}`, id: null, name: `New ${spec.singular}`, origin: "manual", include: true, aiFields: [], rationale: "" };
+  for (const p of (st.data.schema || {})[spec.type] || []) row[p.key] = null;
+  if (spec.key === "workPackages") row.status = "planned";
+  if (spec.key === "capabilities") row.processes = [];
+  st.data[spec.key].push(row);
+  renderSteering();
+}
+
 function startNewAssessment() {
   // Reusing a prior cycle's view name would mix this new cycle's mapping analysis with the old
   // one's data -- mapping is scoped to whatever's actually on the configured As-Is/To-Be views, so
@@ -1396,7 +1984,10 @@ function startNewAssessment() {
     pending: false,
     pairs: [createAssessmentPair(0, ` (${stamp})`)],
     summaryResult: null,
+    steering: { data: null, tab: "capabilities", loading: false, awaitingApproval: false },
   };
+  renderSteering();
+  elements.steeringStatus.classList.add("hidden");
 
   elements.assessmentSetupResult.classList.add("hidden");
   elements.assessmentSetupContinueBtn.disabled = true;
@@ -1983,10 +2574,21 @@ function attachAssessmentEventHandlers() {
   elements.assessmentMappingRunBtn.addEventListener("click", runAssessmentMappingAllPairs);
   elements.assessmentMappingApplyAllBtn.addEventListener("click", applyAllAssessmentMappings);
   elements.assessmentMappingBackBtn.addEventListener("click", () => setAssessmentStep("soll"));
-  elements.assessmentMappingContinueBtn.addEventListener("click", () => setAssessmentStep("summary"));
+  elements.assessmentMappingContinueBtn.addEventListener("click", () => setAssessmentStep("steering"));
+
+  elements.steeringDashboardBtn.addEventListener("click", openDashboardTab);
+  elements.steeringLoadBtn.addEventListener("click", loadSteering);
+  elements.steeringProposeBtn.addEventListener("click", proposeSteering);
+  elements.steeringApplyBtn.addEventListener("click", applySteering);
+  elements.assessmentSteeringBackBtn.addEventListener("click", () => setAssessmentStep("mapping"));
+  elements.assessmentSteeringContinueBtn.addEventListener("click", () => {
+    // The step is optional: continuing without applying still unlocks the summary.
+    markAssessmentStepComplete("steering");
+    setAssessmentStep("summary");
+  });
 
   elements.assessmentSummaryRunBtn.addEventListener("click", runAssessmentSummary);
-  elements.assessmentSummaryBackBtn.addEventListener("click", () => setAssessmentStep("mapping"));
+  elements.assessmentSummaryBackBtn.addEventListener("click", () => setAssessmentStep("steering"));
   elements.assessmentSummaryCopyBtn.addEventListener("click", async () => {
     if (!state.assessment.summaryResult) return;
     try {
@@ -2006,13 +2608,18 @@ function attachAssessmentEventHandlers() {
     window.print();
   });
 
-  elements.assessmentStartNewBtn.addEventListener("click", () => {
+  elements.dashboardBtn.addEventListener("click", openDashboardTab);
+
+  // The wizard survives reloads, so starting over needs its own button in every step, not only on the summary.
+  const confirmStartNewAssessment = () => {
     if (state.assessment.pending) return;
     if (!confirm("Start a new assessment? This clears the current wizard progress (nothing already created in Archi is deleted).")) {
       return;
     }
     startNewAssessment();
-  });
+  };
+  elements.assessmentStartNewBtn.addEventListener("click", confirmStartNewAssessment);
+  elements.assessmentResetBtn.addEventListener("click", confirmStartNewAssessment);
 }
 
 /* ---------------- Meta model viewer ---------------- */
@@ -2103,6 +2710,52 @@ function renderMetaModelBody(metaModel) {
   table.appendChild(tbody);
   tableScroll.appendChild(table);
   container.appendChild(tableScroll);
+
+  // Steering properties: the information step 5 maintains and the dashboard reads.
+  const properties = metaModel.properties || {};
+  if (!Object.keys(properties).length) return;
+  const propHead = document.createElement("h3");
+  propHead.className = "meta-model-relationships-head";
+  propHead.textContent = "Steering properties (maintained in step 5, read by the dashboard)";
+  container.appendChild(propHead);
+  const propScroll = document.createElement("div");
+  propScroll.className = "table-scroll meta-model-table-scroll";
+  const propTable = document.createElement("table");
+  propTable.className = "preview-table";
+  const propHeadRow = document.createElement("tr");
+  for (const label of ["Element type", "Property", "Values", "Meaning"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    propHeadRow.appendChild(th);
+  }
+  const propThead = document.createElement("thead");
+  propThead.appendChild(propHeadRow);
+  propTable.appendChild(propThead);
+  const propBody = document.createElement("tbody");
+  for (const [elementType, props] of Object.entries(properties)) {
+    for (const prop of props) {
+      const tr = document.createElement("tr");
+      let values = prop.type;
+      if (prop.type === "enum") values = prop.values.map((v) => v.label).join(" · ");
+      else if (prop.levels) values = Object.entries(prop.levels).map(([level, label]) => `${level} ${label}`).join(" · ");
+      else if (prop.type === "date") values = "date (YYYY-MM-DD)";
+      const cells = [elementType, `${prop.label} (${prop.key})${prop.core ? " *" : ""}`, values, prop.description];
+      cells.forEach((text, index) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (index === 3) td.className = "meta-model-note";
+        tr.appendChild(td);
+      });
+      propBody.appendChild(tr);
+    }
+  }
+  propTable.appendChild(propBody);
+  propScroll.appendChild(propTable);
+  container.appendChild(propScroll);
+  const footnote = document.createElement("p");
+  footnote.className = "meta-model-note";
+  footnote.textContent = "* needed by a dashboard metric (counts towards data completeness).";
+  container.appendChild(footnote);
 }
 
 async function openMetaModelModal() {
@@ -2527,6 +3180,14 @@ function setActiveTab(tabId) {
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.classList.toggle("hidden", panel.id !== tabId);
   });
+  // The dashboard lives in this page: opening its tab re-reads the model; the assessment keeps its state.
+  if (tabId === "dashboardTab" && window.TransformationDashboard) window.TransformationDashboard.show();
+  persistAssessmentSession();
+}
+
+function openDashboardTab() {
+  setActiveTab("dashboardTab");
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 function setChatCollapsed(collapsed) {
@@ -2655,6 +3316,7 @@ function init() {
 
   attachEventHandlers();
   attachAssessmentEventHandlers();
+  const restoredAssessment = restoreAssessmentSession();
   if (!state.assessment.pairs.length) {
     state.assessment.pairs = [createAssessmentPair(0)];
   }
@@ -2663,8 +3325,31 @@ function init() {
   renderAssessmentCaptureList("soll");
   renderAssessmentPairingReview();
   renderAssessmentMappingPairList();
-  setAssessmentStep("setup");
+  // ?step=steering opens Ratings & Roadmap directly -- for re-assessments, where maturity and the
+  // roadmap are maintained again without repeating steps 1-4.
+  if (restoredAssessment) applyRestoredAssessmentUi();
+  const directStep = new URLSearchParams(window.location.search).get("step");
+  if (directStep === "steering") {
+    const btn = document.querySelector('.assessment-step-btn[data-step="steering"]');
+    if (btn) btn.disabled = false;
+    setAssessmentStep("steering");
+    // The link asks for the step, so it wins over the tab restored from the session. Drop the
+    // parameter afterwards: later reloads restore wherever the user went next.
+    state.activeTab = "assessmentTab";
+    history.replaceState(null, "", window.location.pathname);
+  } else {
+    setAssessmentStep(restoredAssessment ? state.assessment.currentStep : "setup");
+  }
+  // Bookmarks of the former stand-alone dashboard page open the dashboard tab.
+  if (window.location.pathname === "/dashboard.html") {
+    state.activeTab = "dashboardTab";
+    history.replaceState(null, "", "/");
+  }
   setActiveTab(state.activeTab);
+  // Autosave: cheap (skipped when nothing changed) and robust against any code path that edits the
+  // wizard state; pagehide covers reloads and closing the tab.
+  setInterval(persistAssessmentSession, 2000);
+  window.addEventListener("pagehide", persistAssessmentSession);
   setChatCollapsed(state.chatCollapsed);
   renderAll();
   syncComposerFromActiveConversation();

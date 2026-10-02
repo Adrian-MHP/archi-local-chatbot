@@ -1,21 +1,23 @@
+// Transformation Dashboard tab. All figures come from GET /api/dashboard, which reads the active
+// Archi model live via MCP and follows the relationships of the governance meta-model; nothing here
+// is stored or entered by hand. Charts are plain SVG/HTML built with DOM APIs (model names are
+// untrusted text -> textContent only, never innerHTML). Wrapped in an IIFE so it shares no globals
+// with app.js; the app calls window.TransformationDashboard.show() when the tab is opened.
+(() => {
 "use strict";
-
-// Transformation Dashboard. All figures come from GET /api/dashboard, which reads the active Archi
-// model live via MCP and follows the relationships of the governance meta-model; nothing here is
-// stored or entered by hand. Charts are plain SVG/HTML built with DOM APIs (model names are
-// untrusted text -> textContent only, never innerHTML).
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 const ui = {
-  modelLine: document.getElementById("modelLine"),
-  asOf: document.getElementById("asOfInput"),
-  refresh: document.getElementById("refreshBtn"),
-  main: document.getElementById("dashboard"),
-  kpiRow: document.getElementById("kpiRow"),
-  sections: document.getElementById("sections"),
-  error: document.getElementById("errorBox"),
-  tooltip: document.getElementById("tooltip"),
+  root: document.querySelector(".dash-root"),
+  modelLine: document.getElementById("dashModelLine"),
+  asOf: document.getElementById("dashAsOf"),
+  refresh: document.getElementById("dashRefreshBtn"),
+  main: document.getElementById("dashMain"),
+  kpiRow: document.getElementById("dashKpiRow"),
+  sections: document.getElementById("dashSections"),
+  error: document.getElementById("dashErrorBox"),
+  tooltip: document.getElementById("dashTooltip"),
 };
 
 const state = {
@@ -209,7 +211,9 @@ function showTip(event) {
 }
 
 function moveTip(event) {
-  if (!ui.tooltip.hidden) placeTip(event.clientX, event.clientY);
+  // Scrolling hides the tip; the next pointer move over the same mark brings it back.
+  if (ui.tooltip.hidden) showTip(event);
+  else placeTip(event.clientX, event.clientY);
 }
 
 function placeTip(x, y) {
@@ -234,8 +238,8 @@ function hideTip() {
 function section(id, title, intro, cards) {
   return h(
     "section",
-    { id, class: "dash-section", "aria-labelledby": `${id}Title` },
-    h("div", { class: "section-head" }, h("h2", { id: `${id}Title`, text: title }), intro ? h("p", { text: intro }) : null),
+    { id: `dash-${id}`, class: "dash-section", "aria-labelledby": `dash-${id}Title` },
+    h("div", { class: "section-head" }, h("h2", { id: `dash-${id}Title`, text: title }), intro ? h("p", { text: intro }) : null),
     h("div", { class: "card-grid" }, cards.filter(Boolean)),
   );
 }
@@ -427,7 +431,7 @@ function renderKpis(headline) {
       const value = kpiValue(k);
       return h(
         "a",
-        { class: "dash-card kpi-tile", href: `#${k.id}` },
+        { class: "dash-card kpi-tile", href: `#dash-${k.id}` },
         h("span", { class: "kpi-layer", text: k.layer }),
         h("span", { class: "kpi-label", text: k.label }),
         h("span", { class: "kpi-value" }, value.main, value.suffix ? h("small", { text: value.suffix }) : null),
@@ -690,7 +694,7 @@ function strategySection(d) {
     title: "Capability support along the meta-model",
     subtitle: "Capability ← realised by a business process ← served by an application service ← realised by an application component.",
     chart: () =>
-      h(
+      !k.capabilityCount ? empty("No capabilities in the model.") : h(
         "div",
         { class: "meter-list two-col" },
         h(
@@ -1246,7 +1250,6 @@ function render(data) {
   ui.modelLine.textContent =
     `${m.name} · ${fmt.int(m.elementCount)} elements · ${fmt.int(m.relationshipCount)} relationships · ` +
     `as of ${fmt.day(data.asOf)} · read live from Archi via MCP at ${fetched.toLocaleTimeString("en-GB")}`;
-  document.title = `Transformation Dashboard · ${m.name}`;
   renderKpis(data.headline);
   ui.sections.replaceChildren(
     motivationSection(data),
@@ -1260,11 +1263,14 @@ function render(data) {
   renderAll();
 }
 
-function showError(message) {
+const ARCHI_HINT = "Check that Archi is running with a model open and that MCP Server › Start MCP Server is active, then refresh.";
+const BACKEND_HINT = "The app's backend is not answering. Check that its Docker containers are running (docker compose ps), then refresh.";
+
+function showError(message, hint = ARCHI_HINT) {
   ui.error.replaceChildren(
     h("strong", { text: "Could not load the dashboard" }),
     h("span", { text: message }),
-    h("div", { class: "dash-subtle", text: "Check that Archi is running with a model open and that MCP Server › Start MCP Server is active, then refresh." }),
+    h("div", { class: "dash-subtle", text: hint }),
   );
   ui.error.hidden = false;
 }
@@ -1278,13 +1284,19 @@ async function load() {
   try {
     const params = new URLSearchParams();
     if (ui.asOf.value) params.set("asOf", ui.asOf.value);
-    const response = await fetch(`/api/dashboard?${params}`);
+    const response = await fetch(`/api/dashboard?${params}`).catch(() => {
+      throw Object.assign(new Error("The app server is not reachable."), { hint: BACKEND_HINT });
+    });
     const body = await response.json().catch(() => ({}));
+    // nginx answers 502-504 without a JSON detail when the backend container itself is down.
+    if (!response.ok && !body.detail && response.status >= 502 && response.status <= 504) {
+      throw Object.assign(new Error(`No answer from the backend (HTTP ${response.status}).`), { hint: BACKEND_HINT });
+    }
     if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
     ui.error.hidden = true;
     render(body);
   } catch (error) {
-    showError(error.message || String(error));
+    showError(error.message || String(error), error.hint);
     if (!state.data) ui.modelLine.textContent = "Not connected";
   } finally {
     state.loading = false;
@@ -1302,9 +1314,33 @@ function todayLocalIso() {
 ui.asOf.value = todayLocalIso();
 ui.asOf.addEventListener("change", load);
 ui.refresh.addEventListener("click", load);
-window.addEventListener("resize", () => {
+
+// Charts are drawn for their container's width: re-render whenever it changes (window resize,
+// assistant drawer toggled, or the tab becoming visible again after being hidden).
+let lastWidth = 0;
+new ResizeObserver((entries) => {
+  const width = Math.round(entries[0].contentRect.width);
+  if (!width || width === lastWidth) return;
+  lastWidth = width;
   clearTimeout(state.resizeTimer);
-  state.resizeTimer = setTimeout(() => state.data && renderAll(), 150);
-});
+  state.resizeTimer = setTimeout(() => state.data && renderAll(), 120);
+}).observe(ui.main);
 window.addEventListener("scroll", hideTip, { passive: true });
-load();
+
+// Section links scroll within the app instead of changing the URL.
+ui.root.addEventListener("click", (event) => {
+  const link = event.target.closest('a[href^="#dash-"]');
+  if (!link) return;
+  const target = document.getElementById(link.getAttribute("href").slice(1));
+  if (!target) return;
+  event.preventDefault();
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+window.TransformationDashboard = {
+  // Called whenever the tab is opened: always re-read the model so the figures are current.
+  show() {
+    load();
+  },
+};
+})();

@@ -1076,6 +1076,10 @@ a.btn {
   background: var(--danger);
 }
 
+.status-warn {
+  background: var(--warning);
+}
+
 /* ---------------- Health + tools ---------------- */
 
 .card-head {
@@ -1360,6 +1364,10 @@ body.modal-open {
 .assessment-step-btn:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+.assessment-reset-btn {
+  flex: 0 0 auto;
 }
 
 .assessment-step {
@@ -2047,4 +2055,132 @@ body.modal-open {
   .preview-actions .btn {
     width: 100%;
   }
+}
+
+/* ---------------- Assessment step 5: Ratings & Roadmap ---------------- */
+
+.steering-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.steering-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 8px;
+}
+
+.steering-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-muted);
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.steering-tab:hover {
+  background: #f5f9ff;
+}
+
+.steering-tab.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.steering-ai-badge {
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  padding: 1px 7px;
+  font-size: 0.68rem;
+}
+
+.steering-hint,
+.steering-empty {
+  margin: 4px 0 8px;
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+}
+
+.steering-scroll {
+  max-height: 480px;
+}
+
+.steering-grid td {
+  white-space: nowrap;
+}
+
+.steering-grid td.steering-list {
+  white-space: normal;
+  min-width: 180px;
+  color: var(--ink-muted);
+  font-size: 0.76rem;
+}
+
+.steering-grid .cell-name-input {
+  min-width: 200px;
+}
+
+.steering-input {
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  padding: 3px 5px;
+  max-width: 190px;
+}
+
+.steering-input[type="number"] {
+  width: 76px;
+}
+
+.steering-row-ai td {
+  background: #f1fafb;
+}
+
+.steering-grid td.steering-cell-ai {
+  background: #dff1f2;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.steering-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.steering-origin {
+  display: inline-block;
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  vertical-align: middle;
+}
+
+.steering-origin-ai {
+  background: var(--accent);
+  color: #fff;
+}
+
+.steering-origin-new {
+  border: 1px solid var(--accent);
+  color: var(--accent-strong);
+}
+
+.steering-add {
+  margin-top: 8px;
 }

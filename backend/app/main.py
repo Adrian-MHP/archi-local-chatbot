@@ -41,6 +41,8 @@ from .schemas import (
     MappingGapRequest,
     MappingGapResponse,
     SollProposalRequest,
+    SteeringApplyRequest,
+    SteeringRequest,
 )
 
 load_dotenv()
@@ -244,6 +246,17 @@ def health() -> Dict[str, Any]:
         mcp_error = str(exc)
         tool_count = 0
 
+    # Archi's approval mode, read from the plugin (not assumed), so the UI can show the real state.
+    approval_mode = None
+    pending_approvals = None
+    if mcp_status == "ok":
+        try:
+            approvals = dashboard._payload(chat_service.mcp, "list-pending-approvals", {}).get("result") or {}
+            approval_mode = bool(approvals.get("approvalMode"))
+            pending_approvals = int(approvals.get("pendingCount") or 0)
+        except Exception:  # noqa: BLE001
+            approval_mode = None
+
     return {
         "status": "ok",
         "azure_model": settings.azure_openai_model,
@@ -251,6 +264,8 @@ def health() -> Dict[str, Any]:
         "mcp_status": mcp_status,
         "mcp_error": mcp_error,
         "mcp_tool_count": tool_count,
+        "archi_approval_mode": approval_mode,
+        "archi_pending_approvals": pending_approvals,
     }
 
 
@@ -465,8 +480,8 @@ async def business_process_upload_action(
     status = "partial" if steps_truncated else "ok"
     summary = (
         f"Processed {steps_processed} process steps from '{source_name}'. "
-        f"View '{execution.get('view_name', view_name or 'Business Process View')}' was updated in one automation run. "
-        "If Archi approval mode is enabled, approve the proposal to apply changes."
+        f"View '{execution.get('view_name', view_name or 'Business Process View')}' was updated in one automation run."
+        + chat_service.approval_note(execution.get("proposals"))
     )
     if steps_truncated:
         summary += f" Steps were truncated to the configured maximum of {settings.max_action_steps}."
@@ -511,8 +526,8 @@ async def requirements_upload_action(
     status = "partial" if steps_truncated else "ok"
     summary = (
         f"Generated product architecture from '{source_name}' and updated view "
-        f"'{execution.get('view_name', view_name or 'Product Architecture')}' in one automation run. "
-        "If Archi approval mode is enabled, approve the proposal to apply changes."
+        f"'{execution.get('view_name', view_name or 'Product Architecture')}' in one automation run."
+        + chat_service.approval_note(execution.get("proposals"))
     )
     if steps_truncated:
         summary += " Input was truncated to fit the configured action limits."
@@ -586,12 +601,19 @@ def apply_plan(payload: ApplyPlanRequest) -> ActionResponse:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to apply plan: {exc}") from exc
 
-    summary = (
-        f"Applied plan: created {execution.get('created_elements', 0)} elements and "
-        f"{execution.get('created_relationships', 0)} relationships in view "
-        f"'{execution.get('view_name', payload.plan.view_name)}'. "
-        "If Archi approval mode is enabled, approve the proposal to apply changes."
-    )
+    created = int(execution.get("created_elements", 0))
+    reused = int(execution.get("reused_elements", 0))
+    relationships = int(execution.get("created_relationships", 0))
+    view = execution.get("view_name", payload.plan.view_name)
+    if not (created or relationships or execution.get("added_to_view") or execution.get("added_connections")):
+        summary = f"Nothing new to write: all {reused} element(s) and their relationships already exist in view '{view}'."
+    else:
+        summary = (
+            f"Applied plan to view '{view}': {created} new element(s)"
+            + (f", {reused} existing element(s) reused" if reused else "")
+            + f", {relationships} new relationship(s)."
+        )
+    summary += chat_service.approval_note(execution.get("proposals"))
 
     return ActionResponse(
         action=payload.plan.action,
@@ -684,6 +706,36 @@ def assessment_mapping_apply(payload: MappingApplyRequest) -> MappingApplyRespon
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Applying mappings failed: {exc}") from exc
     return MappingApplyResponse(**result)
+
+
+@app.post("/api/assessment/steering/load")
+def assessment_steering_load(payload: SteeringRequest) -> Dict[str, Any]:
+    try:
+        return chat_service.steering_load(ist_view_names=payload.ist_view_names, soll_view_names=payload.soll_view_names)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Loading ratings & roadmap failed: {exc}") from exc
+
+
+@app.post("/api/assessment/steering/propose")
+def assessment_steering_propose(payload: SteeringRequest) -> Dict[str, Any]:
+    try:
+        return chat_service.steering_propose(
+            ist_view_names=payload.ist_view_names, soll_view_names=payload.soll_view_names, state=payload.state
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"AI proposal failed: {exc}") from exc
+
+
+@app.post("/api/assessment/steering/apply")
+def assessment_steering_apply(payload: SteeringApplyRequest) -> Dict[str, Any]:
+    try:
+        return chat_service.steering_apply(state=payload.state)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Applying ratings & roadmap failed: {exc}") from exc
 
 
 @app.post("/api/assessment/summary", response_model=AssessmentSummaryResponse)

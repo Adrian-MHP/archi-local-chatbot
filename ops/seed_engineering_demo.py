@@ -257,31 +257,31 @@ WORK_PACKAGES = [
     ("PLM-integrated Variant Configurator", "2027-01-01", "2028-12-31", "planned", "Head of PLM",
      "Target 2028: Integrated Engineering"),
 ]
-# (name, description, plateau or None when not yet planned, [affected processes])
+# (name, description, criticality, gapCategory, plateau or None when not yet planned, [affected processes])
 GAPS = [
     ("Requirements not traceable from customer need to test",
-     "Requirements, architecture and test cases live in separate tools without trace links.",
+     "Requirements, architecture and test cases live in separate tools without trace links.", "high", "tooling_data_gap",
      "Transition 2027: Digital Thread Foundation", ["Capture & Analyze Requirements", "Develop System Architecture"]),
     ("Two PLM systems for one product structure",
-     "Windchill (acquired unit) and Teamcenter hold overlapping product structures and change processes.",
+     "Windchill (acquired unit) and Teamcenter hold overlapping product structures and change processes.", "high", "redundancy",
      "Transition 2027: Digital Thread Foundation", ["Manage Engineering BOM", "Process Engineering Change (ECR/ECO)"]),
     ("Simulation results stored on local drives",
-     "Simulation models and results are not versioned or linked to the design they validate.",
+     "Simulation models and results are not versioned or linked to the design they validate.", "medium", "tooling_data_gap",
      "Transition 2027: Digital Thread Foundation", ["Perform Simulation & Analysis"]),
     ("Three CAD systems for mechanical design",
-     "NX, Creo and AutoCAD are used in parallel, which blocks design reuse and doubles training effort.",
+     "NX, Creo and AutoCAD are used in parallel, which blocks design reuse and doubles training effort.", "medium", "redundancy",
      "Target 2028: Integrated Engineering", ["Design Mechanical Components"]),
     ("Variant rules maintained outside PLM",
-     "The in-house variant configurator holds configuration rules that PLM cannot validate.",
+     "The in-house variant configurator holds configuration rules that PLM cannot validate.", "medium", "structural_difference",
      "Target 2028: Integrated Engineering", ["Manage Engineering BOM"]),
     ("Manual EBOM-to-MBOM transfer to ERP",
-     "The engineering BOM is re-keyed into SAP through an Excel toolkit for every release.",
+     "The engineering BOM is re-keyed into SAP through an Excel toolkit for every release.", "high", "tooling_data_gap",
      None, ["Release Product Data", "Manage Engineering BOM"]),
     ("No tool support for product portfolio decisions",
-     "Portfolio and roadmap decisions are prepared in slide decks without structured data.",
+     "Portfolio and roadmap decisions are prepared in slide decks without structured data.", "medium", "tooling_data_gap",
      None, ["Manage Product Portfolio"]),
     ("Test data kept in local databases",
-     "Test results are stored in MS Access databases per test bench.",
+     "Test results are stored in MS Access databases per test bench.", "low", "tooling_data_gap",
      None, ["Build & Test Prototypes"]),
 ]
 
@@ -340,8 +340,8 @@ def build_dataset() -> Tuple[List[Tuple[str, str, str, Dict[str, str], str]], Li
     for name, start, end, status, owner, _plateau in WORK_PACKAGES:
         elements.append((name, "WorkPackage", "IMPLEMENTATION_MIGRATION", {
             "startDate": start, "endDate": end, "status": status, "owner": owner}, ""))
-    for name, description, _plateau, _procs in GAPS:
-        elements.append((name, "Gap", "IMPLEMENTATION_MIGRATION", {}, description))
+    for name, description, criticality, category, _plateau, _procs in GAPS:
+        elements.append((name, "Gap", "IMPLEMENTATION_MIGRATION", {"criticality": criticality, "gapCategory": category}, description))
 
     rels: List[Tuple[str, str, str]] = []
     for name, *_rest, goals, caps in OUTCOMES:
@@ -358,7 +358,7 @@ def build_dataset() -> Tuple[List[Tuple[str, str, str, Dict[str, str], str]], Li
         rels += [("RealizationRelationship", name, c) for c in caps]
     for name, *_rest, plateau in WORK_PACKAGES:
         rels.append(("RealizationRelationship", name, plateau))
-    for name, _description, plateau, procs in GAPS:
+    for name, _description, _criticality, _category, plateau, procs in GAPS:
         if plateau:
             rels.append(("AssociationRelationship", plateau, name))
         rels += [("AssociationRelationship", name, p) for p in procs]
@@ -381,6 +381,10 @@ def validate(elements, rels) -> None:
     undeclared = sorted({(types[s], t, types[d]) for t, s, d in rels if not meta.is_declared_pair(types[s], t, types[d])})
     if undeclared:
         raise SystemExit(f"Relationship pairs not declared in the meta-model: {undeclared}")
+    bad_values = [f"{name}: {error}" for name, el_type, _f, props, _d in elements for key, value in props.items()
+                  for _v, error in [meta.normalize_property_value(el_type, key, value)] if error]
+    if bad_values:
+        raise SystemExit(f"Property values outside the meta-model's schema: {bad_values[:10]}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -508,7 +512,7 @@ class Seeder:
 
         # Implementation & Migration: plateau columns with their work packages and gaps.
         ops = []
-        unplanned = [g[0] for g in GAPS if not g[2]]
+        unplanned = [g[0] for g in GAPS if not g[4]]
         for i, (plateau, _date, _caps) in enumerate(PLATEAUS):
             x = 20 + i * 340
             ops.append(self._place(f"pl{i}", plateau, x, 20, 310, 60))
@@ -517,7 +521,7 @@ class Seeder:
             ops.append(self._group(f"wg{i}", "Work packages", x, 120, 310, wp_h))
             for j, wp in enumerate(packages):
                 ops.append(self._place(f"wp{i}_{j}", wp, 14, 36 + j * 65, 282, 55, parent=f"wg{i}"))
-            gaps = [g[0] for g in GAPS if g[2] == plateau]
+            gaps = [g[0] for g in GAPS if g[4] == plateau]
             if gaps:
                 ops.append(self._group(f"gg{i}", "Gaps", x, 120 + wp_h + 30, 310, 40 + len(gaps) * 65 + 10))
                 for j, gap in enumerate(gaps):

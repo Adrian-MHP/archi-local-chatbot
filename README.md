@@ -67,7 +67,7 @@ docker compose up --build -d
 Open:
 
 - Frontend chat UI: `http://localhost:38080`
-- Transformation dashboard: `http://localhost:38080/dashboard.html` (also the **Dashboard** button in the top bar)
+- Transformation dashboard: the **Transformation Dashboard** tab of the app (also the **Dashboard** button in the top bar; old `/dashboard.html` links open that tab)
 - Backend health: `http://localhost:38000/api/health`
 - Backend MCP tools list: `http://localhost:38000/api/tools`
 
@@ -78,7 +78,10 @@ The frontend is a buttons-and-preview workspace, not a chat-first UI:
 - **Workspace tab**: upload a business process document or a requirement spec, review the extracted elements/relationships/view layout in an editable table and a diagram preview, then explicitly click "Create in Archi". Nothing is written to Archi until you approve the preview. Uncheck rows to drop elements or relationships, or edit element names inline before applying.
 - **Health / MCP Tools tabs**: service status and the live MCP tool catalog.
 - **Assistant drawer**: a collapsible chat panel docked on the right for free-form questions about the model. Collapse it with the chevron or the topbar toggle to give the workspace the full width.
-- **Dashboard** (opens in a new tab): the steering view of the assessment — outcome KPIs, capability maturity heat map (TOGAF gap convention), capability gaps vs. plateaus, As-Is → To-Be traceability, application end of life and TIME portfolio, roadmap by plateau, gap register, and data completeness. Every figure is read live from the active Archi model via MCP (`GET /api/dashboard`) along the relationships of the governance meta-model; cost and project-progress data stay in the tools that own them. Property schema, metric definitions and the engineering demo dataset (`ops/seed_engineering_demo.py`): [docs/transformation-dashboard.md](docs/transformation-dashboard.md).
+- **Assessment wizard**: 1 Setup → 2 As-Is Capture → 3 To-Be Architecture → 4 Mapping & Gap Analysis → 5 Ratings & Roadmap → 6 Summary. Step 5 maintains the steering data the dashboard reads (capability maturity, process ratings, plateaus, work packages, gap assignments, goals and outcome KPIs, application attributes): the AI proposes values that only fill empty fields, you review the tables, and nothing is written to Archi before you apply. `/?step=steering` opens step 5 directly, e.g. for a re-assessment.
+- **Assessment progress** is kept for the browser session (sessionStorage): switching to the dashboard, reloading the page or coming back later in the same browser tab restores the step, the view pairs, the results and the step-5 tables. Uploaded files are not kept, only their names. **New assessment** in the stepper starts over (nothing in Archi is deleted); a new browser tab or window starts a fresh assessment.
+- **Approval mode** in the top bar is read from Archi's MCP plugin (`list-pending-approvals`), with the number of pending approvals, refreshed every 30 s and whenever you return to the browser tab. After a write, the app mentions approval only when Archi actually queued the change as a proposal.
+- **Dashboard** (a tab of the app, in the same browser tab): the steering view of the assessment — outcome KPIs, capability maturity heat map (TOGAF gap convention), capability gaps vs. plateaus, As-Is → To-Be traceability, application end of life and TIME portfolio, roadmap by plateau, gap register, and data completeness. Every figure is read live from the active Archi model via MCP (`GET /api/dashboard`) along the relationships of the governance meta-model; cost and project-progress data stay in the tools that own them. Property schema, metric definitions and the engineering demo dataset (`ops/seed_engineering_demo.py`): [docs/transformation-dashboard.md](docs/transformation-dashboard.md).
 
 ### Upload preview workflow
 
@@ -90,7 +93,7 @@ The frontend is a buttons-and-preview workspace, not a chat-first UI:
    - Input: JSON body `{"plan": <plan from step 1, with any rows edited or unchecked>}`
    - Behavior: creates/updates the elements, relationships, and view content for the included rows in one automation run via MCP `bulk-mutate`.
 
-Both preview endpoints still respect Archi approval mode. If approval mode is enabled, a human still needs to approve in Archi after `apply`.
+Both preview endpoints still respect Archi approval mode. If approval mode is enabled, a human still needs to approve in Archi after `apply`; the response then lists the queued proposal ids in `proposals`.
 
 ### One-shot automation actions (no preview)
 

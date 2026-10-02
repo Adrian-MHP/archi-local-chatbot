@@ -176,6 +176,16 @@ class MappingApplyResponse(BaseModel):
     used_tools: List[str] = Field(default_factory=list)
 
 
+class SteeringRequest(BaseModel):
+    ist_view_names: List[str] = Field(default_factory=list)
+    soll_view_names: List[str] = Field(default_factory=list)
+    state: Dict[str, Any] | None = None
+
+
+class SteeringApplyRequest(BaseModel):
+    state: Dict[str, Any]
+
+
 class AssessmentSummaryRequest(BaseModel):
     mappings: List[MappingEntry] = Field(default_factory=list)
     gaps: List[GapEntry] = Field(default_factory=list)
