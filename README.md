@@ -76,8 +76,9 @@ Open:
 The frontend is a buttons-and-preview workspace, not a chat-first UI:
 
 - **Workspace tab**: upload a business process document or a requirement spec, review the extracted elements/relationships/view layout in an editable table and a diagram preview, then explicitly click "Create in Archi". Nothing is written to Archi until you approve the preview. Uncheck rows to drop elements or relationships, or edit element names inline before applying.
-- **Health / MCP Tools tabs**: service status and the live MCP tool catalog.
-- **Assistant drawer**: a collapsible chat panel docked on the right for free-form questions about the model. Collapse it with the chevron or the topbar toggle to give the workspace the full width.
+- **Top bar**: MCP connection (click it for the connection details), Archi's approval mode with pending approvals, Dashboard, and the governance meta-model.
+- **Settings tab**: *Connection* (MCP server, the Archi model it serves, approval mode, endpoint, Azure OpenAI deployment, raw health payload), *MCP tools* (the live tool catalog) and *Assistant* (an optional instruction that replaces the server's default instruction for the chat in this browser).
+- **Assistant** (the drawer on the right; open it from its rail or with Ctrl+K / ⌘K): answers stream in as the model writes them, and every MCP call shows up live as a step ("Searched elements", "Changed the model", …), kept with the answer as a collapsible summary. Answers are rendered as Markdown (lists, tables, code) without HTML. Stop ends the answer and makes the backend stop before its next model or tool call. Copy, regenerate the last answer, edit and resend the last question, suggested questions to start with. Changes queued by Archi's approval mode are shown with their proposal id. Conversations are kept in this browser: history with search, inline rename, export as Markdown, clear, delete. Error notices and stopped answers are not sent back to the model as context; the last 30 turns are.
 - **Assessment wizard**: 1 Setup → 2 As-Is Capture → 3 To-Be Architecture → 4 Mapping & Gap Analysis → 5 Ratings & Roadmap → 6 Summary. Step 5 maintains the steering data the dashboard reads (capability maturity, process ratings, plateaus, work packages, gap assignments, goals and outcome KPIs, application attributes): the AI proposes values that only fill empty fields, you review the tables, and nothing is written to Archi before you apply. `/?step=steering` opens step 5 directly, e.g. for a re-assessment.
 - **Assessment progress** is kept for the browser session (sessionStorage): switching to the dashboard, reloading the page or coming back later in the same browser tab restores the step, the view pairs, the results and the step-5 tables. Uploaded files are not kept, only their names. **New assessment** in the stepper starts over (nothing in Archi is deleted); a new browser tab or window starts a fresh assessment.
 - **Approval mode** in the top bar is read from Archi's MCP plugin (`list-pending-approvals`), with the number of pending approvals, refreshed every 30 s and whenever you return to the browser tab. After a write, the app mentions approval only when Archi actually queued the change as a proposal.
@@ -151,16 +152,20 @@ Example body:
 
 ### Streaming chat (SSE)
 
-POST `http://localhost:38000/api/chat/stream`
+POST `http://localhost:38000/api/chat/stream` (used by the assistant)
 
-Streams response chunks as Server-Sent Events with event names:
+Server-Sent Events while the assistant works:
 
 - `start`
-- `delta` (text chunks)
-- `trace` (optional full trace + tools)
-- `done`
+- `round` (a model call starts)
+- `tool_start` / `tool_end` (each MCP tool call: `name`, `ok`, `duration_ms`, and the approval `proposal` it created, if any)
+- `delta` (answer text as the model writes it)
+- `draft_reset` (text written before the model decided to call tools; discard it)
+- `done` (`answer`, `used_tools`, `proposals`, and `trace` when `include_trace` is true)
 - `error`
 - `close`
+
+When the client disconnects (Stop), no further model or tool call is made.
 
 Example body:
 
@@ -168,10 +173,11 @@ Example body:
 {
   "message": "What application components support customer sales?",
   "history": [],
-  "stream_chunk_chars": 180,
-  "include_trace": true
+  "include_trace": false
 }
 ```
+
+`POST /api/chat` returns the same answer in one response: `answer`, `used_tools` and `proposals`.
 
 ### Conversation export
 

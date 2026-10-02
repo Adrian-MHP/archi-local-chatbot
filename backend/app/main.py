@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 import io
 import json
+import logging
 import os
 from queue import Empty, Queue
 import re
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, Dict
 from uuid import uuid4
 
@@ -17,7 +18,7 @@ from fastapi.responses import StreamingResponse
 import httpx
 from pydantic import ValidationError
 
-from .azure_agent import ChatService
+from .azure_agent import ChatService, ChatStopped
 from .config import get_settings
 from . import dashboard, meta_model
 from .schemas import (
@@ -50,6 +51,8 @@ load_dotenv()
 settings = get_settings()
 chat_service = ChatService(settings)
 
+logger = logging.getLogger("uvicorn.error")
+
 app = FastAPI(title="Archi Local Chatbot API", version="0.1.0")
 
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
@@ -73,28 +76,6 @@ def _history_from_payload(payload: ChatRequest) -> list[dict[str, str]]:
 
 def _sse(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def _chunk_text(text: str, chunk_size: int) -> list[str]:
-    if not text:
-        return []
-    if chunk_size <= 0:
-        return [text]
-
-    chunks: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        end = min(i + chunk_size, n)
-        if end < n:
-            last_space = text.rfind(" ", i, end)
-            if last_space > i + 20:
-                end = last_space
-        chunk = text[i:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        i = max(end, i + 1)
-    return chunks or [text]
 
 
 def _normalize_conversation(conversation: ConversationArchive) -> tuple[ConversationArchive, list[str]]:
@@ -249,6 +230,7 @@ def health() -> Dict[str, Any]:
     # Archi's approval mode, read from the plugin (not assumed), so the UI can show the real state.
     approval_mode = None
     pending_approvals = None
+    archi_model = None
     if mcp_status == "ok":
         try:
             approvals = dashboard._payload(chat_service.mcp, "list-pending-approvals", {}).get("result") or {}
@@ -256,6 +238,11 @@ def health() -> Dict[str, Any]:
             pending_approvals = int(approvals.get("pendingCount") or 0)
         except Exception:  # noqa: BLE001
             approval_mode = None
+        # Archi serves the model opened last; show which one, so nobody works on the wrong model.
+        try:
+            archi_model = (dashboard._payload(chat_service.mcp, "get-model-info", {}).get("result") or {}).get("name") or None
+        except Exception:  # noqa: BLE001
+            archi_model = None
 
     return {
         "status": "ok",
@@ -264,6 +251,7 @@ def health() -> Dict[str, Any]:
         "mcp_status": mcp_status,
         "mcp_error": mcp_error,
         "mcp_tool_count": tool_count,
+        "archi_model": archi_model,
         "archi_approval_mode": approval_mode,
         "archi_pending_approvals": pending_approvals,
     }
@@ -364,15 +352,11 @@ def debug_mcp() -> Dict[str, Any]:
 def chat(payload: ChatRequest) -> ChatResponse:
     history = _history_from_payload(payload)
     try:
-        answer, used_tools = chat_service.chat(
-            history=history,
-            message=payload.message,
-            system_prompt=payload.system_prompt,
-        )
+        result = chat_service.chat_turn(history=history, message=payload.message, system_prompt=payload.system_prompt)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return ChatResponse(answer=answer, used_tools=used_tools)
+    return ChatResponse(answer=result["answer"], used_tools=result["used_tools"], proposals=result.get("proposals", []))
 
 
 @app.post("/api/chat/trace", response_model=ChatTraceResponse)
@@ -392,57 +376,51 @@ def chat_trace(payload: ChatRequest) -> ChatTraceResponse:
 
 @app.post("/api/chat/stream")
 def chat_stream(payload: ChatStreamRequest) -> StreamingResponse:
+    """Server-sent events while the assistant works: start, round, tool_start / tool_end (each MCP call,
+    with the approval proposal it created), delta (answer text as the model writes it), draft_reset,
+    done {answer, used_tools, proposals[, trace]}, error, close. When the client disconnects (Stop),
+    no further model or tool call is made."""
     history = _history_from_payload(payload)
+    events: Queue[tuple[str, Any]] = Queue()
+    stopped = Event()
+
+    def worker() -> None:
+        try:
+            result = chat_service.chat_turn(
+                history=history,
+                message=payload.message,
+                system_prompt=payload.system_prompt,
+                on_event=lambda name, data: events.put((name, data)),
+                should_stop=stopped.is_set,
+            )
+            done = {"answer": result["answer"], "used_tools": result["used_tools"], "proposals": result.get("proposals", [])}
+            if payload.include_trace:
+                done["trace"] = result.get("trace", {})
+            events.put(("done", done))
+        except ChatStopped:
+            logger.info("Chat request stopped by the client; no further model or tool call was made.")
+        except Exception as exc:  # noqa: BLE001
+            events.put(("error", {"detail": str(exc)}))
+        finally:
+            events.put(("end", None))
 
     def event_stream():
-        work_q: Queue[tuple[str, Any]] = Queue()
-
-        def worker() -> None:
-            try:
-                answer, used_tools, trace = chat_service.chat_with_trace(
-                    history=history,
-                    message=payload.message,
-                    system_prompt=payload.system_prompt,
-                )
-                work_q.put(("result", {"answer": answer, "used_tools": used_tools, "trace": trace}))
-            except Exception as exc:  # noqa: BLE001
-                work_q.put(("error", {"detail": str(exc)}))
-            finally:
-                work_q.put(("end", None))
-
         Thread(target=worker, daemon=True).start()
         stream_id = str(uuid4())
-        yield _sse("start", {"stream_id": stream_id, "started_at": _now_iso()})
-
-        is_done = False
-        while not is_done:
-            try:
-                kind, payload_data = work_q.get(timeout=1.0)
-            except Empty:
-                yield ": keep-alive\n\n"
-                continue
-
-            if kind == "result":
-                answer = str(payload_data.get("answer", ""))
-                used_tools = payload_data.get("used_tools", [])
-                trace = payload_data.get("trace", {})
-
-                if answer:
-                    for index, chunk in enumerate(_chunk_text(answer, payload.stream_chunk_chars)):
-                        yield _sse("delta", {"index": index, "content": chunk})
-
-                if payload.include_trace:
-                    yield _sse("trace", {"used_tools": used_tools, "trace": trace})
-                else:
-                    yield _sse("tools", {"used_tools": used_tools})
-
-                yield _sse("done", {"answer": answer, "used_tools": used_tools})
-            elif kind == "error":
-                yield _sse("error", payload_data)
-            elif kind == "end":
-                is_done = True
-
-        yield _sse("close", {"stream_id": stream_id, "completed_at": _now_iso()})
+        try:
+            yield _sse("start", {"stream_id": stream_id, "started_at": _now_iso()})
+            while True:
+                try:
+                    kind, data = events.get(timeout=1.0)
+                except Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                if kind == "end":
+                    break
+                yield _sse(kind, data)
+            yield _sse("close", {"stream_id": stream_id, "completed_at": _now_iso()})
+        finally:
+            stopped.set()  # also reached when the client goes away mid-answer
 
     return StreamingResponse(
         event_stream(),

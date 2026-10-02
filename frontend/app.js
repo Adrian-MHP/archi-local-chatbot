@@ -12,12 +12,10 @@ const state = {
   activeConversationId: null,
   health: null,
   tools: [],
-  pendingController: null,
-  abortResponseMessage: "Request stopped by user.",
+  chatPending: null, // the answer being streamed: {conversationId, controller, text, steps, ...}
   lastUsedTools: new Set(),
   healthPollTimer: null,
   persistTimer: null,
-  pendingAction: null,
   actionLog: [],
   activeTab: "assessmentTab",
   chatCollapsed: true,
@@ -37,37 +35,44 @@ const ASSESSMENT_STEPS = ["setup", "ist", "soll", "mapping", "steering", "summar
 const elements = {
   appGrid: document.getElementById("appGrid"),
   chatDrawer: document.getElementById("chatDrawer"),
-  chatToggleBtn: document.getElementById("chatToggleBtn"),
+  chatPanel: document.getElementById("chatPanel"),
+  chatRail: document.getElementById("chatRail"),
   drawerCollapseBtn: document.getElementById("drawerCollapseBtn"),
+  historyBtn: document.getElementById("historyBtn"),
+  historyPanel: document.getElementById("historyPanel"),
+  historySearch: document.getElementById("historySearch"),
+  chatMenuBtn: document.getElementById("chatMenuBtn"),
+  chatMenu: document.getElementById("chatMenu"),
   chatWindow: document.getElementById("chatWindow"),
+  jumpLatestBtn: document.getElementById("jumpLatestBtn"),
+  chatNotice: document.getElementById("chatNotice"),
   chatForm: document.getElementById("chatForm"),
   messageInput: document.getElementById("messageInput"),
-  systemPromptInput: document.getElementById("systemPromptInput"),
   sendBtn: document.getElementById("sendBtn"),
-  retryBtn: document.getElementById("retryBtn"),
   stopBtn: document.getElementById("stopBtn"),
-  clearBtn: document.getElementById("clearBtn"),
-  renameConversationBtn: document.getElementById("renameConversationBtn"),
-  exportBtn: document.getElementById("exportBtn"),
   newChatBtn: document.getElementById("newChatBtn"),
   messageCounter: document.getElementById("messageCounter"),
   conversationList: document.getElementById("conversationList"),
   conversationTitle: document.getElementById("conversationTitle"),
   conversationMeta: document.getElementById("conversationMeta"),
+  systemPromptInput: document.getElementById("systemPromptInput"),
+  systemPromptResetBtn: document.getElementById("systemPromptResetBtn"),
+  systemPromptStatus: document.getElementById("systemPromptStatus"),
   healthText: document.getElementById("healthText"),
   healthStatus: document.getElementById("healthStatus"),
   healthMcpStatus: document.getElementById("healthMcpStatus"),
+  healthArchiModel: document.getElementById("healthArchiModel"),
+  healthApproval: document.getElementById("healthApproval"),
+  healthAzureModel: document.getElementById("healthAzureModel"),
   healthToolCount: document.getElementById("healthToolCount"),
   healthServer: document.getElementById("healthServer"),
   connectionBadge: document.getElementById("connectionBadge"),
-  modelBadge: document.getElementById("modelBadge"),
   approvalBadge: document.getElementById("approvalBadge"),
   dashboardBtn: document.getElementById("dashboardBtn"),
   steeringDashboardBtn: document.getElementById("steeringDashboardBtn"),
   toolList: document.getElementById("toolList"),
   toolSearchInput: document.getElementById("toolSearchInput"),
   toolCountBadge: document.getElementById("toolCountBadge"),
-  refreshHealthBtn: document.getElementById("refreshHealthBtn"),
   refreshHealthInlineBtn: document.getElementById("refreshHealthInlineBtn"),
   refreshToolsBtn: document.getElementById("refreshToolsBtn"),
   actionLog: document.getElementById("actionLog"),
@@ -141,363 +146,26 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function createConversation(title = "New conversation", history = []) {
-  const now = new Date().toISOString();
-  return {
-    id: createId(),
-    title,
-    createdAt: now,
-    updatedAt: now,
-    history,
-    draft: "",
-  };
-}
-
-function sanitizeHistory(rawHistory) {
-  if (!Array.isArray(rawHistory)) return [];
-  const out = [];
-  for (const turn of rawHistory) {
-    if (!turn || (turn.role !== "user" && turn.role !== "assistant")) continue;
-    const content = String(turn.content || "");
-    const toolsRaw = turn.tools || turn.used_tools || [];
-    const tools = Array.isArray(toolsRaw) ? toolsRaw.map((t) => String(t)).slice(0, 30) : [];
-    out.push({
-      role: turn.role,
-      content: content.slice(0, 20000),
-      tools,
-      timestamp: isNaN(Date.parse(turn.timestamp || "")) ? new Date().toISOString() : turn.timestamp,
-    });
-  }
-  return out;
-}
-
-function loadPersistedState() {
-  let parsed = null;
-  try {
-    parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-  } catch (err) {
-    parsed = null;
-  }
-
-  if (parsed && Array.isArray(parsed.conversations)) {
-    state.conversations = parsed.conversations
-      .map((conv) => {
-        if (!conv || typeof conv !== "object") return null;
-        const history = sanitizeHistory(conv.history);
-        const createdAt = isNaN(Date.parse(conv.createdAt || "")) ? new Date().toISOString() : conv.createdAt;
-        const updatedAt = isNaN(Date.parse(conv.updatedAt || "")) ? createdAt : conv.updatedAt;
-        return {
-          id: String(conv.id || createId()),
-          title: String(conv.title || "New conversation").slice(0, 80),
-          createdAt,
-          updatedAt,
-          history,
-          draft: String(conv.draft || "").slice(0, MAX_MESSAGE_LENGTH),
-        };
-      })
-      .filter(Boolean);
-    state.activeConversationId = String(parsed.activeConversationId || "");
-  }
-
-  if (!state.conversations.length) {
-    const first = createConversation();
-    state.conversations = [first];
-    state.activeConversationId = first.id;
-  }
-
-  if (!state.conversations.some((c) => c.id === state.activeConversationId)) {
-    state.activeConversationId = state.conversations[0].id;
-  }
-
-  try {
-    const stored = localStorage.getItem(CHAT_COLLAPSED_KEY);
-    if (stored !== null) state.chatCollapsed = stored === "1";
-  } catch (err) {
-    // leave the default (collapsed) in place
-  }
-}
-
-function persistState() {
-  state.conversations = state.conversations.slice(0, MAX_CONVERSATIONS);
-  for (const conv of state.conversations) {
-    conv.title = String(conv.title || "New conversation").slice(0, 80);
-    conv.history = sanitizeHistory(conv.history).slice(-400);
-    conv.draft = String(conv.draft || "").slice(0, MAX_MESSAGE_LENGTH);
-  }
-
-  const serializableConversations = state.conversations.map((conv) => ({
-    id: conv.id,
-    title: conv.title,
-    createdAt: conv.createdAt,
-    updatedAt: conv.updatedAt,
-    history: conv.history,
-    draft: conv.draft,
-  }));
-  try {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        conversations: serializableConversations,
-        activeConversationId: state.activeConversationId,
-      })
-    );
-  } catch (err) {
-    console.warn("Unable to persist UI state:", err);
-  }
-}
-
-function schedulePersist() {
-  if (state.persistTimer) {
-    clearTimeout(state.persistTimer);
-  }
-  state.persistTimer = setTimeout(() => {
-    state.persistTimer = null;
-    persistState();
-  }, 250);
-}
-
-function formatClock(isoTimestamp) {
-  if (!isoTimestamp) return "--:--";
-  const d = new Date(isoTimestamp);
-  if (isNaN(d.getTime())) return "--:--";
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function formatRelativeTime(isoTimestamp) {
-  const then = Date.parse(isoTimestamp || "");
-  if (isNaN(then)) return "just now";
-  const deltaSeconds = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (deltaSeconds < 60) return `${deltaSeconds}s ago`;
-  const deltaMinutes = Math.floor(deltaSeconds / 60);
-  if (deltaMinutes < 60) return `${deltaMinutes}m ago`;
-  const deltaHours = Math.floor(deltaMinutes / 60);
-  if (deltaHours < 24) return `${deltaHours}h ago`;
-  const deltaDays = Math.floor(deltaHours / 24);
-  return `${deltaDays}d ago`;
-}
-
-function deriveConversationTitle(text) {
-  const normalized = String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) return "New conversation";
-  return normalized.slice(0, 52) + (normalized.length > 52 ? "..." : "");
-}
-
-function getActiveConversation() {
-  const active = state.conversations.find((conv) => conv.id === state.activeConversationId);
-  if (active) return active;
-  const fallback = state.conversations[0];
-  if (fallback) {
-    state.activeConversationId = fallback.id;
-    return fallback;
-  }
-  const created = createConversation();
-  state.conversations = [created];
-  state.activeConversationId = created.id;
-  return created;
-}
-
-function setActiveConversationDraft(value) {
-  const active = getActiveConversation();
-  active.draft = String(value || "").slice(0, MAX_MESSAGE_LENGTH);
-}
-
-function syncComposerFromActiveConversation() {
-  const active = getActiveConversation();
-  elements.messageInput.value = String(active.draft || "");
-  autoResizeTextarea(elements.messageInput);
-  updateMessageCounter();
-  updateSendButtonState();
-}
-
-function normalizeAssistantText(raw) {
-  if (!raw) return "";
-  let text = String(raw).replace(/\r\n/g, "\n");
-  text = text.replace(/^\s{0,3}#{1,6}\s*/gm, "");
-  text = text.replace(/^\s*[-*+]\s+/gm, "");
-  text = text.replace(/^\s*\d+\.\s+/gm, "");
-  text = text.replace(/\*\*(.*?)\*\*/g, "$1");
-  text = text.replace(/\*(.*?)\*/g, "$1");
-  text = text.replace(/\n{3,}/g, "\n\n").trim();
-  return text;
-}
-
-function splitParagraphs(rawText) {
-  const normalized = normalizeAssistantText(rawText);
-  if (!normalized) return [];
-  return normalized
-    .split(/\n\s*\n/g)
-    .map((block) => block.trim())
-    .filter(Boolean);
-}
-
-function updateLastUsedTools() {
-  const active = getActiveConversation();
-  const lastAssistant = [...active.history]
-    .reverse()
-    .find((turn) => turn.role === "assistant" && Array.isArray(turn.tools) && turn.tools.length);
-  state.lastUsedTools = new Set(lastAssistant ? lastAssistant.tools : []);
-}
-
-function renderConversationList() {
-  const list = elements.conversationList;
-  list.innerHTML = "";
-
-  const sorted = [...state.conversations].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-  if (!sorted.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "No saved conversations";
-    list.appendChild(empty);
-    return;
-  }
-
-  for (const conv of sorted) {
-    const item = document.createElement("div");
-    item.className = "conversation-item";
-
-    const mainButton = document.createElement("button");
-    mainButton.className = `conversation-main${conv.id === state.activeConversationId ? " active" : ""}`;
-    mainButton.type = "button";
-    mainButton.setAttribute("data-conversation-id", conv.id);
-
-    const title = document.createElement("p");
-    title.className = "conversation-title";
-    title.textContent = conv.title || "New conversation";
-    mainButton.appendChild(title);
-
-    const meta = document.createElement("p");
-    meta.className = "conversation-meta";
-    meta.textContent = `${conv.history.length} msgs · ${formatRelativeTime(conv.updatedAt)}`;
-    mainButton.appendChild(meta);
-
-    mainButton.addEventListener("click", () => {
-      switchActiveConversation(conv.id);
-    });
-
-    const deleteButton = document.createElement("button");
-    deleteButton.className = "conversation-delete";
-    deleteButton.type = "button";
-    deleteButton.textContent = "Del";
-    deleteButton.title = "Delete conversation";
-    deleteButton.addEventListener("click", () => {
-      deleteConversation(conv.id);
-    });
-
-    item.appendChild(mainButton);
-    item.appendChild(deleteButton);
-    list.appendChild(item);
-  }
-}
-
-function renderConversationHeader() {
-  const active = getActiveConversation();
-  elements.conversationTitle.textContent = active.title || "Assistant";
-  elements.conversationMeta.textContent = `${active.history.length} messages`;
-}
-
-function updateRetryButtonState() {
-  const active = getActiveConversation();
-  const hasUserTurn = active.history.some((turn) => turn.role === "user" && turn.content);
-  elements.retryBtn.disabled = Boolean(state.pendingController || state.pendingAction || !hasUserTurn);
-}
-
-function createMessageElement(turn, index) {
-  const wrapper = document.createElement("article");
-  wrapper.className = `message ${turn.role}`;
-
-  const meta = document.createElement("div");
-  meta.className = "message-meta";
-
-  const role = document.createElement("span");
-  role.className = "message-role";
-  role.textContent = turn.role === "user" ? "You" : "Assistant";
-  meta.appendChild(role);
-
-  const rightMeta = document.createElement("div");
-  rightMeta.className = "message-time";
-  rightMeta.textContent = formatClock(turn.timestamp);
-  meta.appendChild(rightMeta);
-
-  if (turn.role === "assistant") {
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "message-copy";
-    copy.textContent = "Copy";
-    copy.dataset.turnIndex = String(index);
-    meta.appendChild(copy);
-  }
-
-  wrapper.appendChild(meta);
-
-  const paragraphs = splitParagraphs(turn.content);
-  if (!paragraphs.length) {
-    const emptyParagraph = document.createElement("p");
-    emptyParagraph.className = "msg-paragraph";
-    emptyParagraph.textContent = "";
-    wrapper.appendChild(emptyParagraph);
-  } else {
-    for (const paragraphText of paragraphs) {
-      const paragraph = document.createElement("p");
-      paragraph.className = "msg-paragraph";
-      paragraph.textContent = paragraphText;
-      wrapper.appendChild(paragraph);
-    }
-  }
-
-  if (Array.isArray(turn.tools) && turn.tools.length) {
-    const toolList = document.createElement("div");
-    toolList.className = "tool-chip-list";
-    for (const tool of turn.tools) {
-      const chip = document.createElement("span");
-      chip.className = "tool-chip";
-      chip.textContent = tool;
-      toolList.appendChild(chip);
-    }
-    wrapper.appendChild(toolList);
-  }
-
-  return wrapper;
-}
-
-function renderChatWindow() {
-  const active = getActiveConversation();
-  const container = elements.chatWindow;
-  container.innerHTML = "";
-
-  if (!active.history.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-chat";
-    empty.innerHTML = "<h3>Ask about your model</h3><p>Use quick prompts or ask free-form questions.</p>";
-    container.appendChild(empty);
-    return;
-  }
-
-  active.history.forEach((turn, index) => {
-    container.appendChild(createMessageElement(turn, index));
-  });
-  container.scrollTop = container.scrollHeight;
-}
-
 function renderHealth() {
   const health = state.health || {};
-  const status = String(health.status || "unknown");
   const mcpStatus = String(health.mcp_status || "unknown");
-  const model = String(health.azure_model || "--");
   const toolCount = Number.isFinite(health.mcp_tool_count) ? health.mcp_tool_count : "--";
-  const serverUrl = String(health.mcp_server_url || "--");
-
-  elements.healthStatus.textContent = status;
-  elements.healthMcpStatus.textContent = mcpStatus;
-  elements.healthToolCount.textContent = String(toolCount);
-  elements.healthServer.textContent = serverUrl.replace(/^https?:\/\//, "");
-  elements.healthText.textContent = JSON.stringify(health, null, 2);
-
-  elements.modelBadge.textContent = `Model: ${model}`;
-  // Approval mode as reported by Archi's MCP plugin -- when on, writes wait in Archi for approval.
   const approval = health.archi_approval_mode;
   const pending = Number.isFinite(health.archi_pending_approvals) ? health.archi_pending_approvals : 0;
+
+  elements.healthStatus.textContent = health.status === "ok" ? "Running" : health.status === "error" ? "Not reachable" : "--";
+  elements.healthMcpStatus.textContent = mcpStatus === "ok" ? "Connected"
+    : mcpStatus === "error" ? `Not reachable${health.mcp_error ? ` (${health.mcp_error})` : ""}` : "Checking…";
+  elements.healthMcpStatus.className = mcpStatus === "ok" ? "text-ok" : mcpStatus === "error" ? "text-error" : "";
+  elements.healthArchiModel.textContent = health.archi_model || "--";
+  elements.healthApproval.textContent = approval === true ? `On${pending ? ` · ${pending} pending` : ""}` : approval === false ? "Off" : "--";
+  elements.healthAzureModel.textContent = health.azure_model || "--";
+  elements.healthToolCount.textContent = String(toolCount);
+  elements.healthServer.textContent = String(health.mcp_server_url || "--").replace(/^https?:\/\//, "");
+  elements.healthText.textContent = JSON.stringify(health, null, 2);
+  renderChatContext();
+
+  // Approval mode as reported by Archi's MCP plugin -- when on, writes wait in Archi for approval.
   elements.approvalBadge.className = "badge";
   if (approval === true) {
     elements.approvalBadge.classList.add("status", "status-warn");
@@ -510,7 +178,7 @@ function renderHealth() {
     elements.approvalBadge.textContent = "Approval: unknown";
     elements.approvalBadge.title = "The approval mode could not be read from Archi.";
   }
-  elements.connectionBadge.className = "badge status";
+  elements.connectionBadge.className = "badge status badge-btn";
   if (mcpStatus === "ok") {
     elements.connectionBadge.classList.add("status-ok");
     elements.connectionBadge.textContent = "MCP Connected";
@@ -1493,7 +1161,8 @@ function restoreAssessmentSession() {
       awaitingApproval: Boolean(saved.steering && saved.steering.awaitingApproval),
     },
   };
-  if (["assessmentTab", "dashboardTab", "healthTab", "toolsTab"].includes(saved.activeTab)) state.activeTab = saved.activeTab;
+  const savedTab = ["healthTab", "toolsTab"].includes(saved.activeTab) ? "settingsTab" : saved.activeTab; // before Settings
+  if (["assessmentTab", "dashboardTab", "settingsTab"].includes(savedTab)) state.activeTab = savedTab;
   lastAssessmentSessionSnapshot = "";
   return true;
 }
@@ -2793,305 +2462,10 @@ function closeMetaModelModal() {
 /* ---------------- Chat / general UI ---------------- */
 
 function renderAll() {
-  updateLastUsedTools();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
+  renderChat();
   renderHealth();
   renderToolList();
   renderActionLog();
-  updateMessageCounter();
-  updateSendButtonState();
-  updateRetryButtonState();
-}
-
-function abortPendingRequest(message = "Request stopped by user.") {
-  if (!state.pendingController) {
-    return false;
-  }
-  state.abortResponseMessage = message;
-  state.pendingController.abort();
-  return true;
-}
-
-function switchActiveConversation(conversationId) {
-  if (!conversationId || state.activeConversationId === conversationId) {
-    return;
-  }
-  if (!state.conversations.some((conv) => conv.id === conversationId)) {
-    return;
-  }
-  setActiveConversationDraft(elements.messageInput.value);
-  if (state.pendingController) {
-    abortPendingRequest("");
-  }
-  state.activeConversationId = conversationId;
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
-  updateLastUsedTools();
-  renderToolList();
-  syncComposerFromActiveConversation();
-  elements.messageInput.focus();
-}
-
-function createNewConversation() {
-  setActiveConversationDraft(elements.messageInput.value);
-  if (state.pendingController) {
-    abortPendingRequest("");
-  }
-  const conversation = createConversation();
-  state.conversations.unshift(conversation);
-  state.conversations = state.conversations.slice(0, MAX_CONVERSATIONS);
-  state.activeConversationId = conversation.id;
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
-  syncComposerFromActiveConversation();
-  elements.messageInput.focus();
-}
-
-function deleteConversation(conversationId) {
-  if (!conversationId) {
-    return;
-  }
-  if (state.pendingController && state.activeConversationId === conversationId) {
-    abortPendingRequest("");
-  }
-  if (state.conversations.length <= 1) {
-    const active = getActiveConversation();
-    active.history = [];
-    active.title = "New conversation";
-    active.updatedAt = new Date().toISOString();
-    active.draft = "";
-    persistState();
-    renderConversationList();
-    renderConversationHeader();
-    renderChatWindow();
-    syncComposerFromActiveConversation();
-    return;
-  }
-
-  state.conversations = state.conversations.filter((conv) => conv.id !== conversationId);
-  if (state.activeConversationId === conversationId) {
-    state.activeConversationId = state.conversations[0]?.id || null;
-  }
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
-  syncComposerFromActiveConversation();
-}
-
-function clearActiveConversation() {
-  if (state.pendingController) {
-    abortPendingRequest("");
-  }
-  const active = getActiveConversation();
-  active.history = [];
-  active.title = "New conversation";
-  active.updatedAt = new Date().toISOString();
-  active.draft = "";
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
-  syncComposerFromActiveConversation();
-  elements.messageInput.focus();
-}
-
-function exportActiveConversation() {
-  const active = getActiveConversation();
-  const payload = {
-    exported_at: new Date().toISOString(),
-    conversation: active,
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  const safeTitle = active.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "conversation";
-  anchor.href = url;
-  anchor.download = `${safeTitle}-${Date.now()}.json`;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
-  URL.revokeObjectURL(url);
-}
-
-function renameActiveConversation() {
-  const active = getActiveConversation();
-  const nextTitle = window.prompt("Conversation title", active.title || "New conversation");
-  if (nextTitle === null) return;
-  const clean = nextTitle.replace(/\s+/g, " ").trim();
-  if (!clean) return;
-  active.title = clean.slice(0, 80);
-  active.updatedAt = new Date().toISOString();
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-}
-
-function retryLastUserPrompt() {
-  if (state.pendingController) {
-    return;
-  }
-  const active = getActiveConversation();
-  const lastUserTurn = [...active.history].reverse().find((turn) => turn.role === "user" && turn.content);
-  if (!lastUserTurn) {
-    return;
-  }
-  sendMessage(lastUserTurn.content);
-}
-
-function autoResizeTextarea(textarea) {
-  textarea.style.height = "auto";
-  const nextHeight = Math.min(textarea.scrollHeight, 160);
-  textarea.style.height = `${nextHeight}px`;
-}
-
-function updateMessageCounter() {
-  const rawLength = elements.messageInput.value.length;
-  elements.messageCounter.textContent = `${rawLength}/${MAX_MESSAGE_LENGTH}`;
-  elements.messageCounter.classList.toggle("over-limit", rawLength > MAX_MESSAGE_LENGTH);
-}
-
-function updateSendButtonState() {
-  const rawValue = elements.messageInput.value || "";
-  const hasText = rawValue.trim().length > 0;
-  const overLimit = rawValue.length > MAX_MESSAGE_LENGTH;
-  elements.sendBtn.disabled = Boolean(state.pendingController || state.pendingAction || !hasText || overLimit);
-}
-
-function setSending(isSending) {
-  elements.sendBtn.textContent = isSending ? "Sending..." : "Send";
-  updateSendButtonState();
-  elements.stopBtn.disabled = !isSending;
-  updateRetryButtonState();
-
-  const existing = document.getElementById("typingIndicator");
-  if (isSending && !existing) {
-    const typing = document.createElement("div");
-    typing.id = "typingIndicator";
-    typing.className = "typing-indicator";
-    typing.textContent = "Assistant is analyzing your model...";
-    elements.chatWindow.appendChild(typing);
-    elements.chatWindow.scrollTop = elements.chatWindow.scrollHeight;
-  }
-  if (!isSending && existing) {
-    existing.remove();
-  }
-}
-
-function appendTurn(conversation, role, content, tools = []) {
-  const turn = {
-    role,
-    content: String(content || ""),
-    tools: Array.isArray(tools) ? tools.map((t) => String(t)) : [],
-    timestamp: new Date().toISOString(),
-  };
-  conversation.history.push(turn);
-  conversation.history = conversation.history.slice(-400);
-  conversation.updatedAt = turn.timestamp;
-  if (role === "user" && (conversation.title === "New conversation" || conversation.history.length <= 2)) {
-    conversation.title = deriveConversationTitle(content);
-  }
-}
-
-function buildApiHistory(conversation) {
-  return conversation.history
-    .slice(0, -1)
-    .filter((turn) => turn.role === "user" || turn.role === "assistant")
-    .map((turn) => ({ role: turn.role, content: turn.content }));
-}
-
-async function sendMessage(rawMessage) {
-  const raw = String(rawMessage || "");
-  const content = raw.trim();
-  if (!content || state.pendingController) return;
-  if (raw.length > MAX_MESSAGE_LENGTH) {
-    updateMessageCounter();
-    updateSendButtonState();
-    return;
-  }
-
-  const active = getActiveConversation();
-  active.draft = "";
-  appendTurn(active, "user", content);
-  persistState();
-  renderConversationList();
-  renderConversationHeader();
-  renderChatWindow();
-
-  elements.messageInput.value = "";
-  autoResizeTextarea(elements.messageInput);
-
-  const controller = new AbortController();
-  state.pendingController = controller;
-  setSending(true);
-
-  const systemPrompt = elements.systemPromptInput.value.trim().slice(0, MAX_SYSTEM_PROMPT_LENGTH);
-  if (systemPrompt) {
-    localStorage.setItem(SYSTEM_PROMPT_KEY, systemPrompt);
-  } else {
-    localStorage.removeItem(SYSTEM_PROMPT_KEY);
-  }
-
-  try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({
-        message: content,
-        history: buildApiHistory(active),
-        system_prompt: systemPrompt || undefined,
-      }),
-    });
-
-    let data = {};
-    try {
-      data = await response.json();
-    } catch (err) {
-      data = {};
-    }
-
-    if (!response.ok) {
-      throw new Error(data.detail || `Request failed with status ${response.status}`);
-    }
-
-    appendTurn(active, "assistant", data.answer || "", data.used_tools || []);
-    persistState();
-    updateLastUsedTools();
-    renderConversationList();
-    renderConversationHeader();
-    renderChatWindow();
-    await loadHealth();
-    if (!state.tools.length) {
-      await loadTools();
-    } else {
-      renderToolList();
-    }
-  } catch (err) {
-    if (err && err.name === "AbortError") {
-      if (state.abortResponseMessage) {
-        appendTurn(active, "assistant", state.abortResponseMessage);
-      }
-    } else {
-      appendTurn(active, "assistant", `Error: ${err.message || String(err)}`);
-    }
-    persistState();
-    renderConversationList();
-    renderConversationHeader();
-    renderChatWindow();
-  } finally {
-    state.abortResponseMessage = "Request stopped by user.";
-    state.pendingController = null;
-    setSending(false);
-    updateSendButtonState();
-    elements.messageInput.focus();
-  }
 }
 
 async function loadHealth() {
@@ -3144,32 +2518,6 @@ function startHealthPolling() {
   }, HEALTH_POLL_INTERVAL_MS);
 }
 
-async function copyMessage(turnIndex, button) {
-  const active = getActiveConversation();
-  const turn = active.history[turnIndex];
-  if (!turn) return;
-
-  let copied = false;
-  try {
-    await navigator.clipboard.writeText(turn.content || "");
-    copied = true;
-  } catch (err) {
-    const temp = document.createElement("textarea");
-    temp.value = turn.content || "";
-    document.body.appendChild(temp);
-    temp.select();
-    copied = document.execCommand("copy");
-    document.body.removeChild(temp);
-  }
-
-  if (!copied) return;
-  const original = button.textContent;
-  button.textContent = "Copied";
-  setTimeout(() => {
-    button.textContent = original;
-  }, 1200);
-}
-
 /* ---------------- Tabs + chat drawer ---------------- */
 
 function setActiveTab(tabId) {
@@ -3185,82 +2533,34 @@ function setActiveTab(tabId) {
   persistAssessmentSession();
 }
 
+function showSettingsSection(sectionId) {
+  document.querySelectorAll(".settings-nav-btn").forEach((btn) => {
+    const active = btn.dataset.section === sectionId;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll(".settings-section").forEach((section) => {
+    section.classList.toggle("hidden", section.id !== sectionId);
+  });
+}
+
+function openConnectionSettings() {
+  setActiveTab("settingsTab");
+  showSettingsSection("settingsConnection");
+  loadHealth();
+}
+
 function openDashboardTab() {
   setActiveTab("dashboardTab");
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
-function setChatCollapsed(collapsed) {
-  state.chatCollapsed = collapsed;
-  elements.appGrid.classList.toggle("chat-collapsed", collapsed);
-  elements.chatToggleBtn.textContent = collapsed ? "Show assistant" : "Hide assistant";
-  elements.chatToggleBtn.setAttribute("aria-expanded", String(!collapsed));
-  elements.drawerCollapseBtn.textContent = collapsed ? "«" : "»";
-  elements.drawerCollapseBtn.title = collapsed ? "Expand assistant" : "Collapse assistant";
-  try {
-    localStorage.setItem(CHAT_COLLAPSED_KEY, collapsed ? "1" : "0");
-  } catch (err) {
-    // ignore storage errors
-  }
-}
-
 function attachEventHandlers() {
-  elements.chatForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await sendMessage(elements.messageInput.value);
-  });
-
-  elements.messageInput.addEventListener("input", () => {
-    setActiveConversationDraft(elements.messageInput.value);
-    schedulePersist();
-    autoResizeTextarea(elements.messageInput);
-    updateMessageCounter();
-    updateSendButtonState();
-  });
-
-  elements.messageInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      elements.chatForm.requestSubmit();
-    }
-  });
-
-  elements.systemPromptInput.addEventListener("input", () => {
-    if (elements.systemPromptInput.value.length > MAX_SYSTEM_PROMPT_LENGTH) {
-      elements.systemPromptInput.value = elements.systemPromptInput.value.slice(0, MAX_SYSTEM_PROMPT_LENGTH);
-    }
-    try {
-      localStorage.setItem(SYSTEM_PROMPT_KEY, elements.systemPromptInput.value);
-    } catch (err) {
-      console.warn("Unable to store system prompt:", err);
-    }
-  });
-
-  elements.renameConversationBtn.addEventListener("click", renameActiveConversation);
-  elements.clearBtn.addEventListener("click", clearActiveConversation);
-  elements.exportBtn.addEventListener("click", exportActiveConversation);
-  elements.retryBtn.addEventListener("click", retryLastUserPrompt);
-  elements.newChatBtn.addEventListener("click", createNewConversation);
-
-  elements.stopBtn.addEventListener("click", () => {
-    abortPendingRequest("Request stopped by user.");
-  });
-
-  elements.refreshHealthBtn.addEventListener("click", loadHealth);
+  elements.connectionBadge.addEventListener("click", openConnectionSettings);
   elements.refreshHealthInlineBtn.addEventListener("click", loadHealth);
   elements.refreshToolsBtn.addEventListener("click", loadTools);
-
   elements.toolSearchInput.addEventListener("input", () => {
     renderToolList();
-  });
-
-  elements.chatWindow.addEventListener("click", async (event) => {
-    if (!(event.target instanceof Element)) return;
-    const button = event.target.closest(".message-copy");
-    if (!button) return;
-    const turnIndex = Number(button.dataset.turnIndex);
-    if (!Number.isInteger(turnIndex)) return;
-    await copyMessage(turnIndex, button);
   });
 
   document.querySelectorAll(".tab-btn").forEach((button) => {
@@ -3268,12 +2568,8 @@ function attachEventHandlers() {
       setActiveTab(button.dataset.tab);
     });
   });
-
-  elements.chatToggleBtn.addEventListener("click", () => {
-    setChatCollapsed(!state.chatCollapsed);
-  });
-  elements.drawerCollapseBtn.addEventListener("click", () => {
-    setChatCollapsed(!state.chatCollapsed);
+  document.querySelectorAll(".settings-nav-btn").forEach((button) => {
+    button.addEventListener("click", () => showSettingsSection(button.dataset.section));
   });
 
   elements.metaModelBtn.addEventListener("click", openMetaModelModal);
@@ -3294,28 +2590,13 @@ function attachEventHandlers() {
       loadHealth();
     }
   });
-
-  window.addEventListener("beforeunload", () => {
-    setActiveConversationDraft(elements.messageInput.value);
-    persistState();
-  });
 }
 
 function init() {
   validateRequiredElements();
-  loadPersistedState();
-
-  try {
-    const prompt = localStorage.getItem(SYSTEM_PROMPT_KEY);
-    if (prompt) {
-      elements.systemPromptInput.value = prompt.slice(0, MAX_SYSTEM_PROMPT_LENGTH);
-    }
-  } catch (err) {
-    console.warn("Unable to load saved system prompt:", err);
-  }
-
   attachEventHandlers();
   attachAssessmentEventHandlers();
+  initChat();
   const restoredAssessment = restoreAssessmentSession();
   if (!state.assessment.pairs.length) {
     state.assessment.pairs = [createAssessmentPair(0)];
@@ -3350,15 +2631,11 @@ function init() {
   // wizard state; pagehide covers reloads and closing the tab.
   setInterval(persistAssessmentSession, 2000);
   window.addEventListener("pagehide", persistAssessmentSession);
-  setChatCollapsed(state.chatCollapsed);
   renderAll();
-  syncComposerFromActiveConversation();
-  updateMessageCounter();
-  updateSendButtonState();
   loadHealth();
   loadTools();
   startHealthPolling();
-  elements.messageInput.focus();
 }
 
-init();
+// chat.js is loaded after this file; DOMContentLoaded fires once every script has run.
+document.addEventListener("DOMContentLoaded", init);

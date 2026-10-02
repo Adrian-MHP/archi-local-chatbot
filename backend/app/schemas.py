@@ -20,13 +20,14 @@ class ChatRequest(BaseModel):
 
 
 class ChatStreamRequest(ChatRequest):
-    stream_chunk_chars: int = Field(default=180, ge=20, le=2000)
-    include_trace: bool = Field(default=True)
+    include_trace: bool = Field(default=False)
 
 
 class ChatResponse(BaseModel):
     answer: str
     used_tools: List[str]
+    # Approval proposals Archi created for changes made in this answer (approval mode on).
+    proposals: List[str] = Field(default_factory=list)
 
 
 class ChatTraceRound(BaseModel):

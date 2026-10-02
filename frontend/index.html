@@ -34,16 +34,11 @@
           </div>
         </div>
         <div class="topbar-status">
-          <span id="connectionBadge" class="badge status status-pending">Checking MCP</span>
-          <span id="modelBadge" class="badge">Model: --</span>
+          <button id="connectionBadge" class="badge status status-pending badge-btn" type="button" title="Connection details">Checking MCP</button>
           <span id="approvalBadge" class="badge" title="Archi's MCP approval mode, read from the plugin">Approval: --</span>
           <button id="dashboardBtn" class="btn primary" type="button">Dashboard</button>
-          <button id="refreshHealthBtn" class="btn ghost" type="button">Refresh status</button>
           <button id="metaModelBtn" class="btn ghost" type="button" aria-haspopup="dialog" aria-controls="metaModelModal">
             Meta model
-          </button>
-          <button id="chatToggleBtn" class="btn ghost" type="button" aria-expanded="true" aria-controls="chatDrawer">
-            Hide assistant
           </button>
         </div>
       </header>
@@ -53,8 +48,7 @@
           <nav class="tab-bar card" aria-label="Workspace sections">
             <button class="tab-btn active" type="button" data-tab="assessmentTab">Architecture Assessment</button>
             <button class="tab-btn" type="button" data-tab="dashboardTab">Transformation Dashboard</button>
-            <button class="tab-btn" type="button" data-tab="healthTab">Health</button>
-            <button class="tab-btn" type="button" data-tab="toolsTab">MCP Tools</button>
+            <button class="tab-btn" type="button" data-tab="settingsTab">Settings</button>
           </nav>
 
           <section id="assessmentTab" class="tab-panel">
@@ -260,29 +254,43 @@
             </div>
           </section>
 
-          <section id="healthTab" class="tab-panel hidden">
-            <section class="card">
+          <section id="settingsTab" class="tab-panel hidden">
+            <nav class="settings-nav card" role="tablist" aria-label="Settings">
+              <button class="settings-nav-btn active" type="button" role="tab" aria-selected="true" data-section="settingsConnection">Connection</button>
+              <button class="settings-nav-btn" type="button" role="tab" aria-selected="false" data-section="settingsTools">MCP tools</button>
+              <button class="settings-nav-btn" type="button" role="tab" aria-selected="false" data-section="settingsAssistant">Assistant</button>
+            </nav>
+
+            <section id="settingsConnection" class="settings-section card">
               <header class="card-head">
-                <h2>Service health</h2>
-                <button id="refreshHealthInlineBtn" class="btn ghost small" type="button">Refresh</button>
+                <div>
+                  <h2>Connection</h2>
+                  <p>Archi's MCP server, the model it serves, and the Azure OpenAI deployment of this app.</p>
+                </div>
+                <button id="refreshHealthInlineBtn" class="btn ghost small" type="button">Re-check</button>
               </header>
               <div class="kv-grid">
-                <div><span>Status</span><strong id="healthStatus">--</strong></div>
-                <div><span>MCP</span><strong id="healthMcpStatus">--</strong></div>
-                <div><span>Tools</span><strong id="healthToolCount">--</strong></div>
-                <div><span>Server</span><strong id="healthServer">--</strong></div>
+                <div><span>Archi MCP server</span><strong id="healthMcpStatus">--</strong></div>
+                <div><span>Active Archi model</span><strong id="healthArchiModel">--</strong></div>
+                <div><span>Approval mode</span><strong id="healthApproval">--</strong></div>
+                <div><span>MCP endpoint</span><strong id="healthServer">--</strong></div>
+                <div><span>MCP tools</span><strong id="healthToolCount">--</strong></div>
+                <div><span>Azure OpenAI deployment</span><strong id="healthAzureModel">--</strong></div>
+                <div><span>App backend</span><strong id="healthStatus">--</strong></div>
               </div>
+              <p class="settings-hint">Archi serves the model that was opened last. After restarting Archi, start the server with MCP Server › Start MCP Server.</p>
               <details class="raw-block">
-                <summary>Raw payload</summary>
+                <summary>Raw health payload</summary>
                 <pre id="healthText">Loading...</pre>
               </details>
             </section>
-          </section>
 
-          <section id="toolsTab" class="tab-panel hidden">
-            <section class="card">
+            <section id="settingsTools" class="settings-section card hidden">
               <header class="card-head">
-                <h2>MCP tools</h2>
+                <div>
+                  <h2>MCP tools</h2>
+                  <p>The tools Archi's MCP plugin offers to the assistant and the assessment.</p>
+                </div>
                 <button id="refreshToolsBtn" class="btn ghost small" type="button">Reload</button>
               </header>
               <div class="tool-toolbar">
@@ -291,58 +299,76 @@
               </div>
               <div id="toolList" class="tool-list"></div>
             </section>
+
+            <section id="settingsAssistant" class="settings-section card hidden">
+              <header class="card-head">
+                <div>
+                  <h2>Assistant instruction</h2>
+                  <p>Optional. Replaces the server's default instruction for the chat in this browser. The governance meta-model and the answer format are always added.</p>
+                </div>
+                <button id="systemPromptResetBtn" class="btn ghost small" type="button">Reset to default</button>
+              </header>
+              <label class="sr-only" for="systemPromptInput">Assistant instruction</label>
+              <textarea id="systemPromptInput" rows="8" placeholder="e.g. You are an enterprise architect at MHP. Answer in German and focus on the PLM domain."></textarea>
+              <p id="systemPromptStatus" class="settings-hint">Using the default instruction of the server.</p>
+            </section>
           </section>
         </main>
 
-        <aside id="chatDrawer" class="chat-drawer card">
-          <header class="drawer-head">
-            <div class="drawer-head-text">
-              <h2 id="conversationTitle">Assistant</h2>
-              <p id="conversationMeta">0 messages</p>
+        <aside id="chatDrawer" class="chat-drawer card" aria-label="Assistant">
+          <button id="chatRail" class="chat-rail" type="button" aria-controls="chatDrawer" aria-expanded="false" title="Open the assistant (Ctrl+K / ⌘K)">
+            <span>Assistant</span>
+          </button>
+          <div id="chatPanel" class="chat-panel">
+            <header class="chat-head">
+              <div class="chat-head-main">
+                <button id="historyBtn" class="icon-btn" type="button" aria-controls="historyPanel" aria-expanded="false" title="Conversations" aria-label="Conversations"></button>
+                <div class="chat-head-text">
+                  <h2 id="conversationTitle">New conversation</h2>
+                  <p id="conversationMeta"></p>
+                </div>
+              </div>
+              <div class="chat-head-actions">
+                <button id="newChatBtn" class="icon-btn" type="button" title="New conversation" aria-label="New conversation"></button>
+                <div class="chat-menu-wrap">
+                  <button id="chatMenuBtn" class="icon-btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="chatMenu" title="More" aria-label="More"></button>
+                  <div id="chatMenu" class="chat-menu hidden" role="menu">
+                    <button type="button" role="menuitem" data-action="rename">Rename</button>
+                    <button type="button" role="menuitem" data-action="export">Export as Markdown</button>
+                    <hr />
+                    <button type="button" role="menuitem" data-action="clear">Clear messages</button>
+                    <button type="button" role="menuitem" data-action="delete" class="danger">Delete conversation</button>
+                  </div>
+                </div>
+                <button id="drawerCollapseBtn" class="icon-btn" type="button" aria-controls="chatDrawer" aria-expanded="true" title="Hide the assistant" aria-label="Hide the assistant"></button>
+              </div>
+            </header>
+
+            <div id="historyPanel" class="history-panel hidden">
+              <label class="history-search">
+                <span class="sr-only">Search conversations</span>
+                <input id="historySearch" type="search" placeholder="Search conversations" />
+              </label>
+              <div id="conversationList" class="conversation-list"></div>
             </div>
-            <button id="drawerCollapseBtn" class="drawer-collapse-btn" type="button" title="Collapse assistant">&raquo;</button>
-          </header>
 
-          <div class="drawer-body">
-            <div class="conversation-toolbar">
-              <button id="newChatBtn" class="btn small" type="button">New chat</button>
-              <button id="renameConversationBtn" class="btn ghost small" type="button">Rename</button>
-              <button id="clearBtn" class="btn ghost small" type="button">Clear</button>
-              <button id="exportBtn" class="btn ghost small" type="button">Export</button>
+            <div class="chat-body">
+              <div id="chatWindow" class="chat-window" role="log" aria-live="polite" aria-label="Conversation"></div>
+              <button id="jumpLatestBtn" class="jump-latest hidden" type="button">Latest</button>
             </div>
 
-            <div id="conversationList" class="conversation-list"></div>
-
-            <div id="chatWindow" class="chat-window" aria-live="polite"></div>
+            <div id="chatNotice" class="chat-notice hidden" role="status"></div>
 
             <form id="chatForm" class="composer">
-              <label class="sr-only" for="messageInput">Message</label>
-              <textarea
-                id="messageInput"
-                rows="2"
-                placeholder="Ask about your Archi model..."
-                required
-              ></textarea>
-
-              <details class="advanced">
-                <summary>Optional system instruction</summary>
-                <textarea
-                  id="systemPromptInput"
-                  rows="3"
-                  placeholder="Optional override for assistant behavior on this page."
-                ></textarea>
-              </details>
-
-              <div class="composer-row">
-                <div class="composer-meta">
-                  <span class="hint">Enter to send</span>
-                  <span id="messageCounter" class="counter">0/20000</span>
-                </div>
-                <div class="composer-actions">
-                  <button id="retryBtn" class="btn ghost small" type="button">Retry</button>
-                  <button id="stopBtn" class="btn warn small" type="button" disabled>Stop</button>
-                  <button id="sendBtn" class="btn primary small" type="submit">Send</button>
-                </div>
+              <div class="composer-box">
+                <label class="sr-only" for="messageInput">Message</label>
+                <textarea id="messageInput" rows="1" placeholder="Ask about the active Archi model…"></textarea>
+                <button id="sendBtn" class="send-btn" type="submit" title="Send (Enter)" aria-label="Send"></button>
+                <button id="stopBtn" class="send-btn stop hidden" type="button" title="Stop the answer" aria-label="Stop"></button>
+              </div>
+              <div class="composer-foot">
+                <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
+                <span id="messageCounter" class="counter"></span>
               </div>
             </form>
           </div>
@@ -367,5 +393,6 @@
 
     <script src="/dashboard.js"></script>
     <script src="/app.js"></script>
+    <script src="/chat.js"></script>
   </body>
 </html>

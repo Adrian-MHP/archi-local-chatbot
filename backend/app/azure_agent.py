@@ -8,7 +8,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import httpx
 from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
@@ -21,6 +21,13 @@ from .mcp_client import McpClient, McpTool
 
 
 _BACKREF_RE = re.compile(r"^\$(\d+)\.id$")
+
+# Receives the chat's live progress events: (event name, payload).
+ChatEventSink = Callable[[str, Dict[str, Any]], None]
+
+
+class ChatStopped(RuntimeError):
+    """The client stopped the chat request; no further model or tool call is made."""
 
 
 def _tracks_proposals(method):
@@ -99,10 +106,12 @@ class ChatService:
 
     def _build_messages(self, history: List[Dict[str, str]], message: str, system_prompt: str | None) -> List[Dict[str, Any]]:
         ui_formatting_rules = (
-            "Output format for end users: plain text only. "
-            "Do not use markdown headings, bullet lists, or numbered lists. "
-            "Use short paragraphs separated by blank lines. "
-            "If you need structure, use simple labels like 'Model summary:' in plain text."
+            "Output format: the chat renders GitHub-flavoured Markdown. Lead with the answer, then the "
+            "detail. Use short paragraphs, bullet or numbered lists for enumerations, a table when you compare "
+            "several elements on the same attributes and **bold** for key figures. Refer to elements by name and "
+            "mention the type only where the context does not make it clear; show element ids only when the user "
+            "asks for them, then as `code`. "
+            "Use headings (### at most) only in long answers. No HTML, no emojis."
         )
         execution_policy = (
             "When the user requests model changes, prefer one consolidated execution plan: "
@@ -595,13 +604,20 @@ class ChatService:
         if isinstance(unwrapped, dict) and unwrapped.get("allSucceeded") is False:
             raise RuntimeError(f"{tool_name} did not fully succeed: {json.dumps(unwrapped)[:500]}")
 
-        if tool_name == "bulk-mutate" and isinstance(unwrapped, dict):
-            proposal = unwrapped.get("proposal")
-            sink = getattr(self._proposal_local, "ids", None)
-            if isinstance(proposal, dict) and proposal.get("proposalId") and sink is not None:
-                sink.append(str(proposal["proposalId"]))
-
+        self._record_proposal(unwrapped)
         return unwrapped
+
+    def _record_proposal(self, unwrapped: Any) -> str | None:
+        """With Archi's approval mode on, a mutating tool returns a proposal instead of applying the
+        change: remember its id for the running write operation and return it."""
+        proposal = unwrapped.get("proposal") if isinstance(unwrapped, dict) else None
+        if not (isinstance(proposal, dict) and proposal.get("proposalId")):
+            return None
+        proposal_id = str(proposal["proposalId"])
+        sink = getattr(self._proposal_local, "ids", None)
+        if sink is not None:
+            sink.append(proposal_id)
+        return proposal_id
 
     @contextmanager
     def _collect_proposals(self):
@@ -3390,17 +3406,74 @@ class ChatService:
             "executive_summary": executive_summary,
         }
 
+    def _model_round(
+        self,
+        create_kwargs: Dict[str, Any],
+        on_event: ChatEventSink | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> Tuple[str, List[Dict[str, str]], str, int]:
+        """One model call -> (text, tool calls, model used, retry attempts). With on_event the call is
+        streamed and every text delta is reported as it arrives."""
+        if on_event is None:
+            response, model_used, attempts = self._call_model_with_retries(create_kwargs)
+            message = response.choices[0].message
+            calls = [
+                {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or ""}
+                for tc in message.tool_calls or []
+            ]
+            return message.content or "", calls, model_used, attempts
+
+        stream, model_used, attempts = self._call_model_with_retries({**create_kwargs, "stream": True})
+        parts: List[str] = []
+        calls_by_index: Dict[int, Dict[str, str]] = {}
+        try:
+            for chunk in stream:
+                if should_stop and should_stop():
+                    raise ChatStopped()
+                if not chunk.choices:  # Azure sends content-filter metadata without choices
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    parts.append(delta.content)
+                    on_event("delta", {"content": delta.content})
+                for tc in delta.tool_calls or []:
+                    slot = calls_by_index.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                    slot["id"] = tc.id or slot["id"]
+                    if tc.function and tc.function.name:
+                        slot["name"] += tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        calls = [calls_by_index[i] for i in sorted(calls_by_index)]
+        if calls and parts:
+            # Text written before the model decided to call tools is not the answer.
+            on_event("draft_reset", {})
+        return "".join(parts), calls, model_used, attempts
+
     def _chat_internal(
         self,
         history: List[Dict[str, str]],
         message: str,
         system_prompt: str | None = None,
         include_trace: bool = False,
+        on_event: ChatEventSink | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Tuple[str, List[str], Dict[str, Any] | None]:
+        """The tool-calling loop. on_event (optional) receives live progress -- ("round", ...),
+        ("tool_start", ...), ("tool_end", ...), ("delta", ...), ("draft_reset", ...) -- and switches the
+        model calls to streaming; should_stop (optional) is checked before every model call and tool
+        call, so a stopped request never starts another change in Archi."""
         if not self.settings.azure_openai_api_key:
             raise RuntimeError("AZURE_OPENAI_API_KEY is not configured.")
         if not self.settings.azure_openai_base_url:
             raise RuntimeError("AZURE_OPENAI_BASE_URL is not configured.")
+
+        def check_stop() -> None:
+            if should_stop and should_stop():
+                raise ChatStopped()
 
         mcp_tools = self.mcp.list_tools()
         tools = [self._tool_to_openai_format(t) for t in mcp_tools]
@@ -3421,6 +3494,9 @@ class ChatService:
             }
 
         for round_index in range(self.settings.max_tool_roundtrips):
+            check_stop()
+            if on_event:
+                on_event("round", {"round": round_index + 1})
             round_start = time.perf_counter()
             create_kwargs: Dict[str, Any] = dict(
                 model=self.settings.azure_openai_model,
@@ -3430,11 +3506,9 @@ class ChatService:
             )
             # Some newer models only allow default temperature and reject explicit values.
             create_kwargs["temperature"] = self.settings.model_temperature
-            response, model_used, retry_attempts = self._call_model_with_retries(create_kwargs)
+            assistant_content, tool_calls, model_used, retry_attempts = self._model_round(create_kwargs, on_event, should_stop)
             used_models.add(model_used)
 
-            assistant = response.choices[0].message
-            assistant_content = assistant.content or ""
             round_trace = {
                 "round": round_index + 1,
                 "model": model_used,
@@ -3445,38 +3519,36 @@ class ChatService:
                 "tool_errors": [],
                 "finish_reason": "final",
             }
-            if assistant.tool_calls:
+            if tool_calls:
                 messages.append(
                     {
                         "role": "assistant",
                         "content": assistant_content,
                         "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            }
-                            for tc in assistant.tool_calls
+                            {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                            for tc in tool_calls
                         ],
                     }
                 )
 
                 round_trace["finish_reason"] = "tool_calls"
-                for tc in assistant.tool_calls:
-                    tool_name = tc.function.name
+                for tc in tool_calls:
+                    check_stop()
+                    tool_name = tc["name"]
                     round_trace["tool_calls"].append(tool_name)
                     try:
-                        args = json.loads(tc.function.arguments or "{}")
+                        args = json.loads(tc["arguments"] or "{}")
                     except json.JSONDecodeError:
                         args = {}
 
+                    if on_event:
+                        on_event("tool_start", {"id": tc["id"], "name": tool_name})
                     tool_started = time.perf_counter()
+                    proposal_id = None
                     try:
                         tool_result = self.mcp.call_tool(tool_name, args)
                         tool_error = None
+                        proposal_id = self._record_proposal(self._unwrap_mcp_result(tool_result))
                     except Exception as exc:  # noqa: BLE001
                         tool_error = str(exc)
                         tool_result = {
@@ -3484,6 +3556,10 @@ class ChatService:
                             "tool_name": tool_name,
                             "arguments": args,
                         }
+                    duration_ms = int((time.perf_counter() - tool_started) * 1000)
+                    if on_event:
+                        on_event("tool_end", {"id": tc["id"], "name": tool_name, "ok": tool_error is None,
+                                              "duration_ms": duration_ms, "proposal": proposal_id})
 
                     used_tools.append(tool_name)
                     if tool_error:
@@ -3492,7 +3568,7 @@ class ChatService:
                         trace["notes"].append(
                             (
                                 f"Round {round_index + 1} | tool={tool_name} | "
-                                f"ok={tool_error is None} | duration_ms={int((time.perf_counter() - tool_started) * 1000)} | "
+                                f"ok={tool_error is None} | duration_ms={duration_ms} | "
                                 f"args={self._preview_json(args, limit=250)}"
                             )
                         )
@@ -3502,7 +3578,7 @@ class ChatService:
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": tc.id,
+                            "tool_call_id": tc["id"],
                             "content": json.dumps(tool_result, ensure_ascii=False),
                         }
                     )
@@ -3519,6 +3595,8 @@ class ChatService:
             return assistant_content, used_tools, trace
 
         answer = "I hit the tool round-trip limit before producing a final answer. Please refine the question."
+        if on_event:
+            on_event("delta", {"content": answer})
         if include_trace and trace is not None:
             trace["rounds"].append(
                 {
@@ -3536,6 +3614,27 @@ class ChatService:
             trace["duration_ms"] = int((time.perf_counter() - trace_start) * 1000)
             trace["fallback_used"] = len(used_models) > 1
         return answer, used_tools, trace
+
+    @_tracks_proposals
+    def chat_turn(
+        self,
+        *,
+        history: List[Dict[str, str]],
+        message: str,
+        system_prompt: str | None = None,
+        on_event: ChatEventSink | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Dict[str, Any]:
+        """One assistant answer for the chat UI, including the approval proposals Archi created."""
+        answer, used_tools, trace = self._chat_internal(
+            history=history,
+            message=message,
+            system_prompt=system_prompt,
+            include_trace=True,
+            on_event=on_event,
+            should_stop=should_stop,
+        )
+        return {"answer": answer, "used_tools": used_tools, "trace": trace or {}}
 
     def chat(self, history: List[Dict[str, str]], message: str, system_prompt: str | None = None) -> Tuple[str, List[str]]:
         answer, used_tools, _trace = self._chat_internal(

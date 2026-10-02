@@ -464,6 +464,15 @@
   fill: transparent;
 }
 
+/* Labels are drawn on top of the marks' hit areas; let the pointer through so hovering a value
+   label shows the same tooltip as hovering its bar. */
+.dash-root .ax-text,
+.dash-root .row-text,
+.dash-root .val-text,
+.dash-root .today-text {
+  pointer-events: none;
+}
+
 /* ---------------- Legends & status chips ---------------- */
 
 .dash-root .legend {
