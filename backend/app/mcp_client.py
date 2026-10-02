@@ -20,9 +20,16 @@ class McpTool:
 
 
 class McpClient:
-    def __init__(self, server_url: str, bearer_token: str = "", timeout_seconds: float = 60.0):
+    def __init__(
+        self,
+        server_url: str,
+        bearer_token: str = "",
+        timeout_seconds: float = 60.0,
+        host_header: str = "",
+    ):
         self.server_url = server_url
         self.bearer_token = bearer_token
+        self.host_header = host_header
         self.timeout_seconds = timeout_seconds
 
         self._id_lock = threading.Lock()
@@ -41,6 +48,8 @@ class McpClient:
         }
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
+        if self.host_header:
+            headers["Host"] = self.host_header
         if self._session_id:
             headers["mcp-session-id"] = self._session_id
         return headers

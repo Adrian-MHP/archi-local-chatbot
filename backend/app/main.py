@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import io
 import json
 import os
@@ -11,7 +11,7 @@ from typing import Any, Dict
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 from .azure_agent import ChatService
 from .config import get_settings
-from . import meta_model
+from . import dashboard, meta_model
 from .schemas import (
     ActionResponse,
     ApplyPlanRequest,
@@ -274,6 +274,19 @@ def tools() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/dashboard")
+def get_dashboard(as_of: str | None = Query(default=None, alias="asOf")) -> Dict[str, Any]:
+    """Transformation dashboard metrics, computed live from the active Archi model via MCP."""
+    try:
+        today = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="asOf must be a date in YYYY-MM-DD format.") from exc
+    try:
+        return dashboard.build_dashboard(chat_service.mcp, today)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not read the Archi model via MCP: {exc}") from exc
+
+
 @app.get("/api/meta-model")
 def get_meta_model() -> Dict[str, Any]:
     return meta_model.as_dict()
@@ -289,6 +302,8 @@ def debug_mcp() -> Dict[str, Any]:
     }
     if settings.mcp_bearer_token:
         headers["Authorization"] = f"Bearer {settings.mcp_bearer_token}"
+    if settings.mcp_host_header:
+        headers["Host"] = settings.mcp_host_header
 
     init_payload = {
         "jsonrpc": "2.0",

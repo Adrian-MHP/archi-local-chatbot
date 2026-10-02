@@ -42,6 +42,7 @@ class ChatService:
             server_url=settings.mcp_server_url,
             bearer_token=settings.mcp_bearer_token,
             timeout_seconds=settings.request_timeout_seconds,
+            host_header=settings.mcp_host_header,
         )
         self.openai = OpenAI(
             api_key=settings.azure_openai_api_key,

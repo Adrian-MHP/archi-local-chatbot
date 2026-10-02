@@ -15,6 +15,7 @@ class Settings:
     azure_openai_summary_model: str
     mcp_server_url: str
     mcp_bearer_token: str
+    mcp_host_header: str
     app_host: str
     app_port: int
     request_timeout_seconds: float
@@ -48,6 +49,7 @@ def get_settings() -> Settings:
         azure_openai_summary_model=os.getenv("AZURE_OPENAI_SUMMARY_MODEL", "").strip(),
         mcp_server_url=os.getenv("MCP_SERVER_URL", "http://127.0.0.1:18090/mcp").strip(),
         mcp_bearer_token=os.getenv("MCP_BEARER_TOKEN", "").strip(),
+        mcp_host_header=os.getenv("MCP_HOST_HEADER", "").strip(),
         app_host=os.getenv("APP_HOST", "0.0.0.0").strip(),
         app_port=int(os.getenv("APP_PORT", "8000")),
         request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),

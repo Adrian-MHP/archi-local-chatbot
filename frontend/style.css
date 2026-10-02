@@ -1006,6 +1006,12 @@ button:focus {
   background: #f5f9ff;
 }
 
+a.btn {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
 .btn:disabled {
   cursor: not-allowed;
   opacity: 0.55;
