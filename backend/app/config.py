@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,13 @@ class Settings:
     max_upload_text_chars: int
     max_action_steps: int
     default_system_prompt: str
+    # Assessment baselines (git repository) and coArchi repositories; *_display paths are the host
+    # paths shown to the user when the app runs in Docker.
+    baselines_dir: str
+    baselines_display_path: str
+    coarchi_dir: str
+    coarchi_display_path: str
+    baseline_git_author: str
 
 
 def _normalize_azure_base_url(raw: str) -> str:
@@ -68,4 +76,11 @@ def get_settings() -> Settings:
                 "If data is missing from tool results, state that explicitly."
             ),
         ).strip(),
+        baselines_dir=os.getenv("BASELINES_DIR", str(Path.home() / "Documents" / "Archi" / "assessment-baselines")),
+        baselines_display_path=os.getenv("BASELINES_HOST_DIR", "").strip()
+        or os.getenv("BASELINES_DIR", "~/Documents/Archi/assessment-baselines"),
+        coarchi_dir=os.getenv("COARCHI_DIR", str(Path.home() / "Documents" / "Archi" / "model-repository")),
+        coarchi_display_path=os.getenv("COARCHI_HOST_DIR", "").strip()
+        or os.getenv("COARCHI_DIR", "~/Documents/Archi/model-repository"),
+        baseline_git_author=os.getenv("BASELINE_GIT_AUTHOR", "Archi Local Chatbot <baselines@archi-local-chatbot.local>").strip(),
     )

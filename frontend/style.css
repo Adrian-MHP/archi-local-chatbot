@@ -2892,3 +2892,87 @@ body.modal-open {
 .steering-add {
   margin-top: 8px;
 }
+
+/* ---------------- Assessment cycle: baselines ---------------- */
+
+.steering-baseline {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.7rem;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.steering-baseline.changed {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.steering-baseline.changed::before {
+  content: "Δ ";
+}
+
+.cycle-card {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.cycle-card-text h4 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+}
+
+.cycle-card-text p {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--ink-muted);
+}
+
+.cycle-card-text .cycle-last {
+  margin-top: 6px;
+  color: var(--ink);
+}
+
+.cycle-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.cycle-form label {
+  display: grid;
+  gap: 3px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+.cycle-form label:not(.grow) input {
+  width: 240px;
+}
+
+.cycle-form label.grow {
+  flex: 1;
+  min-width: 220px;
+}
+
+.cycle-open {
+  margin-left: 10px;
+}
+
+@media (max-width: 720px) {
+  .cycle-form label,
+  .cycle-form label:not(.grow) input {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}

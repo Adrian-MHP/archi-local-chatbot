@@ -127,6 +127,11 @@ const elements = {
   assessmentSteeringBackBtn: document.getElementById("assessmentSteeringBackBtn"),
   assessmentSteeringContinueBtn: document.getElementById("assessmentSteeringContinueBtn"),
   assessmentStartNewBtn: document.getElementById("assessmentStartNewBtn"),
+  cycleNameInput: document.getElementById("cycleNameInput"),
+  cycleNoteInput: document.getElementById("cycleNoteInput"),
+  cycleSaveBtn: document.getElementById("cycleSaveBtn"),
+  cycleStatus: document.getElementById("cycleStatus"),
+  cycleLastBaseline: document.getElementById("cycleLastBaseline"),
   assessmentResetBtn: document.getElementById("assessmentResetBtn"),
 };
 
@@ -362,6 +367,89 @@ function setAssessmentStep(step) {
     else renderSteering();
     if (state.assessment.steering.awaitingApproval) setAssessmentStatus(elements.steeringStatus, STEERING_AWAITING_APPROVAL, "warn");
   }
+  if (step === "summary") refreshCycleCard();
+}
+
+/* ---------------- Assessment cycle: save a baseline ---------------- */
+
+function localIsoDate() {
+  const now = new Date();
+  return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+
+function formatDay(iso) {
+  return iso ? new Date(`${iso}T00:00:00`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "";
+}
+
+// Proposes a name and shows the latest baseline of the active model (the one this cycle is compared with).
+async function refreshCycleCard() {
+  let baselines = [];
+  try {
+    const res = await fetch("/api/baselines");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    baselines = data.baselines || [];
+    const last = baselines[baselines.length - 1];
+    elements.cycleLastBaseline.textContent = last
+      ? `Latest baseline of ${data.model.name}: "${last.name}" of ${formatDay(last.date)} (${baselines.length} in total).`
+      : `${data.model.name} has no baseline yet: this will be the first.`;
+  } catch (err) {
+    elements.cycleLastBaseline.textContent = `The baselines could not be read: ${err.message || err}`;
+  }
+  if (!elements.cycleNameInput.value.trim()) {
+    const month = new Date().toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+    elements.cycleNameInput.value = `${baselines.length ? "Re-assessment" : "Assessment"} ${month}`;
+  }
+}
+
+async function saveCycleBaseline() {
+  const name = elements.cycleNameInput.value.trim();
+  if (!name) {
+    setAssessmentStatus(elements.cycleStatus, "Give the baseline a name, e.g. 'Assessment Q4 2026'.", "error");
+    return;
+  }
+  elements.cycleSaveBtn.disabled = true;
+  setAssessmentStatus(elements.cycleStatus, "Reading the model and committing the baseline...", "pending");
+  try {
+    const res = await fetch("/api/baselines", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, note: elements.cycleNoteInput.value.trim(), date: localIsoDate() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
+    setAssessmentStatus(
+      elements.cycleStatus,
+      `Baseline "${data.name}" saved (${data.model.elementCount} elements, git commit ${data.commit}). The next re-assessment and the dashboard's Progress section measure against it.`,
+      "ok",
+    );
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn ghost small cycle-open";
+    open.textContent = "Open Progress";
+    open.addEventListener("click", openProgress);
+    elements.cycleStatus.appendChild(open);
+    elements.cycleNameInput.value = "";
+    elements.cycleNoteInput.value = "";
+    markAssessmentStepComplete("summary");
+    refreshCycleCard();
+  } catch (err) {
+    setAssessmentStatus(elements.cycleStatus, `The baseline was not saved: ${err.message || err}`, "error");
+  } finally {
+    elements.cycleSaveBtn.disabled = false;
+  }
+}
+
+function openProgress() {
+  setActiveTab("dashboardTab");
+  // The dashboard renders asynchronously; jump to the section once it exists.
+  const started = Date.now();
+  const jump = () => {
+    const target = document.getElementById("dash-progress");
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    else if (Date.now() - started < 8000) setTimeout(jump, 200);
+  };
+  jump();
 }
 
 function markAssessmentStepComplete(step) {
@@ -1463,7 +1551,9 @@ function renderSteeringTable() {
 
   const hint = document.createElement("p");
   hint.className = "steering-hint";
-  hint.textContent = `${spec.hint} Highlighted cells and rows are AI suggestions; editing a cell confirms it.`;
+  const baseline = st.data.baseline;
+  hint.textContent = `${spec.hint} Highlighted cells and rows are AI suggestions; editing a cell confirms it.`
+    + (baseline ? ` Re-assessment: under each field is its value in the baseline "${baseline.name}" of ${formatDay(baseline.date)}, marked where this cycle changes it.` : "");
   container.appendChild(hint);
 
   if (!rows.length) {
@@ -1589,15 +1679,42 @@ function renderSteeringCell(spec, row, col, tr) {
     }
     default: {
       const input = steeringPropInput(spec.type, col.field, row[col.field]);
+      const previous = steeringBaselineValue(row, col.field);
+      const note = previous === null ? null : document.createElement("span");
+      const markChange = () => note && note.classList.toggle("changed", String(row[col.field] ?? "") !== previous);
       input.addEventListener("change", () => {
         row[col.field] = input.value === "" ? null : input.value;
         confirmSteeringField(row, col.field);
         td.classList.remove("steering-cell-ai");
+        markChange();
       });
       td.appendChild(input);
+      if (note) {
+        const baseline = st.data.baseline;
+        note.className = "steering-baseline";
+        note.textContent = `Baseline: ${steeringValueLabel(spec.type, col.field, previous)}`;
+        note.title = `Value in the baseline "${baseline.name}" of ${formatDay(baseline.date)}; highlighted when this cycle changes it.`;
+        markChange();
+        td.appendChild(note);
+      }
     }
   }
   return td;
+}
+
+// The value the latest baseline (previous assessment cycle) recorded for this element, if any.
+function steeringBaselineValue(row, field) {
+  const baseline = state.assessment.steering.data && state.assessment.steering.data.baseline;
+  if (!baseline || !row.id) return null;
+  const value = (baseline.values[row.id] || {})[field];
+  return value === undefined || value === null || value === "" ? null : String(value);
+}
+
+function steeringValueLabel(type, field, value) {
+  const def = steeringSchemaProp(type, field);
+  if (def && def.type === "enum") return (def.values.find((v) => v.value === value) || {}).label || value;
+  if (def && def.levels && def.levels[value]) return `${value} · ${def.levels[value]}`;
+  return value;
 }
 
 function steeringPropInput(type, field, value) {
@@ -2288,6 +2405,7 @@ function attachAssessmentEventHandlers() {
     startNewAssessment();
   };
   elements.assessmentStartNewBtn.addEventListener("click", confirmStartNewAssessment);
+  elements.cycleSaveBtn.addEventListener("click", saveCycleBaseline);
   elements.assessmentResetBtn.addEventListener("click", confirmStartNewAssessment);
 }
 

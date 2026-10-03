@@ -21,9 +21,17 @@ const ui = {
 };
 
 const state = {
+  flash: null, // the last message of a baseline action
+  lastJump: null, // the last section link followed: {id, at}
   data: null,
   cards: [],
   loading: false,
+  progress: null, // GET /api/baselines/progress: baselines, trend, comparison
+  progressError: null,
+  compareFrom: null,
+  compareTo: null,
+  commits: null, // coArchi history, loaded on demand
+  busy: false,
   resizeTimer: null,
   heatMode: new URLSearchParams(window.location.search).get("heat") === "gap" ? "gap" : "maturity",
 };
@@ -272,6 +280,7 @@ function card({ title, subtitle, chart, table, legend, note, span }) {
     const width = Math.max(260, Math.floor(body.clientWidth || figure.clientWidth - 32 || 600));
     body.replaceChildren(chart(width));
   };
+  render.figure = figure;
   state.cards.push(render);
   return figure;
 }
@@ -431,7 +440,7 @@ function renderKpis(headline) {
       const value = kpiValue(k);
       return h(
         "a",
-        { class: "dash-card kpi-tile", href: `#dash-${k.id}` },
+        { class: "dash-card kpi-tile", href: `#dash-${k.id}`, "data-kpi": k.id },
         h("span", { class: "kpi-layer", text: k.layer }),
         h("span", { class: "kpi-label", text: k.label }),
         h("span", { class: "kpi-value" }, value.main, value.suffix ? h("small", { text: value.suffix }) : null),
@@ -1238,7 +1247,824 @@ function qualitySection(d) {
 // Loading & rendering
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// Progress: re-assessment against the baselines. Archi only knows the current model; a baseline
+// freezes it at the close of an assessment cycle (a commit in the baseline git repository). Every
+// figure of a baseline comes from the same dashboard code, as of the baseline's own date.
+// ---------------------------------------------------------------------------------------------
+
+const DAY = 86400000;
+const PROGRESS_INTRO =
+  "Archi only knows the current model. A baseline freezes it at the close of an assessment cycle (a commit in the baseline git repository); progress is the re-assessment against it.";
+
+async function api(path, options = {}) {
+  const response = await fetch(path, options).catch(() => {
+    throw Object.assign(new Error("The app server is not reachable."), { hint: BACKEND_HINT });
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (!body.detail && response.status >= 502 && response.status <= 504) {
+      throw Object.assign(new Error(`No answer from the backend (HTTP ${response.status}).`), { hint: BACKEND_HINT });
+    }
+    const detail = Array.isArray(body.detail) ? body.detail.map((d) => d.msg).join("; ") : body.detail;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
+  return body;
+}
+
+async function loadProgress() {
+  const params = new URLSearchParams();
+  if (ui.asOf.value) params.set("asOf", ui.asOf.value);
+  if (state.compareFrom) params.set("from", state.compareFrom);
+  if (state.compareTo) params.set("to", state.compareTo);
+  try {
+    state.progress = await api(`/api/baselines/progress?${params}`);
+    state.progressError = null;
+    const c = state.progress.comparison;
+    state.compareFrom = c ? c.from.id : null;
+    state.compareTo = c ? c.to.id : null;
+  } catch (error) {
+    state.progressError = error.message || String(error);
+  }
+  refreshProgress();
+}
+
+// Replace only the Progress section and draw its charts; the rest of the dashboard stays as it is.
+function refreshProgress() {
+  const old = document.getElementById("dash-progress");
+  if (!old) return;
+  const fresh = progressSection();
+  old.replaceWith(fresh);
+  state.cards = state.cards.filter((render) => !render.figure || render.figure.isConnected);
+  state.cards.filter((render) => render.figure && fresh.contains(render.figure)).forEach((render) => render());
+  decorateKpis();
+  const jump = state.lastJump;
+  if (jump && jump.id !== "dash-progress" && Date.now() - jump.at < 4000) {
+    const target = document.getElementById(jump.id);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function flash(text, error = false) {
+  state.flash = { text, error };
+}
+
+// ---- formatting ---------------------------------------------------------------------------------
+
+function formatMetric(def, value) {
+  if (value === null || value === undefined) return "–";
+  if (def.format === "percent") return fmt.pct(value);
+  if (def.format === "decimal") return fmt.dec(value);
+  return fmt.int(value);
+}
+
+function formatDelta(def, delta) {
+  if (delta === null || delta === undefined) return "–";
+  if (Math.abs(delta) < 1e-9) return "±0";
+  const abs = Math.abs(delta);
+  const text = def.format === "percent" ? `${Math.round(abs * 100)} pts` : def.format === "decimal" ? fmt.dec(abs) : fmt.int(abs);
+  return `${delta > 0 ? "+" : "−"}${text}`;
+}
+
+const ASSESSMENT_TEXT = {
+  better: "better",
+  worse: "worse",
+  same: "no change",
+  changed: "changed (neutral figure)",
+  "n/a": "no comparison",
+};
+
+// Direction by arrow, judgement by the icon's status colour plus a text label for screen readers.
+function deltaBadge(def, delta, assessment) {
+  const status = assessment === "better" ? "good" : assessment === "worse" ? "critical" : "neutral";
+  const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "=";
+  return h(
+    "span",
+    { class: `delta st-${status}`, title: ASSESSMENT_TEXT[assessment] || "" },
+    h("span", { class: "delta-icon", "aria-hidden": "true", text: arrow }),
+    formatDelta(def, delta),
+    h("span", { class: "visually-hidden", text: ` (${ASSESSMENT_TEXT[assessment] || ""})` }),
+  );
+}
+
+function valueWithOf(def, value, of) {
+  const text = formatMetric(def, value);
+  return of !== null && of !== undefined && value !== null && value !== undefined ? `${text} of ${fmt.int(of)}` : text;
+}
+
+function pointShort(p) {
+  return p.kind === "current" ? "Now" : p.label;
+}
+
+function pointLabel(p) {
+  return `${pointShort(p)} · ${fmt.day(p.date)}`;
+}
+
+function sourceText(source) {
+  if (!source) return "–";
+  if (source.type === "coarchi") return `coArchi ${source.repository} @ ${String(source.commit || "").slice(0, 7)}`;
+  return "Live model (MCP)";
+}
+
+function panel(title, subtitle, ...children) {
+  return h(
+    "figure",
+    { class: "dash-card chart-card span-all" },
+    h("div", { class: "chart-head" }, h("div", {}, h("h3", { text: title }), subtitle ? h("p", { text: subtitle }) : null)),
+    ...children,
+  );
+}
+
+// ---- time-series chart ------------------------------------------------------------------------
+
+// Round tick values on 2-4 gridlines; whole numbers only for counts.
+function axisTicks(lo, hi, integer) {
+  if (hi - lo < 1e-9) hi = lo + (integer ? 2 : 1);
+  const raw = (hi - lo) / 3;
+  const exp = Math.pow(10, Math.floor(Math.log10(raw)));
+  const f = raw / exp;
+  let step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * exp;
+  if (integer) step = Math.max(1, Math.ceil(step));
+  const ticks = [];
+  for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step / 2; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+  return ticks.length > 1 ? ticks : [ticks[0], ticks[0] + step];
+}
+
+function linePath(points) {
+  return points.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+}
+
+function textWidth(text, px = 11) {
+  return String(text).length * px * 0.58 + 4;
+}
+
+function overlaps(a, b, gap = 6) {
+  return a.left < b.right + gap && b.left < a.right + gap && a.top < b.bottom && b.top < a.bottom;
+}
+
+// series: [{ role: "measured" | "reference", label, points: [{ date, moment?, value, kind, name }] }].
+// Measured points are drawn as a line with dots (hollow = the live model), references dashed.
+function timeSeriesChart({ width, height = 136, series, format, domain, ariaLabel, startAtZero = true, integer = false }) {
+  const pad = { l: 42, r: 12, t: 18, b: 22 };
+  const inset = 14; // keeps the first and last dot off the axes
+  const plotW = Math.max(60, width - pad.l - pad.r);
+  const plotH = height - pad.t - pad.b;
+  const present = (pt) => pt.value !== null && pt.value !== undefined;
+  const all = series.flatMap((sr) => sr.points);
+  const valued = all.filter(present);
+  if (!valued.length) return empty("No values yet.");
+
+  // x: time; all points within two days (e.g. the first baseline and now) are spread evenly instead.
+  const time = (pt) => new Date(pt.moment || `${pt.date}T12:00:00`).getTime();
+  const times = [...new Set(all.map(time))].sort((a, b) => a - b);
+  const t0 = times[0];
+  const t1 = times[times.length - 1];
+  const left = pad.l + inset;
+  const span = plotW - 2 * inset;
+  const byIndex = t1 - t0 < 2 * DAY;
+  const x = (pt) => {
+    if (byIndex) return times.length === 1 ? left + span / 2 : left + (times.indexOf(time(pt)) / (times.length - 1)) * span;
+    return left + ((time(pt) - t0) / (t1 - t0)) * span;
+  };
+
+  const values = valued.map((pt) => pt.value);
+  const ticks = domain
+    ? [domain[0], (domain[0] + domain[1]) / 2, domain[1]]
+    : axisTicks(startAtZero ? Math.min(0, ...values) : Math.min(...values), Math.max(...values), integer);
+  const y0 = ticks[0];
+  const y1 = ticks[ticks.length - 1];
+  const y = (v) => pad.t + plotH - ((v - y0) / (y1 - y0 || 1)) * plotH;
+  const root = svgRoot(width, height, ariaLabel);
+  for (const v of ticks) {
+    root.append(
+      s("line", { class: "grid-line", x1: pad.l, x2: pad.l + plotW, y1: y(v), y2: y(v) }),
+      s("text", { class: "ax-text", x: pad.l - 6, y: y(v) + 4, "text-anchor": "end", text: format(v, true) }),
+    );
+  }
+
+  const taken = []; // label boxes already placed
+  const place = (text, cx, cy, anchor, cls = "val-text strong") => {
+    const w = textWidth(text);
+    const leftEdge = anchor === "start" ? cx : anchor === "end" ? cx - w : cx - w / 2;
+    const box = { left: leftEdge, right: leftEdge + w, top: cy - 11, bottom: cy + 2 };
+    if (taken.some((b) => overlaps(b, box))) return false;
+    taken.push(box);
+    root.append(s("text", { class: cls, x: cx, y: cy, "text-anchor": anchor, text }));
+    return true;
+  };
+
+  const measuredSeries = series.filter((sr) => sr.role === "measured");
+  for (const sr of measuredSeries) {
+    let segment = [];
+    const flush = () => {
+      if (segment.length > 1) root.append(s("path", { class: "trend-line", d: linePath(segment) }));
+      segment = [];
+    };
+    for (const pt of sr.points) {
+      if (!present(pt)) flush();
+      else segment.push([x(pt), y(pt.value)]);
+    }
+    flush();
+    const measured = sr.points.filter(present);
+    for (const pt of measured) {
+      const g = s("g", { class: "mark" });
+      g.append(
+        s("circle", { class: pt.kind === "current" ? "trend-dot now" : "trend-dot", cx: x(pt), cy: y(pt.value), r: 4.5 }),
+        s("circle", { class: "hit", cx: x(pt), cy: y(pt.value), r: 12 }),
+      );
+      root.append(g);
+      tip(g, { title: pt.name || fmt.day(pt.date), rows: [[format(pt.value), sr.label || ""]], notes: [fmt.day(pt.date)] });
+      taken.push({ left: x(pt) - 5, right: x(pt) + 5, top: y(pt.value) - 5, bottom: y(pt.value) + 5 });
+    }
+    // Selective direct labels: the latest value, then the first one if there is room.
+    const last = measured[measured.length - 1];
+    const first = measured[0];
+    const label = (pt) => place(format(pt.value), x(pt), y(pt.value) - 9, "middle") || place(format(pt.value), x(pt), y(pt.value) + 17, "middle");
+    label(last);
+    if (first !== last) label(first);
+  }
+
+  // Dates on the x axis: the measured points (latest first), then the ends of the reference line,
+  // each only where it fits next to the labels already placed.
+  const axisCandidates = [];
+  for (const sr of measuredSeries) {
+    [...sr.points.filter(present)].reverse().forEach((pt) => axisCandidates.push({ pt, text: pt.kind === "current" ? "Now" : fmt.month(pt.date) }));
+  }
+  for (const sr of series.filter((sr) => sr.role === "reference")) {
+    const pts = sr.points.filter(present);
+    if (pts.length > 1) [pts[pts.length - 1], pts[0]].forEach((pt) => axisCandidates.push({ pt, text: fmt.month(pt.date) }));
+  }
+  const axisKept = [];
+  for (const { pt, text } of axisCandidates) {
+    const px = x(pt);
+    const anchor = px < pad.l + 40 ? "start" : px > pad.l + plotW - 40 ? "end" : "middle";
+    const cx = anchor === "start" ? Math.max(pad.l, px - inset / 2) : anchor === "end" ? Math.min(pad.l + plotW, px + inset / 2) : px;
+    const w = textWidth(text);
+    const l = anchor === "start" ? cx : anchor === "end" ? cx - w : cx - w / 2;
+    const box = { left: l, right: l + w, top: 0, bottom: 1 };
+    if (axisKept.some((k) => overlaps(k.box, box, 8) || k.text === text)) continue;
+    axisKept.push({ text, box });
+    root.append(s("text", { class: "ax-text", x: cx, y: height - 4, "text-anchor": anchor, text }));
+  }
+
+  for (const sr of series.filter((sr) => sr.role === "reference")) {
+    const pts = sr.points.filter(present);
+    if (!pts.length) continue;
+    root.insertBefore(s("path", { class: "trend-ref", d: linePath(pts.map((pt) => [x(pt), y(pt.value)])) }), root.querySelector(".trend-line, .mark"));
+    const lastRef = pts[pts.length - 1];
+    const prevRef = pts[pts.length - 2];
+    const text = `${sr.label || "target"} ${format(lastRef.value)}`;
+    const cx = Math.max(pad.l + textWidth(text), Math.min(x(lastRef), pad.l + plotW));
+    const yEnd = y(lastRef.value);
+    // A falling line comes in from above-left, so its label goes below the end; otherwise above it.
+    const falling = prevRef && yEnd > y(prevRef.value) + 1;
+    const spots = falling ? [[cx, yEnd + 14, "end"], [cx, yEnd - 6, "end"]] : [[cx, yEnd - 6, "end"], [cx, yEnd + 14, "end"]];
+    if (prevRef) {
+      const mx = (x(pts[0]) + x(lastRef)) / 2;
+      const my = (y(pts[0].value) + yEnd) / 2;
+      spots.push([mx, my - 6, "middle"], [mx, my + 14, "middle"]);
+    }
+    // Left out only if every spot would hide a value; the tooltip and the table still have it.
+    spots.some(([sx, sy, anchor]) => place(text, sx, sy, anchor, "ax-text ref-text"));
+  }
+  return root;
+}
+
+function metricFormatter(def) {
+  return (v) => {
+    if (def.format === "percent") return fmt.pct(v);
+    if (def.format === "decimal") return fmt.dec(v);
+    return Number.isInteger(v) ? fmt.int(v) : fmt.dec(v);
+  };
+}
+
+function metricChart(p, m, width) {
+  const series = [
+    {
+      role: "measured",
+      label: m.label,
+      points: p.points.map((pt) => ({ date: pt.date, moment: pt.moment, value: m.values[pt.id], kind: pt.kind, name: pointShort(pt) })),
+    },
+  ];
+  if (m.references) {
+    series.push({
+      role: "reference",
+      label: m.referenceLabel || "target",
+      points: p.points.map((pt) => ({ date: pt.date, moment: pt.moment, value: m.references[pt.id] })),
+    });
+  }
+  return timeSeriesChart({
+    width, series, format: metricFormatter(m), domain: m.domain, integer: m.format === "integer", ariaLabel: `${m.label} per assessment cycle`,
+  });
+}
+
+function smallMultiples(items, width, draw, minCell = 300) {
+  const cols = Math.max(1, Math.min(3, Math.floor((width + 16) / minCell)));
+  const cellW = Math.floor((width - 16 * (cols - 1)) / cols);
+  return h("div", { class: "trend-grid", style: { gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` } }, items.map((item) => draw(item, cellW)));
+}
+
+// ---- cards ----------------------------------------------------------------------------------
+
+function firstBaselineCard(p) {
+  return panel(
+    "No baseline yet",
+    null,
+    h(
+      "p",
+      { class: "progress-empty" },
+      `Save the current state of "${p.model.name}" as the first baseline at the close of this assessment cycle. ` +
+        "Every later re-assessment is then measured against it: the trend of the steering figures, maturity per capability, " +
+        "the outcome KPIs per cycle, and every change in the model.",
+    ),
+    p.coarchi.available
+      ? h("p", { class: "chart-note", text: `The model is versioned with coArchi (${p.coarchi.repository}): earlier commits, e.g. the state at the kick-off, can become baselines too.` })
+      : null,
+  );
+}
+
+function comparisonCard(p) {
+  const c = p.comparison;
+  const picker = (label, value, onPick) =>
+    h(
+      "label",
+      { class: "compare-pick" },
+      h("span", { text: label }),
+      h(
+        "select",
+        { onchange: (event) => onPick(event.target.value) },
+        p.points.map((pt) => h("option", { value: pt.id, selected: pt.id === value, text: pointLabel(pt) })),
+      ),
+    );
+  const controls = h(
+    "div",
+    { class: "compare-bar" },
+    picker("Compare", state.compareFrom, (value) => {
+      state.compareFrom = value;
+      loadProgress();
+    }),
+    h("span", { class: "compare-arrow", "aria-hidden": "true", text: "→" }),
+    picker("with", state.compareTo, (value) => {
+      state.compareTo = value;
+      loadProgress();
+    }),
+  );
+  if (!c) return panel("What changed", null, controls, h("p", { class: "chart-note", text: "Pick two different points to compare." }));
+  const days = Math.round((new Date(`${c.to.date}T00:00:00`) - new Date(`${c.from.date}T00:00:00`)) / DAY);
+  return panel(
+    "What changed",
+    `${pointShort(c.from)} (${fmt.day(c.from.date)}) → ${pointShort(c.to)} (${fmt.day(c.to.date)})${days ? ` · ${plural(Math.abs(days), "day")}` : ""}`,
+    controls,
+    c.highlights.length
+      ? h("ul", { class: "highlight-list" }, c.highlights.map((text) => h("li", { text })))
+      : h("p", { class: "chart-note", text: "No capability rating, work package, gap or outcome KPI moved between these two points." }),
+    c.from.note ? h("p", { class: "chart-note", text: `${pointShort(c.from)}: ${c.from.note}` }) : null,
+  );
+}
+
+function kpiCompareCard(p) {
+  const rows = p.comparison ? p.comparison.kpis : [];
+  if (!rows.length) return null;
+  return panel(
+    "Steering figures then and now",
+    "The dashboard's metrics, computed the same way for both points, each as of its own date.",
+    h(
+      "div",
+      { class: "kpi-compare-grid" },
+      rows.map((k) =>
+        h(
+          "div",
+          { class: "kpi-compare" },
+          h("span", { class: "kpi-layer", text: k.section }),
+          h("span", { class: "kpi-label", text: k.label }),
+          h(
+            "span",
+            { class: "kpi-compare-values" },
+            h("span", { class: "was", text: valueWithOf(k, k.from, k.fromOf) }),
+            h("span", { class: "arrow", "aria-hidden": "true", text: "→" }),
+            h("strong", { text: valueWithOf(k, k.to, k.toOf) }),
+          ),
+          deltaBadge(k, k.delta, k.assessment),
+        ),
+      ),
+    ),
+  );
+}
+
+function trendCard(p) {
+  if (p.points.length < 2 || !p.metrics.length) return null;
+  return card({
+    title: "Trend across the assessment cycles",
+    subtitle: "Filled dots are baselines, the hollow dot is the live model; dashed lines are targets.",
+    span: true,
+    chart: (width) =>
+      smallMultiples(p.metrics, width, (m, cellW) =>
+        h(
+          "div",
+          { class: "trend-cell" },
+          h("div", { class: "trend-head" }, h("span", { class: "trend-title", text: m.label }), h("span", { class: "trend-section", text: m.section })),
+          metricChart(p, m, cellW),
+        ),
+      ),
+    table: () =>
+      dataTable(
+        [{ label: "Metric", value: (m) => m.label }, ...p.points.map((pt) => ({ label: pointShort(pt), num: true, value: (m) => valueWithOf(m, m.values[pt.id], m.of ? m.of[pt.id] : null) }))],
+        p.metrics,
+      ),
+  });
+}
+
+function capabilityTrendCard(p) {
+  if (!p.capabilities.length) return null;
+  const c = p.comparison;
+  const cols = p.points;
+  const lastOf = (map) => [...cols].reverse().map((pt) => map[pt.id]).find((v) => v !== null && v !== undefined);
+  return panel(
+    "Capability maturity per assessment cycle",
+    c ? `Current maturity in each cycle; Δ from ${pointShort(c.from)} to ${pointShort(c.to)}.` : "Current maturity in each cycle.",
+    h(
+      "div",
+      { class: "data-table-wrap" },
+      h(
+        "table",
+        { class: "data-table maturity-matrix" },
+        h(
+          "thead",
+          {},
+          h(
+            "tr",
+            {},
+            h("th", { scope: "col", text: "Capability" }),
+            cols.map((pt) => h("th", { scope: "col", class: "num", title: fmt.day(pt.date) }, pointShort(pt), h("small", { text: pt.kind === "current" ? "live" : fmt.month(pt.date) }))),
+            h("th", { scope: "col", class: "num", text: "Target" }),
+            c ? h("th", { scope: "col", class: "num", text: "Δ" }) : null,
+          ),
+        ),
+        h(
+          "tbody",
+          {},
+          p.capabilities.map((cap) => {
+            const a = c ? cap.values[c.from.id] : null;
+            const b = c ? cap.values[c.to.id] : null;
+            const delta = a !== null && a !== undefined && b !== null && b !== undefined ? b - a : null;
+            const target = lastOf(cap.targets);
+            return h(
+              "tr",
+              {},
+              h("td", {}, h("span", { text: cap.name }), h("span", { class: "cap-group", text: cap.group })),
+              cols.map((pt) => {
+                const v = cap.values[pt.id];
+                return h("td", { class: "num" }, v === null || v === undefined ? "–" : h("span", { class: `mat-cell m${maturityLevel(v)}`, text: fmt.dec(v, 0) }));
+              }),
+              h("td", { class: "num", text: target === undefined || target === null ? "–" : fmt.dec(target, 0) }),
+              c ? h("td", { class: "num" }, delta === null ? "–" : deltaBadge({ format: "integer" }, delta, delta > 0 ? "better" : delta < 0 ? "worse" : "same")) : null,
+            );
+          }),
+        ),
+      ),
+    ),
+  );
+}
+
+function outcomeChart(o, points, width) {
+  const format = (v) => fmt.num(Math.round(v * 10) / 10, o.unit);
+  const series = [
+    {
+      role: "measured",
+      label: o.kpi,
+      points: points
+        .filter((pt) => o.values[pt.id] !== null && o.values[pt.id] !== undefined)
+        .map((pt) => ({
+          date: pt.date,
+          moment: pt.moment,
+          value: o.values[pt.id],
+          kind: pt.kind,
+          name: pointShort(pt) + (o.measuredAt[pt.id] ? ` · measured ${fmt.day(o.measuredAt[pt.id])}` : ""),
+        })),
+    },
+  ];
+  if (o.baseline !== null && o.target !== null && o.baselineDate && o.targetDate) {
+    series.push({ role: "reference", label: "target", points: [{ date: o.baselineDate, value: o.baseline }, { date: o.targetDate, value: o.target }] });
+  }
+  return timeSeriesChart({ width, height: 150, series, format, ariaLabel: `${o.kpi} per assessment cycle`, startAtZero: false });
+}
+
+function outcomeTrendCard(p) {
+  const outcomes = p.outcomes.filter((o) => Object.values(o.values).some((v) => v !== null && v !== undefined));
+  if (!outcomes.length) return null;
+  return card({
+    title: "Outcome KPIs measured per cycle",
+    subtitle: "Each outcome's current value per cycle against the planned path from baseline to target (dashed).",
+    span: true,
+    chart: (width) =>
+      smallMultiples(outcomes, width, (o, cellW) =>
+        h(
+          "div",
+          { class: "trend-cell" },
+          h(
+            "div",
+            { class: "trend-head" },
+            h("span", { class: "trend-title", text: o.kpi }),
+            h("span", { class: "trend-section", text: o.target !== null ? `target ${fmt.num(o.target, o.unit)}${o.targetDate ? ` by ${fmt.month(o.targetDate)}` : ""}` : "no target" }),
+          ),
+          outcomeChart(o, p.points, cellW),
+        ),
+      ),
+    table: () =>
+      dataTable(
+        [
+          { label: "KPI", value: (o) => o.kpi },
+          { label: "Baseline", num: true, value: (o) => fmt.num(o.baseline, o.unit) },
+          ...p.points.map((pt) => ({ label: pointShort(pt), num: true, value: (o) => fmt.num(o.values[pt.id], o.unit) })),
+          { label: "Target", num: true, value: (o) => fmt.num(o.target, o.unit) },
+        ],
+        outcomes,
+      ),
+  });
+}
+
+function details(summary, content) {
+  return h("details", { class: "change-details" }, h("summary", { text: summary }), content);
+}
+
+function groupedNames(items) {
+  if (!items.length) return h("p", { class: "chart-note", text: "None." });
+  const groups = {};
+  for (const item of items) (groups[item.type] = groups[item.type] || []).push(item.name || "(unnamed)");
+  return h(
+    "ul",
+    { class: "list-plain change-list" },
+    Object.entries(groups).map(([type, names]) =>
+      h("li", {}, h("strong", { text: `${type} (${names.length}): ` }), names.slice(0, 40).join(", ") + (names.length > 40 ? ", …" : "")),
+    ),
+  );
+}
+
+function changeTable(rows) {
+  return h(
+    "div",
+    { class: "data-table-wrap" },
+    dataTable(
+      [
+        { label: "Element", value: (r) => r.name },
+        { label: "Type", value: (r) => r.type },
+        { label: "Property", value: (r) => r.label },
+        { label: "Before", value: (r) => r.from ?? "–" },
+        { label: "After", value: (r) => r.to ?? "–" },
+      ],
+      rows,
+    ),
+  );
+}
+
+function changesCard(p) {
+  const c = p.comparison;
+  if (!c) return null;
+  const ch = c.changes;
+  const sm = ch.summary;
+  const steering = ch.propertyChanges.filter((x) => x.steering);
+  const other = ch.propertyChanges.filter((x) => !x.steering);
+  const stat = (value, label) => h("span", { class: "change-stat" }, h("strong", { text: value }), label);
+  return panel(
+    `Model changes from ${pointShort(c.from)} to ${pointShort(c.to)}`,
+    "Element by element: names, types, properties and relationships.",
+    h(
+      "div",
+      { class: "change-stats" },
+      stat(sm.elementsAdded ? `+${fmt.int(sm.elementsAdded)}` : "0", "elements added"),
+      stat(sm.elementsRemoved ? `−${fmt.int(sm.elementsRemoved)}` : "0", "removed"),
+      stat(fmt.int(sm.elementsChanged), "changed"),
+      stat(fmt.int(sm.steeringChanges), "ratings and steering values"),
+      stat(`${sm.relationshipsAdded ? `+${fmt.int(sm.relationshipsAdded)}` : "0"} / ${sm.relationshipsRemoved ? `−${fmt.int(sm.relationshipsRemoved)}` : "0"}`, "relationships added / removed"),
+    ),
+    steering.length
+      ? h("div", { class: "change-block" }, h("h4", { text: `Ratings and steering values (${steering.length})` }), changeTable(steering))
+      : h("p", { class: "chart-note", text: "No rating or steering value changed." }),
+    details(`Added elements (${fmt.int(sm.elementsAdded)})`, groupedNames(ch.added)),
+    details(`Removed elements (${fmt.int(sm.elementsRemoved)})`, groupedNames(ch.removed)),
+    ch.renamed.length
+      ? details(
+          `Renamed elements (${ch.renamed.length})`,
+          h("div", { class: "data-table-wrap" }, dataTable([{ label: "Type", value: (r) => r.type }, { label: "Before", value: (r) => r.from }, { label: "After", value: (r) => r.to }], ch.renamed)),
+        )
+      : null,
+    other.length ? details(`Other property changes (${other.length})`, changeTable(other)) : null,
+    ch.relationshipsByType.length
+      ? details(
+          "Relationships by type",
+          h(
+            "div",
+            { class: "data-table-wrap" },
+            dataTable(
+              [
+                { label: "Relationship", value: (r) => r.type },
+                { label: "Added", num: true, value: (r) => fmt.int(r.added) },
+                { label: "Removed", num: true, value: (r) => fmt.int(r.removed) },
+              ],
+              ch.relationshipsByType,
+            ),
+          ),
+        )
+      : null,
+    ch.truncated ? h("p", { class: "chart-note", text: "Long lists stop at 400 entries; the full difference is in the baseline repository (git diff of the snapshot.json files)." }) : null,
+  );
+}
+
+function defaultBaselineName(p) {
+  const month = new Date().toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+  return `${p.baselines.length ? "Re-assessment" : "Assessment"} ${month}`;
+}
+
+async function saveBaseline(name, note, button) {
+  if (state.busy) return;
+  state.busy = true;
+  button.disabled = true;
+  button.textContent = "Saving…";
+  try {
+    const meta = await api("/api/baselines", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, note, date: todayLocalIso() }),
+    });
+    flash(`Saved the baseline "${meta.name}" (git commit ${meta.commit}).`);
+    state.compareFrom = null; // compare against the newest baseline again
+    state.compareTo = null;
+  } catch (error) {
+    flash(`The baseline was not saved: ${error.message}`, true);
+  } finally {
+    state.busy = false;
+  }
+  await loadProgress();
+}
+
+async function deleteBaseline(b) {
+  if (state.busy || !window.confirm(`Delete the baseline "${b.name}"? It disappears from the dashboard but stays in the history of the git repository.`)) return;
+  state.busy = true;
+  try {
+    await api(`/api/baselines/${encodeURIComponent(b.id)}`, { method: "DELETE" });
+    flash(`Deleted the baseline "${b.name}".`);
+    if (state.compareFrom === b.id) state.compareFrom = null;
+    if (state.compareTo === b.id) state.compareTo = null;
+    state.commits = null;
+  } catch (error) {
+    flash(`The baseline was not deleted: ${error.message}`, true);
+  } finally {
+    state.busy = false;
+  }
+  await loadProgress();
+}
+
+async function loadCommits() {
+  try {
+    state.commits = await api("/api/coarchi/commits");
+  } catch (error) {
+    flash(`The coArchi history could not be read: ${error.message}`, true);
+  }
+  refreshProgress();
+}
+
+async function importCommit(commit, name, button) {
+  if (state.busy) return;
+  state.busy = true;
+  button.disabled = true;
+  button.textContent = "Importing…";
+  try {
+    const meta = await api("/api/baselines/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commit: commit.commit, name: name || null }),
+    });
+    flash(`Commit ${commit.shortCommit} is now the baseline "${meta.name}" of ${fmt.day(meta.date)}.`);
+    state.commits = null;
+  } catch (error) {
+    flash(`The commit was not imported: ${error.message}`, true);
+  } finally {
+    state.busy = false;
+  }
+  await loadProgress();
+  if (!state.commits) loadCommits();
+}
+
+function commitAction(commit) {
+  if (commit.baseline) return h("span", { class: "dash-subtle", text: `Baseline "${commit.baseline}"` });
+  const cell = h("span", { class: "commit-action" });
+  const start = h("button", {
+    class: "dash-btn small",
+    type: "button",
+    text: "Use as baseline",
+    onclick: () => {
+      const input = h("input", { type: "text", maxlength: "80", value: commit.tags[0] || `coArchi ${commit.date}: ${commit.message}`.slice(0, 80), "aria-label": "Name of the baseline" });
+      const go = h("button", { class: "dash-btn small primary", type: "button", text: "Import", onclick: () => importCommit(commit, input.value.trim(), go) });
+      const cancel = h("button", { class: "dash-btn small", type: "button", text: "Cancel", onclick: () => cell.replaceChildren(start) });
+      cell.replaceChildren(input, go, cancel);
+      input.focus();
+      input.select();
+    },
+  });
+  cell.append(start);
+  return cell;
+}
+
+function coarchiBlock(p) {
+  const info = p.coarchi;
+  if (!info.available) return h("p", { class: "chart-note", text: `coArchi: ${info.reason}` });
+  const head = h(
+    "div",
+    { class: "coarchi-head" },
+    h("h4", { text: `coArchi history · ${info.repository}` }),
+    h("p", { class: "chart-note", text: "Earlier versions of the model, e.g. the state at the kick-off, can become baselines after the fact; they are dated with the commit." }),
+  );
+  if (!state.commits) {
+    return h("div", { class: "coarchi-block" }, head, h("button", { class: "dash-btn small", type: "button", text: "Show the commits", onclick: loadCommits }));
+  }
+  return h(
+    "div",
+    { class: "coarchi-block" },
+    head,
+    h(
+      "div",
+      { class: "data-table-wrap" },
+      dataTable(
+        [
+          { label: "Commit", value: (c) => h("code", { text: c.shortCommit }) },
+          { label: "Date", value: (c) => fmt.day(c.date) },
+          { label: "Message", value: (c) => c.message + (c.tags.length ? `  [${c.tags.join(", ")}]` : "") },
+          { label: "Author", value: (c) => c.author },
+          { label: "", value: (c) => commitAction(c) },
+        ],
+        state.commits.commits,
+      ),
+    ),
+  );
+}
+
+function baselinesCard(p) {
+  const store = p.store;
+  const name = h("input", { type: "text", maxlength: "80", value: defaultBaselineName(p), "aria-label": "Baseline name" });
+  const note = h("input", { type: "text", maxlength: "1000", placeholder: "e.g. ratings agreed in the steerco", "aria-label": "Note" });
+  const save = h("button", { class: "dash-btn primary", type: "button", text: "Save the current model as a baseline" });
+  save.addEventListener("click", () => saveBaseline(name.value.trim(), note.value.trim(), save));
+  const where = store.initialized
+    ? `Stored in the git repository ${store.path} · ${plural(store.commits, "commit")}. Each baseline is one commit with a tag; deleting one keeps it in the history.`
+    : `The git repository ${store.path} is created with the first baseline. It holds client models: keep it private.`;
+  return panel(
+    "Baselines",
+    `${p.model.name}: one per assessment cycle. A baseline freezes the whole model (elements, properties, relationships).`,
+    state.flash ? h("p", { class: `baseline-flash${state.flash.error ? " error" : ""}`, role: "status", text: state.flash.text }) : null,
+    p.baselines.length
+      ? h(
+          "div",
+          { class: "data-table-wrap" },
+          dataTable(
+            [
+              { label: "Baseline", value: (b) => h("span", {}, h("strong", { text: b.name }), b.note ? h("span", { class: "cap-group", text: b.note }) : null) },
+              { label: "Date", value: (b) => fmt.day(b.date) },
+              { label: "Source", value: (b) => sourceText(b.source) },
+              { label: "Elements", num: true, value: (b) => fmt.int(b.model.elementCount) },
+              { label: "Relationships", num: true, value: (b) => fmt.int(b.model.relationshipCount) },
+              { label: "", value: (b) => h("button", { class: "dash-btn small", type: "button", text: "Delete", "aria-label": `Delete ${b.name}`, onclick: () => deleteBaseline(b) }) },
+            ],
+            [...p.baselines].reverse(),
+          ),
+        )
+      : null,
+    h("div", { class: "baseline-form" }, h("label", {}, h("span", { text: "Name" }), name), h("label", { class: "grow" }, h("span", { text: "Note (optional)" }), note), save),
+    coarchiBlock(p),
+    h("p", { class: "chart-note", text: where }),
+    p.warnings && p.warnings.length ? h("p", { class: "chart-note", text: `Skipped: ${p.warnings.join("; ")}` }) : null,
+  );
+}
+
+function progressSection() {
+  const p = state.progress;
+  const title = "Progress · Re-assessment against the baseline";
+  if (state.progressError) {
+    return section("progress", title, PROGRESS_INTRO, [
+      panel("The baselines could not be read", null, h("p", { class: "chart-note", text: state.progressError })),
+    ]);
+  }
+  if (!p) return section("progress", title, PROGRESS_INTRO, [panel("Reading the baselines…", null)]);
+  const cards = p.baselines.length
+    ? [comparisonCard(p), kpiCompareCard(p), trendCard(p), capabilityTrendCard(p), outcomeTrendCard(p), changesCard(p)]
+    : [firstBaselineCard(p)];
+  cards.push(baselinesCard(p));
+  return section("progress", title, PROGRESS_INTRO, cards);
+}
+
+// The overview tiles show how far each headline figure moved since the compared baseline.
+function decorateKpis() {
+  ui.kpiRow.querySelectorAll(".kpi-delta").forEach((node) => node.remove());
+  const c = state.progress && state.progress.comparison;
+  if (!c || c.to.kind !== "current") return;
+  for (const k of c.kpis) {
+    if (!k.headline || k.delta === null) continue;
+    const tile = ui.kpiRow.querySelector(`[data-kpi="${k.headline}"]`);
+    if (tile) tile.append(h("span", { class: "kpi-delta" }, deltaBadge(k, k.delta, k.assessment), h("span", { text: ` since ${pointShort(c.from)}` })));
+  }
+}
+
 function renderAll() {
+  state.cards = state.cards.filter((render) => !render.figure || render.figure.isConnected);
   state.cards.forEach((render) => render());
 }
 
@@ -1252,6 +2078,7 @@ function render(data) {
     `as of ${fmt.day(data.asOf)} · read live from Archi via MCP at ${fetched.toLocaleTimeString("en-GB")}`;
   renderKpis(data.headline);
   ui.sections.replaceChildren(
+    progressSection(),
     motivationSection(data),
     strategySection(data),
     gapsSection(data),
@@ -1261,6 +2088,7 @@ function render(data) {
     qualitySection(data),
   );
   renderAll();
+  decorateKpis();
 }
 
 const ARCHI_HINT = "Check that Archi is running with a model open and that MCP Server › Start MCP Server is active, then refresh.";
@@ -1304,6 +2132,7 @@ async function load() {
     ui.main.classList.remove("is-loading");
     ui.main.setAttribute("aria-busy", "false");
   }
+  if (state.data) loadProgress(); // baselines and trend: their own request, the dashboard does not wait for it
 }
 
 function todayLocalIso() {
@@ -1334,6 +2163,7 @@ ui.root.addEventListener("click", (event) => {
   const target = document.getElementById(link.getAttribute("href").slice(1));
   if (!target) return;
   event.preventDefault();
+  state.lastJump = { id: target.id, at: Date.now() };
   target.scrollIntoView({ behavior: "smooth", block: "start" });
 });
 

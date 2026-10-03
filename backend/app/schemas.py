@@ -247,3 +247,16 @@ class ConversationImportResponse(BaseModel):
     message_count: int = Field(default=0, ge=0)
     warnings: List[str] = Field(default_factory=list)
     conversation: ConversationArchive
+
+
+class BaselineCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    note: str = Field(default="", max_length=1000)
+    # The client's local date; the baseline is dated the day the model is frozen.
+    date: str | None = Field(default=None, max_length=10)
+
+
+class BaselineImportRequest(BaseModel):
+    commit: str = Field(pattern=r"^[0-9a-f]{7,40}$")
+    name: str | None = Field(default=None, max_length=80)
+    note: str = Field(default="", max_length=1000)

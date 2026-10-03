@@ -128,6 +128,68 @@ Process → capability realisations are only added, never removed.
 `/?step=steering` opens the step directly, e.g. to re-rate capabilities in a later assessment cycle.
 The executive summary (step 6) also receives these steering figures from the model.
 
+## Progress: re-assessment against baselines
+
+Archi only knows the current state of a model, but steering needs time series: progress is a
+re-assessment against a **baseline**. A baseline is the complete model — elements with their
+properties and the relationships between them, without documentation texts and views — frozen at
+the close of an assessment cycle.
+
+**Storage: a git repository per installation**, outside this app because it holds client models.
+Default `~/Documents/Archi/assessment-baselines` (Docker: `ARCHI_BASELINES_DIR`, mounted at
+`/data/baselines`); it is created with the first baseline.
+
+    <model>/<baseline id>/baseline.json   name, date, note, source (live model via MCP or a coArchi commit)
+    <model>/<baseline id>/snapshot.json   elements and relationships, one per line (readable git diffs)
+    <model>/<baseline id>/kpis.json       the trend figures at that date, for people reading the repository
+
+Each baseline is one commit with the tag `baseline/<model>/<baseline id>`; deleting a baseline is a
+further commit, so the history keeps it. Push the repository only to a remote the client has approved.
+
+**Sources.**
+
+- *Live model*: **Save baseline** in assessment step 6 (*Close the assessment cycle*) or in the
+  dashboard's Progress section reads the active model via MCP and commits it, dated today.
+- *coArchi history*: if the model is versioned with coArchi, Archi's git collaboration plugin, any
+  of its commits can become a baseline after the fact — e.g. the state at the kick-off. The app reads
+  coArchi's local repositories read-only (default `~/Documents/Archi/model-repository`, Docker:
+  `ARCHI_COARCHI_DIR`), finds the repository whose model has the active model's name, and rebuilds
+  the model at the chosen commit from coArchi's file format (one XML file per element). The baseline
+  is dated with the commit.
+
+**What the Progress section shows** (dashboard, after Overview; `GET /api/baselines/progress`):
+
+- *What changed*: pick two points — any baseline or *Now* (default: the latest baseline against the
+  live model) — and read the highlights: capabilities that improved or declined in maturity or reached
+  their target, work packages completed, gaps closed (no longer in the model) or new, outcome KPIs
+  that moved.
+- *Steering figures then and now*: every dashboard metric for both points, with the change and
+  whether it is better or worse (▲/▼ plus the status colour; model size is neutral).
+- *Trend across the assessment cycles*: one small chart per metric over all baselines and the live
+  model (filled dots: baselines, hollow dot: now; dashed: target maturity).
+- *Capability maturity per assessment cycle*: current maturity per capability and cycle, target, Δ.
+- *Outcome KPIs measured per cycle*: each outcome's `current` value per cycle against the planned
+  path from `baseline` (at `baselineDate`) to `target` (at `targetDate`) — the KPI's actual time series.
+- *Model changes*: elements added, removed, renamed and changed; every changed rating and steering
+  value (before → after); relationships added and removed by type.
+- *Baselines*: the list, save, delete, and the coArchi history with *Use as baseline*.
+
+The overview tiles show the change of each headline figure since the compared baseline.
+
+**Same definitions for every point.** A baseline's figures are computed with the dashboard code from
+its snapshot, as of the baseline's own date (end of life, overdue work packages and outcome
+expectations are judged as on that day). Changing a metric definition therefore changes the whole
+series consistently.
+
+**Re-assessment in the wizard.** Step 5 shows, under every rating field, its value in the latest
+baseline and marks the fields this cycle changes. The executive summary (step 6) reports the progress
+since the latest baseline next to the current steering figures.
+
+API: `GET /api/baselines`, `POST /api/baselines` `{name, note, date}`, `DELETE /api/baselines/{id}`,
+`GET /api/baselines/progress?from=&to=&asOf=`, `GET /api/coarchi/commits`,
+`POST /api/baselines/import` `{commit, name, note}` → [backend/app/baselines.py](../backend/app/baselines.py),
+[backend/app/coarchi.py](../backend/app/coarchi.py).
+
 ## Metrics
 
 | Section | Metric | Definition |

@@ -7,6 +7,17 @@ services:
       - .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      # Assessment baselines: a git repository with one snapshot of the model per assessment cycle.
+      # It holds client models, so it lives outside this repository (override with ARCHI_BASELINES_DIR).
+      BASELINES_DIR: /data/baselines
+      BASELINES_HOST_DIR: ${ARCHI_BASELINES_DIR:-${HOME}/Documents/Archi/assessment-baselines}
+      # coArchi's local repositories (read-only): earlier model versions can be imported as baselines.
+      COARCHI_DIR: /data/coarchi
+      COARCHI_HOST_DIR: ${ARCHI_COARCHI_DIR:-${HOME}/Documents/Archi/model-repository}
+    volumes:
+      - ${ARCHI_BASELINES_DIR:-${HOME}/Documents/Archi/assessment-baselines}:/data/baselines
+      - ${ARCHI_COARCHI_DIR:-${HOME}/Documents/Archi/model-repository}:/data/coarchi:ro
     ports:
       - "38000:8000"
     restart: unless-stopped

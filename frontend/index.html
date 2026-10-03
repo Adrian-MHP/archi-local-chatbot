@@ -190,6 +190,19 @@
                   </footer>
                 </article>
               </div>
+              <section class="cycle-card" aria-labelledby="cycleTitle">
+                <div class="cycle-card-text">
+                  <h4 id="cycleTitle">Close the assessment cycle</h4>
+                  <p>Save the model as it stands now as a baseline. Re-assessments and the dashboard's Progress section measure against it; it is kept as a commit in the baseline git repository.</p>
+                  <p id="cycleLastBaseline" class="cycle-last"></p>
+                </div>
+                <div class="cycle-form">
+                  <label><span>Name</span><input id="cycleNameInput" type="text" maxlength="80" /></label>
+                  <label class="grow"><span>Note (optional)</span><input id="cycleNoteInput" type="text" maxlength="1000" placeholder="e.g. ratings agreed in the steerco" /></label>
+                  <button id="cycleSaveBtn" class="btn primary" type="button">Save baseline</button>
+                </div>
+                <div id="cycleStatus" class="action-status hidden" role="status"></div>
+              </section>
               <div class="assessment-step-actions">
                 <button id="assessmentSummaryBackBtn" class="btn ghost" type="button">Back</button>
                 <button id="assessmentStartNewBtn" class="btn primary" type="button">Start New Assessment</button>
@@ -225,6 +238,7 @@
 
                 <nav class="dash-card dash-nav" aria-label="Dashboard sections">
                   <a href="#dash-overview">Overview</a>
+                  <a href="#dash-progress">Progress</a>
                   <a href="#dash-motivation">Motivation</a>
                   <a href="#dash-strategy">Strategy</a>
                   <a href="#dash-gaps">Gaps &amp; roadmap</a>

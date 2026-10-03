@@ -13,23 +13,36 @@ Local web app with separate frontend + backend:
 archi-local-chatbot/
 ├── backend/
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── azure_agent.py
+│   │   ├── azure_agent.py      chat, automation, assessment steps
+│   │   ├── baselines.py        assessment baselines in git, trend and comparison
+│   │   ├── coarchi.py          earlier model versions from coArchi repositories
 │   │   ├── config.py
-│   │   ├── main.py
+│   │   ├── dashboard.py        transformation dashboard metrics
+│   │   ├── main.py             FastAPI endpoints
 │   │   ├── mcp_client.py
-│   │   ├── meta_model.py
-│   │   └── schemas.py
+│   │   ├── meta_model.py       governance meta-model and property schema
+│   │   ├── pdf_diagram.py
+│   │   ├── pdf_table.py
+│   │   ├── schemas.py
+│   │   └── steering.py         assessment step 5: ratings and roadmap
+│   ├── tests/
 │   ├── Dockerfile
 │   └── requirements.txt
+├── docs/
+│   └── transformation-dashboard.md
 ├── frontend/
-│   ├── app.js
+│   ├── app.js                  workspace, assessment wizard, settings
+│   ├── chat.js                 assistant
+│   ├── dashboard.css
+│   ├── dashboard.js            transformation dashboard and progress
 │   ├── Dockerfile
 │   ├── index.html
 │   ├── nginx.conf
 │   └── style.css
 ├── ops/
-│   └── check_mcp.sh
+│   ├── check_mcp.sh
+│   ├── mcp_seed_client.py
+│   └── seed_engineering_demo.py
 ├── .env.example
 ├── .gitignore
 ├── docker-compose.yml
@@ -71,6 +84,18 @@ Open:
 - Backend health: `http://localhost:38000/api/health`
 - Backend MCP tools list: `http://localhost:38000/api/tools`
 
+Two folders of the Mac are mounted into the backend (override in the shell or a `.env` next to
+`docker-compose.yml`):
+
+| Variable | Default | Use |
+|---|---|---|
+| `ARCHI_BASELINES_DIR` | `~/Documents/Archi/assessment-baselines` | git repository of the assessment baselines (read/write) |
+| `ARCHI_COARCHI_DIR` | `~/Documents/Archi/model-repository` | coArchi's local repositories, to import earlier model versions (read-only) |
+
+On macOS, Docker Desktop needs access to the Documents folder for these mounts: confirm the
+system dialog *"Docker" would like to access files in your "Documents" folder*, or allow it under
+System Settings › Privacy & Security › Files and Folders › Docker.
+
 ## Workspace UI
 
 The frontend is a buttons-and-preview workspace, not a chat-first UI:
@@ -82,6 +107,7 @@ The frontend is a buttons-and-preview workspace, not a chat-first UI:
 - **Assessment wizard**: 1 Setup → 2 As-Is Capture → 3 To-Be Architecture → 4 Mapping & Gap Analysis → 5 Ratings & Roadmap → 6 Summary. Step 5 maintains the steering data the dashboard reads (capability maturity, process ratings, plateaus, work packages, gap assignments, goals and outcome KPIs, application attributes): the AI proposes values that only fill empty fields, you review the tables, and nothing is written to Archi before you apply. `/?step=steering` opens step 5 directly, e.g. for a re-assessment.
 - **Assessment progress** is kept for the browser session (sessionStorage): switching to the dashboard, reloading the page or coming back later in the same browser tab restores the step, the view pairs, the results and the step-5 tables. Uploaded files are not kept, only their names. **New assessment** in the stepper starts over (nothing in Archi is deleted); a new browser tab or window starts a fresh assessment.
 - **Approval mode** in the top bar is read from Archi's MCP plugin (`list-pending-approvals`), with the number of pending approvals, refreshed every 30 s and whenever you return to the browser tab. After a write, the app mentions approval only when Archi actually queued the change as a proposal.
+- **Assessment cycles and baselines**: Archi only knows the current model, so progress is measured against baselines — the whole model frozen at the close of an assessment cycle, one commit per baseline in a git repository outside this app (default `~/Documents/Archi/assessment-baselines`; it holds client models). Save one in step 6 (*Close the assessment cycle*) or in the dashboard; earlier commits of the model's coArchi repository can become baselines too (e.g. the kick-off state). The dashboard's **Progress** section compares any two points (baselines or now): trend per metric, maturity per capability and cycle, outcome KPIs per cycle against the planned path, every model change. Step 5 shows the previous cycle's rating under each field. Details: [docs/transformation-dashboard.md](docs/transformation-dashboard.md#progress-re-assessment-against-baselines).
 - **Dashboard** (a tab of the app, in the same browser tab): the steering view of the assessment — outcome KPIs, capability maturity heat map (TOGAF gap convention), capability gaps vs. plateaus, As-Is → To-Be traceability, application end of life and TIME portfolio, roadmap by plateau, gap register, and data completeness. Every figure is read live from the active Archi model via MCP (`GET /api/dashboard`) along the relationships of the governance meta-model; cost and project-progress data stay in the tools that own them. Property schema, metric definitions and the engineering demo dataset (`ops/seed_engineering_demo.py`): [docs/transformation-dashboard.md](docs/transformation-dashboard.md).
 
 ### Upload preview workflow
@@ -217,6 +243,10 @@ Then serve frontend separately or open a static server and point calls to `/api`
 
 ## Troubleshooting
 
+- New containers stay in "Created" and never start (macOS): Docker Desktop waits for permission to
+  the Documents folder (baseline and coArchi mounts). Allow it in the system dialog or under System
+  Settings › Privacy & Security › Files and Folders › Docker › Documents Folder; if no dialog
+  appears, quit and restart Docker Desktop. Running containers are not affected.
 - `mcp_status=error` in `/api/health`:
   - Verify Archi MCP server is started.
   - Verify MCP URL/token in `.env`.

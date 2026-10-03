@@ -8,12 +8,13 @@ import math
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 import httpx
 from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
 
-from . import dashboard, meta_model, steering
+from . import baselines, dashboard, meta_model, steering
 from . import pdf_diagram
 from . import pdf_table
 from .config import Settings
@@ -64,6 +65,9 @@ class ChatService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._proposal_local = threading.local()
+        self.baselines = baselines.BaselineStore(
+            Path(settings.baselines_dir), author=settings.baseline_git_author, display_path=settings.baselines_display_path
+        )
         self.mcp = McpClient(
             server_url=settings.mcp_server_url,
             bearer_token=settings.mcp_bearer_token,
@@ -3149,10 +3153,26 @@ class ChatService:
         as_is, to_be, warnings = self._steering_scope(
             ist_view_names=ist_view_names, soll_view_names=soll_view_names, used_tools=used_tools
         )
-        state = steering.current_state(dashboard.fetch_snapshot(self.mcp), as_is_process_ids=as_is, to_be_process_ids=to_be)
+        snapshot = dashboard.fetch_snapshot(self.mcp)
+        state = steering.current_state(snapshot, as_is_process_ids=as_is, to_be_process_ids=to_be)
         state["warnings"] = warnings + state["warnings"]
         state["schema"] = meta_model.PROPERTIES
+        state["baseline"] = self._previous_cycle((snapshot.get("info") or {}).get("name"))
         return state
+
+    def _previous_cycle(self, model_name: str | None) -> Dict[str, Any] | None:
+        """The ratings of the latest baseline, shown next to the inputs of a re-assessment."""
+        store = getattr(self, "baselines", None)
+        if store is None or not model_name:
+            return None
+        try:
+            meta = baselines.latest_before(store.list(model_name), date.today())
+            if meta is None:
+                return None
+            return {"id": meta["id"], "name": meta["name"], "date": meta["date"],
+                    "values": baselines.steering_values(store.snapshot(meta))}
+        except baselines.BaselineError:
+            return None
 
     def steering_propose(
         self, *, ist_view_names: List[str], soll_view_names: List[str], state: Dict[str, Any] | None = None
@@ -3259,7 +3279,29 @@ class ChatService:
         if a["applicationCount"]:
             lines.append(f"- Applications: {a['pastEndOfLife']} past end of life, {a['endOfLifeWithin24Months']} reach end of "
                          f"life within 24 months")
+        lines.extend(self._progress_context(data))
         return "\n".join(lines)
+
+    def _progress_context(self, current: Dict[str, Any]) -> List[str]:
+        """Progress since the latest baseline, so the summary reports the re-assessment, not just a state."""
+        store = getattr(self, "baselines", None)
+        if store is None:
+            return []
+        try:
+            meta = baselines.latest_before(store.list(current["model"]["name"]), date.today())
+            if meta is None:
+                return []
+            before = store.evaluated(meta)
+        except baselines.BaselineError:
+            return []
+        rows = [r for r in baselines.compare_figures(before, current) if r["assessment"] in ("better", "worse", "changed")]
+        figures = "; ".join(
+            f"{r['label'].lower()} {baselines._fmt(r['from'])} -> {baselines._fmt(r['to'])} ({r['assessment']})" for r in rows[:8]
+        )
+        lines = [f"- Progress since the baseline '{meta['name']}' of {meta['date']}: "
+                 + (figures or "no change in the steering figures")]
+        lines += [f"  - {text}" for text in baselines.highlights(before, current)[:6]]
+        return lines
 
     def generate_assessment_summary(
         self, *, mappings: List[Dict[str, Any]], gaps: List[Dict[str, Any]]

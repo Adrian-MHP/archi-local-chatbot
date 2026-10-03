@@ -7,6 +7,7 @@ import logging
 import os
 from queue import Empty, Queue
 import re
+from pathlib import Path
 from threading import Event, Thread
 from typing import Any, Dict
 from uuid import uuid4
@@ -20,7 +21,7 @@ from pydantic import ValidationError
 
 from .azure_agent import ChatService, ChatStopped
 from .config import get_settings
-from . import dashboard, meta_model
+from . import baselines, coarchi, dashboard, meta_model
 from .schemas import (
     ActionResponse,
     ApplyPlanRequest,
@@ -28,6 +29,8 @@ from .schemas import (
     AssessmentSummaryRequest,
     AssessmentSummaryResponse,
     AutomationPlanResponse,
+    BaselineCreateRequest,
+    BaselineImportRequest,
     ChatRequest,
     ChatResponse,
     ChatStreamRequest,
@@ -288,6 +291,163 @@ def get_dashboard(as_of: str | None = Query(default=None, alias="asOf")) -> Dict
         return dashboard.build_dashboard(chat_service.mcp, today)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Could not read the Archi model via MCP: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------------------------
+# Assessment baselines: the model per assessment cycle, versioned in git (baselines.py), and
+# earlier model versions from the model's coArchi repository (coarchi.py)
+# ---------------------------------------------------------------------------------------------
+
+def _baseline_http_error(exc: baselines.BaselineError) -> HTTPException:
+    if isinstance(exc, baselines.BaselineNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, baselines.BaselineConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, baselines.BaselineStorageError):
+        return HTTPException(status_code=500, detail=str(exc))
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _live_snapshot() -> Dict[str, Any]:
+    try:
+        return baselines.normalize_snapshot(dashboard.fetch_snapshot(chat_service.mcp))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not read the Archi model via MCP: {exc}") from exc
+
+
+def _active_model_name() -> str:
+    try:
+        name = (dashboard._payload(chat_service.mcp, "get-model-info", {}).get("result") or {}).get("name")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not read the Archi model via MCP: {exc}") from exc
+    if not name:
+        raise HTTPException(status_code=422, detail="The active Archi model has no name, so it has no baselines.")
+    return str(name)
+
+
+def _coarchi_info(model_name: str) -> Dict[str, Any]:
+    try:
+        repo = coarchi.repository_for(Path(settings.coarchi_dir), model_name)
+    except Exception as exc:  # noqa: BLE001 -- coArchi is optional
+        return {"available": False, "reason": str(exc)}
+    if repo is None:
+        return {"available": False,
+                "reason": f"No coArchi repository of '{model_name}' in {settings.coarchi_display_path}."}
+    return {"available": True, "repository": repo["folder"], "head": repo["head"][:7],
+            "path": f"{settings.coarchi_display_path.rstrip('/')}/{repo['folder']}"}
+
+
+def _parse_day(value: str | None, *, field: str = "asOf") -> date:
+    if not value:
+        return date.today()
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"{field} must be a date in YYYY-MM-DD format.") from exc
+
+
+@app.get("/api/baselines")
+def list_baselines() -> Dict[str, Any]:
+    model_name = _active_model_name()
+    store = chat_service.baselines
+    return {"model": {"name": model_name}, "baselines": store.list(model_name), "store": store.status(),
+            "coarchi": _coarchi_info(model_name)}
+
+
+@app.post("/api/baselines")
+def create_baseline(payload: BaselineCreateRequest) -> Dict[str, Any]:
+    """Freeze the live model as the baseline of an assessment cycle (one git commit + tag)."""
+    day = _parse_day(payload.date, field="date")
+    if abs((day - date.today()).days) > 1:  # the client's local date, within a day of the server's
+        raise HTTPException(status_code=422, detail="A baseline is dated the day the model is frozen, i.e. today.")
+    snapshot = _live_snapshot()
+    try:
+        return chat_service.baselines.create(
+            snapshot, name=payload.name, note=payload.note, day=day,
+            source={"type": "mcp", "modelVersion": snapshot["model"]["modelVersion"]},
+        )
+    except baselines.BaselineError as exc:
+        raise _baseline_http_error(exc) from exc
+
+
+@app.delete("/api/baselines/{baseline_id}")
+def delete_baseline(baseline_id: str) -> Dict[str, Any]:
+    try:
+        return chat_service.baselines.delete(baseline_id, _active_model_name())
+    except baselines.BaselineError as exc:
+        raise _baseline_http_error(exc) from exc
+
+
+@app.get("/api/baselines/progress")
+def baseline_progress(
+    compare_from: str | None = Query(default=None, alias="from"),
+    compare_to: str | None = Query(default=None, alias="to"),
+    as_of: str | None = Query(default=None, alias="asOf"),
+) -> Dict[str, Any]:
+    """Every baseline of the active model plus the live model: trend per metric, maturity per
+    capability and cycle, outcome KPI measurements, and the comparison of two points."""
+    today = _parse_day(as_of)
+    snapshot = _live_snapshot()
+    model_name = snapshot["model"]["name"]
+    store = chat_service.baselines
+    metas = store.list(model_name)
+    points, warnings = [], []
+    for meta in metas:
+        try:
+            points.append({"id": meta["id"], "label": meta["name"], "date": meta["date"], "moment": baselines.moment(meta), "kind": "baseline",
+                           "source": meta.get("source"), "note": meta.get("note") or "",
+                           "snapshot": store.snapshot(meta), "dashboard": store.evaluated(meta)})
+        except baselines.BaselineError as exc:
+            warnings.append(str(exc))
+    points.append({"id": baselines.CURRENT, "label": "Now", "date": today.isoformat(), "moment": f"{today.isoformat()}T23:59:59+00:00", "kind": "current",
+                   "source": {"type": "mcp"}, "note": "", "snapshot": snapshot,
+                   "dashboard": baselines.evaluate(snapshot, today)})
+    points.sort(key=lambda p: (p["date"], p["kind"] == "current", p["moment"]))
+    report = baselines.build_progress(points, compare_from, compare_to)
+    return {"model": {"name": model_name}, "asOf": today.isoformat(), "baselines": metas, "store": store.status(),
+            "coarchi": _coarchi_info(model_name), "warnings": warnings, **report}
+
+
+@app.get("/api/coarchi/commits")
+def coarchi_commits() -> Dict[str, Any]:
+    model_name = _active_model_name()
+    repo = coarchi.repository_for(Path(settings.coarchi_dir), model_name)
+    if repo is None:
+        raise HTTPException(status_code=404, detail=_coarchi_info(model_name).get("reason"))
+    try:
+        commits = coarchi.commits(repo["path"])
+    except coarchi.CoArchiError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    imported = {(m.get("source") or {}).get("commit"): m["name"] for m in chat_service.baselines.list(model_name)}
+    for commit in commits:
+        commit["baseline"] = imported.get(commit["commit"])
+    return {"repository": repo["folder"], "commits": commits}
+
+
+@app.post("/api/baselines/import")
+def import_baseline(payload: BaselineImportRequest) -> Dict[str, Any]:
+    """A commit of the model's coArchi repository as a baseline, dated with the commit date."""
+    model_name = _active_model_name()
+    repo = coarchi.repository_for(Path(settings.coarchi_dir), model_name)
+    if repo is None:
+        raise HTTPException(status_code=404, detail=_coarchi_info(model_name).get("reason"))
+    try:
+        commit = next((c for c in coarchi.commits(repo["path"], limit=1000) if c["commit"].startswith(payload.commit)), None)
+        if commit is None:
+            raise HTTPException(status_code=404, detail=f"Commit {payload.commit} is not in the history of {repo['folder']}.")
+        snapshot = coarchi.snapshot_at(repo["path"], commit["commit"])
+    except coarchi.CoArchiError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    snapshot["model"]["name"] = model_name  # matched by name; keep the spelling of the live model
+    name = payload.name or (commit["tags"][0] if commit["tags"] else f"coArchi {commit['date']}: {commit['message']}"[:80])
+    try:
+        return chat_service.baselines.create(
+            snapshot, name=name, note=payload.note, day=date.fromisoformat(commit["date"]),
+            source={"type": "coarchi", "repository": repo["folder"], "commit": commit["commit"],
+                    "commitDate": commit["committedAt"], "author": commit["author"], "message": commit["message"]},
+        )
+    except baselines.BaselineError as exc:
+        raise _baseline_http_error(exc) from exc
 
 
 @app.get("/api/meta-model")
